@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.idea/
+.claude/
+.DS_Store
+*.egg-info/
+.venv/
+venv/
