@@ -6,6 +6,7 @@ import sys
 
 sys.path.append('/Users/avrahamraviv/PycharmProjects')
 sys.path.append('/home/avrahamra/PycharmProjects')
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn as nn
