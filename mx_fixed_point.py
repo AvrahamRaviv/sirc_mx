@@ -108,6 +108,7 @@ def fixed_point_accumulate(
 
 
 _VALID_MODES = ("fp32", "fixed_point")
+_VALID_BACKENDS = ("python", "triton")
 
 
 def _get_xblock(mx_specs, key, default):
@@ -142,6 +143,17 @@ def cross_block_accumulate_from_specs(partials, mx_specs):
     bits = _get_xblock(mx_specs, 'xblock_accum_bits', _DEFAULT_BITS)
     saturate = _get_xblock(mx_specs, 'xblock_accum_saturate', True)
     ste_mask = _get_xblock(mx_specs, 'xblock_accum_ste_mask', False)
+    backend = _get_xblock(mx_specs, 'xblock_accum_backend', 'python')
+
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(f"xblock_accum_backend={backend!r} not in {_VALID_BACKENDS}")
+
+    if backend == "triton":
+        from mx_fixed_point_triton import fixed_point_accumulate_triton
+        return fixed_point_accumulate_triton(
+            partials, total_bits=bits, scale_exp=None, saturate=saturate, ste_mask=ste_mask
+        )
+
     return fixed_point_accumulate(
         partials, total_bits=bits, scale_exp=None, saturate=saturate, ste_mask=ste_mask
     )

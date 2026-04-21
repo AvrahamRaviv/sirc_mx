@@ -230,6 +230,7 @@ class MXQuantizer:
             'xblock_accum_bits': _XBLOCK_ACCUM_DEFAULT_BITS,
             'xblock_accum_saturate': True,
             'xblock_accum_ste_mask': False,
+            'xblock_accum_backend': 'python',
         }
         if spec_dict is not None:
             spec_dict = dict(spec_dict)
@@ -246,6 +247,12 @@ class MXQuantizer:
             )
         if xblock_cfg['xblock_accum_mode'] == 'fixed_point':
             validate_xblock_accum_bits(xblock_cfg['xblock_accum_bits'])
+
+        if xblock_cfg['xblock_accum_backend'] not in ('python', 'triton'):
+            raise ValueError(
+                f"xblock_accum_backend must be 'python' or 'triton', "
+                f"got {xblock_cfg['xblock_accum_backend']!r}"
+            )
 
         for k, v in xblock_cfg.items():
             setattr(mx_specs, k, v)
@@ -305,7 +312,8 @@ class MXQuantizer:
             # Propagate xblock_accum_* attrs onto the new layer; microxcaling
             # re-builds its internal mx_specs and drops python attrs.
             for k in ('xblock_accum_mode', 'xblock_accum_bits',
-                      'xblock_accum_saturate', 'xblock_accum_ste_mask'):
+                      'xblock_accum_saturate', 'xblock_accum_ste_mask',
+                      'xblock_accum_backend'):
                 if hasattr(mx_specs, k):
                     setattr(new, k, getattr(mx_specs, k))
 
