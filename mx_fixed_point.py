@@ -16,10 +16,17 @@ def validate_xblock_accum_bits(bits):
 
 
 def _auto_scale_exp(partials, total_bits, headroom_bits=2):
+    """Pick scale_exp so the *accumulated* sum fits in the target window.
+
+    Worst-case cumulative sum is `num_blocks * max(|partial|)`, so the
+    per-partial max must be bounded by `2^(total_bits-1-headroom) / num_blocks`
+    to guarantee no saturation.
+    """
     max_abs = partials.detach().abs().amax()
     if max_abs.item() == 0.0:
         return 0
-    target = float(1 << (total_bits - 1 - headroom_bits))
+    num_blocks = max(1, partials.shape[-1])
+    target = float(1 << (total_bits - 1 - headroom_bits)) / num_blocks
     exp = int(torch.floor(torch.log2(target / max_abs)).item())
     return exp
 

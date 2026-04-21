@@ -21,6 +21,7 @@ from mx_fixed_point import (
     validate_xblock_accum_bits,
     _DEFAULT_BITS as _XBLOCK_ACCUM_DEFAULT_BITS,
 )
+from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked
 
 
 class MXQuantizer:
@@ -286,7 +287,12 @@ class MXQuantizer:
                 continue
 
             if is_conv:
-                new = MXConv2d(
+                use_blocked = (
+                    getattr(mx_specs, 'xblock_accum_mode', 'fp32') == 'fixed_point'
+                    and module.groups == 1
+                )
+                conv_cls = MXConv2dBlocked if use_blocked else MXConv2d
+                new = conv_cls(
                     module.in_channels,
                     module.out_channels,
                     module.kernel_size,
@@ -298,7 +304,12 @@ class MXQuantizer:
                     mx_specs=mx_specs
                 )
             else:
-                new = MXLinear(
+                linear_cls = (
+                    MXLinearBlocked
+                    if getattr(mx_specs, 'xblock_accum_mode', 'fp32') == 'fixed_point'
+                    else MXLinear
+                )
+                new = linear_cls(
                     module.in_features,
                     module.out_features,
                     bias=module.bias is not None,
