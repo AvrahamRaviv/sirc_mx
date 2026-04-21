@@ -292,6 +292,83 @@ def test_conv_dispatch_default_fp32_uses_original(tmp_path):
     assert not isinstance(model.conv, MXConv2dBlocked)
 
 
+def test_conv_nondivisible_channels_falls_back_to_original(tmp_path, capsys):
+    """C not divisible by bs → dispatcher falls back to original MXConv2d + prints name."""
+    import json
+    from mx_quantizer import MXQuantizer
+
+    cfg = {
+        "mx_specs": {
+            "w_elem_format": "int8",
+            "a_elem_format": "int8",
+            "block_size": 32,
+            "scale_bits": 8,
+            "shared_exp_method": "max",
+            "custom_cuda": False,
+            "xblock_accum_mode": "fixed_point",
+            "xblock_accum_bits": 48,
+            "xblock_accum_backend": "python",
+        },
+        "layers": [{"name": "conv"}],
+        "ptq": False,
+        "measure_error": False,
+    }
+    (tmp_path / "mx_config.json").write_text(json.dumps(cfg))
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 16, 3, padding=1)
+        def forward(self, x):
+            return self.conv(x)
+
+    q = MXQuantizer(str(tmp_path))
+    model = q.quant(Net())
+    out = capsys.readouterr().out
+    assert isinstance(model.conv, MXConv2d)
+    assert not isinstance(model.conv, MXConv2dBlocked)
+    assert "blocked path skipped for conv 'conv'" in out
+    assert "in_channels=3" in out
+
+
+def test_linear_nondivisible_features_falls_back_to_original(tmp_path, capsys):
+    import json
+    from mx_quantizer import MXQuantizer
+
+    cfg = {
+        "mx_specs": {
+            "w_elem_format": "int8",
+            "a_elem_format": "int8",
+            "block_size": 32,
+            "scale_bits": 8,
+            "shared_exp_method": "max",
+            "custom_cuda": False,
+            "xblock_accum_mode": "fixed_point",
+            "xblock_accum_bits": 48,
+            "xblock_accum_backend": "python",
+        },
+        "layers": [{"name": "fc"}],
+        "ptq": False,
+        "measure_error": False,
+    }
+    (tmp_path / "mx_config.json").write_text(json.dumps(cfg))
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(100, 32)
+        def forward(self, x):
+            return self.fc(x)
+
+    q = MXQuantizer(str(tmp_path))
+    model = q.quant(Net())
+    out = capsys.readouterr().out
+    assert isinstance(model.fc, MXLinear)
+    assert not isinstance(model.fc, MXLinearBlocked)
+    assert "blocked path skipped for linear 'fc'" in out
+    assert "in_features=100" in out
+
+
 def test_conv_groups_falls_back_to_original(tmp_path):
     """groups != 1 unsupported by blocked path; dispatcher keeps original MXConv2d."""
     import json
