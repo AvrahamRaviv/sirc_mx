@@ -222,23 +222,33 @@ class MXQuantizer:
         mx_specs['block_size'] = 32
         mx_specs['shared_exp_method'] = 'max'
         mx_specs['custom_cuda'] = True
-        mx_specs['xblock_accum_mode'] = 'fp32'
-        mx_specs['xblock_accum_bits'] = _XBLOCK_ACCUM_DEFAULT_BITS
-        mx_specs['xblock_accum_saturate'] = True
-        mx_specs['xblock_accum_ste_mask'] = False
 
-        # override with provided dict
+        # Extract xblock_accum_* keys — stored as attributes (NOT dict items) so
+        # microxcaling.apply_mx_specs does not reject them as unknown keys.
+        xblock_cfg = {
+            'xblock_accum_mode': 'fp32',
+            'xblock_accum_bits': _XBLOCK_ACCUM_DEFAULT_BITS,
+            'xblock_accum_saturate': True,
+            'xblock_accum_ste_mask': False,
+        }
         if spec_dict is not None:
+            spec_dict = dict(spec_dict)
+            for k in list(xblock_cfg.keys()):
+                if k in spec_dict:
+                    xblock_cfg[k] = spec_dict.pop(k)
             for k, v in spec_dict.items():
                 mx_specs[k] = v
 
-        if mx_specs['xblock_accum_mode'] not in ('fp32', 'fixed_point'):
+        if xblock_cfg['xblock_accum_mode'] not in ('fp32', 'fixed_point'):
             raise ValueError(
                 f"xblock_accum_mode must be 'fp32' or 'fixed_point', "
-                f"got {mx_specs['xblock_accum_mode']!r}"
+                f"got {xblock_cfg['xblock_accum_mode']!r}"
             )
-        if mx_specs['xblock_accum_mode'] == 'fixed_point':
-            validate_xblock_accum_bits(mx_specs['xblock_accum_bits'])
+        if xblock_cfg['xblock_accum_mode'] == 'fixed_point':
+            validate_xblock_accum_bits(xblock_cfg['xblock_accum_bits'])
+
+        for k, v in xblock_cfg.items():
+            setattr(mx_specs, k, v)
 
         return mx_specs
 
@@ -291,6 +301,13 @@ class MXQuantizer:
             # preserve weights/bias
             new.weight = module.weight
             new.bias = module.bias
+
+            # Propagate xblock_accum_* attrs onto the new layer; microxcaling
+            # re-builds its internal mx_specs and drops python attrs.
+            for k in ('xblock_accum_mode', 'xblock_accum_bits',
+                      'xblock_accum_saturate', 'xblock_accum_ste_mask'):
+                if hasattr(mx_specs, k):
+                    setattr(new, k, getattr(mx_specs, k))
 
             setattr(parent, leaf, new)
 
