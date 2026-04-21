@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bump minor version in setup.py, commit, push.
-NEW=$(python3 - <<'PY'
-import re, pathlib
-p = pathlib.Path("setup.py")
-s = p.read_text()
-m = re.search(r'version="(\d+)\.(\d+)"', s)
-major, minor = int(m.group(1)), int(m.group(2))
-new = f"{major}.{minor + 1}"
-p.write_text(re.sub(r'version="\d+\.\d+"', f'version="{new}"', s))
-print(new)
-PY
-)
+# Push pending commits, bump minor git tag (vMAJOR.MINOR), push tag.
+LATEST=$(git tag --list 'v[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+if [ -z "$LATEST" ]; then
+  NEW="v1.2"
+else
+  MAJOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\.([0-9]+).*/\1/')
+  MINOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\.([0-9]+).*/\2/')
+  NEW="v${MAJOR}.$((MINOR + 1))"
+fi
 
-git add setup.py
-git commit -m "Bump version to ${NEW}"
 git push "$@"
-echo "Pushed v${NEW}"
+git tag -a "$NEW" -m "Release $NEW"
+git push origin "$NEW"
+echo "Released $NEW"
