@@ -286,11 +286,19 @@ class MXQuantizer:
             if parent is None:
                 continue
 
+            want_blocked = getattr(mx_specs, 'xblock_accum_mode', 'fp32') == 'fixed_point'
+            bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
+
             if is_conv:
-                use_blocked = (
-                    getattr(mx_specs, 'xblock_accum_mode', 'fp32') == 'fixed_point'
-                    and module.groups == 1
-                )
+                reason = None
+                if want_blocked and module.groups != 1:
+                    reason = f"groups={module.groups}"
+                elif want_blocked and bs > 0 and module.in_channels % bs != 0:
+                    reason = f"in_channels={module.in_channels} not divisible by block_size={bs}"
+                use_blocked = want_blocked and reason is None
+                if want_blocked and not use_blocked:
+                    print(f"[MXQuantizer] fixed_point blocked path skipped for "
+                          f"conv '{clean_name}' ({reason}); using original MXConv2d.")
                 conv_cls = MXConv2dBlocked if use_blocked else MXConv2d
                 new = conv_cls(
                     module.in_channels,
@@ -304,11 +312,14 @@ class MXQuantizer:
                     mx_specs=mx_specs
                 )
             else:
-                linear_cls = (
-                    MXLinearBlocked
-                    if getattr(mx_specs, 'xblock_accum_mode', 'fp32') == 'fixed_point'
-                    else MXLinear
-                )
+                reason = None
+                if want_blocked and bs > 0 and module.in_features % bs != 0:
+                    reason = f"in_features={module.in_features} not divisible by block_size={bs}"
+                use_blocked = want_blocked and reason is None
+                if want_blocked and not use_blocked:
+                    print(f"[MXQuantizer] fixed_point blocked path skipped for "
+                          f"linear '{clean_name}' ({reason}); using original MXLinear.")
+                linear_cls = MXLinearBlocked if use_blocked else MXLinear
                 new = linear_cls(
                     module.in_features,
                     module.out_features,
