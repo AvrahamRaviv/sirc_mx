@@ -110,6 +110,20 @@ def fixed_point_accumulate(
 _VALID_MODES = ("fp32", "fixed_point")
 
 
+def _get_xblock(mx_specs, key, default):
+    """Read xblock_accum_* from a specs object.
+
+    Prefers python attribute (bypasses microxcaling apply_mx_specs key check),
+    falls back to dict-style __getitem__ for plain-dict specs (used in tests).
+    """
+    if hasattr(mx_specs, key):
+        return getattr(mx_specs, key)
+    try:
+        return mx_specs[key]
+    except (KeyError, TypeError):
+        return default
+
+
 def cross_block_accumulate_from_specs(partials, mx_specs):
     """
     Hook entry: reduce per-block FP32 partials under the layer's mx_specs config.
@@ -118,16 +132,16 @@ def cross_block_accumulate_from_specs(partials, mx_specs):
       - 'fp32'        : plain torch.sum on last dim (baseline, no emulation)
       - 'fixed_point' : N-bit signed saturating int64-emulated accumulator
     """
-    mode = mx_specs['xblock_accum_mode']
+    mode = _get_xblock(mx_specs, 'xblock_accum_mode', 'fp32')
     if mode not in _VALID_MODES:
         raise ValueError(f"xblock_accum_mode={mode!r} not in {_VALID_MODES}")
 
     if mode == "fp32":
         return partials.sum(dim=-1)
 
-    bits = mx_specs['xblock_accum_bits']
-    saturate = mx_specs['xblock_accum_saturate']
-    ste_mask = mx_specs['xblock_accum_ste_mask']
+    bits = _get_xblock(mx_specs, 'xblock_accum_bits', _DEFAULT_BITS)
+    saturate = _get_xblock(mx_specs, 'xblock_accum_saturate', True)
+    ste_mask = _get_xblock(mx_specs, 'xblock_accum_ste_mask', False)
     return fixed_point_accumulate(
         partials, total_bits=bits, scale_exp=None, saturate=saturate, ste_mask=ste_mask
     )
