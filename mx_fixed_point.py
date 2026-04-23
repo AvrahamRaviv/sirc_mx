@@ -1,8 +1,10 @@
 import torch
 
-_MIN_BITS = 40
+_MIN_BITS = 32
 _MAX_BITS = 48
 _DEFAULT_BITS = 48
+_VALID_MODES = ("fp32_partial", "hw_fixed_point")
+_VALID_SAT_MODES = ("per_product", "per_block")
 
 
 def validate_xblock_accum_bits(bits):
@@ -124,6 +126,10 @@ XBLOCK_ACCUM_DEFAULTS = {
     "scale_exp": None,   # None = auto-pick per forward from partial range
     "saturate": True,
     "ste_mask": False,
+    # HW-faithful emulation knobs. Only consulted when mode == 'hw_fixed_point'.
+    "mode": "fp32_partial",       # 'fp32_partial' (legacy einsum+xblock_accum) or 'hw_fixed_point'
+    "sat_mode": "per_product",    # 'per_product' (HW-faithful) or 'per_block' (sum-then-sat; fast)
+    "e_layer_min": None,          # int; required for 'hw_fixed_point' inference (set via calibration)
 }
 
 
@@ -166,6 +172,20 @@ def normalize_xblock_accum(value):
             raise TypeError(
                 f"xblock_accum.scale_exp must be None or int, "
                 f"got {type(cfg['scale_exp']).__name__}"
+            )
+        if cfg["mode"] not in _VALID_MODES:
+            raise ValueError(
+                f"xblock_accum.mode must be in {_VALID_MODES}, got {cfg['mode']!r}"
+            )
+        if cfg["sat_mode"] not in _VALID_SAT_MODES:
+            raise ValueError(
+                f"xblock_accum.sat_mode must be in {_VALID_SAT_MODES}, "
+                f"got {cfg['sat_mode']!r}"
+            )
+        if cfg["e_layer_min"] is not None and not isinstance(cfg["e_layer_min"], int):
+            raise TypeError(
+                f"xblock_accum.e_layer_min must be None or int, "
+                f"got {type(cfg['e_layer_min']).__name__}"
             )
     return cfg
 

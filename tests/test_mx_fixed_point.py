@@ -35,9 +35,9 @@ def _specs(enabled=True, **overrides):
 
 
 def test_validate_bits_range():
-    for b in (40, 44, 48):
+    for b in (32, 35, 40, 44, 48):
         assert validate_xblock_accum_bits(b) == b
-    for b in (0, 1, 16, 32, 39, 49, 64):
+    for b in (0, 1, 16, 31, 49, 64):
         with pytest.raises(ValueError):
             validate_xblock_accum_bits(b)
     with pytest.raises(TypeError):
