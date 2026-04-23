@@ -27,12 +27,16 @@ def _specs(block_size=32, custom_cuda=False):
     return sp
 
 
-def _attach_xblock_attrs(layer, mode='fixed_point', bits=48, backend='python'):
-    layer.xblock_accum_mode = mode
-    layer.xblock_accum_bits = bits
-    layer.xblock_accum_saturate = True
-    layer.xblock_accum_ste_mask = False
-    layer.xblock_accum_backend = backend
+def _attach_xblock_attrs(layer, enabled=True, bits=48, backend='python',
+                          scale_exp=None, saturate=True, ste_mask=False):
+    layer.xblock_accum = {
+        'enabled': enabled,
+        'bits': bits,
+        'backend': backend,
+        'scale_exp': scale_exp,
+        'saturate': saturate,
+        'ste_mask': ste_mask,
+    }
 
 
 def _build_pair(in_feat, out_feat, bias, seed=0):
@@ -143,9 +147,11 @@ def test_dispatch_fixed_point_uses_blocked(tmp_path):
             "scale_bits": 8,
             "shared_exp_method": "max",
             "custom_cuda": False,
-            "xblock_accum_mode": "fixed_point",
-            "xblock_accum_bits": 48,
-            "xblock_accum_backend": "python",
+            "xblock_accum": {
+                "enabled": True,
+                "bits": 48,
+                "backend": "python",
+            },
         },
         "layers": [{"name": "fc"}],
         "ptq": False,
@@ -237,9 +243,11 @@ def test_conv_dispatch_fixed_point_uses_blocked(tmp_path):
             "scale_bits": 8,
             "shared_exp_method": "max",
             "custom_cuda": False,
-            "xblock_accum_mode": "fixed_point",
-            "xblock_accum_bits": 48,
-            "xblock_accum_backend": "python",
+            "xblock_accum": {
+                "enabled": True,
+                "bits": 48,
+                "backend": "python",
+            },
         },
         "layers": [{"name": "conv"}],
         "ptq": False,
@@ -305,9 +313,11 @@ def test_conv_nondivisible_channels_falls_back_to_original(tmp_path, capsys):
             "scale_bits": 8,
             "shared_exp_method": "max",
             "custom_cuda": False,
-            "xblock_accum_mode": "fixed_point",
-            "xblock_accum_bits": 48,
-            "xblock_accum_backend": "python",
+            "xblock_accum": {
+                "enabled": True,
+                "bits": 48,
+                "backend": "python",
+            },
         },
         "layers": [{"name": "conv"}],
         "ptq": False,
@@ -343,9 +353,11 @@ def test_linear_nondivisible_features_falls_back_to_original(tmp_path, capsys):
             "scale_bits": 8,
             "shared_exp_method": "max",
             "custom_cuda": False,
-            "xblock_accum_mode": "fixed_point",
-            "xblock_accum_bits": 48,
-            "xblock_accum_backend": "python",
+            "xblock_accum": {
+                "enabled": True,
+                "bits": 48,
+                "backend": "python",
+            },
         },
         "layers": [{"name": "fc"}],
         "ptq": False,
@@ -382,9 +394,11 @@ def test_conv_groups_falls_back_to_original(tmp_path):
             "scale_bits": 8,
             "shared_exp_method": "max",
             "custom_cuda": False,
-            "xblock_accum_mode": "fixed_point",
-            "xblock_accum_bits": 48,
-            "xblock_accum_backend": "python",
+            "xblock_accum": {
+                "enabled": True,
+                "bits": 48,
+                "backend": "python",
+            },
         },
         "layers": [{"name": "conv"}],
         "ptq": False,

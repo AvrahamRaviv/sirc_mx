@@ -10,6 +10,7 @@ from mx_fixed_point import (
     FixedPointAccumulator,
     cross_block_accumulate_from_specs,
     fixed_point_accumulate,
+    normalize_xblock_accum,
     validate_xblock_accum_bits,
 )
 
@@ -18,13 +19,18 @@ class _FakeSpecs(dict):
     pass
 
 
-def _specs(**overrides):
+def _specs(enabled=True, **overrides):
     s = _FakeSpecs()
-    s['xblock_accum_mode'] = 'fixed_point'
-    s['xblock_accum_bits'] = 48
-    s['xblock_accum_saturate'] = True
-    s['xblock_accum_ste_mask'] = False
-    s.update(overrides)
+    cfg = {
+        'enabled': enabled,
+        'bits': 48,
+        'backend': 'python',
+        'scale_exp': None,
+        'saturate': True,
+        'ste_mask': False,
+    }
+    cfg.update(overrides)
+    s['xblock_accum'] = cfg
     return s
 
 
@@ -103,25 +109,51 @@ def test_autoscale_no_saturation_for_small_inputs():
     assert torch.allclose(out_auto, ref, atol=1e-4, rtol=1e-4)
 
 
-def test_hook_fp32_mode_is_plain_sum():
+def test_hook_disabled_is_plain_sum():
     torch.manual_seed(5)
     partials = torch.randn(4, 7) * 100.0
-    out = cross_block_accumulate_from_specs(partials, _specs(xblock_accum_mode='fp32'))
+    out = cross_block_accumulate_from_specs(partials, _specs(enabled=False))
     assert torch.allclose(out, partials.sum(-1))
 
 
-def test_hook_fixed_point_mode_uses_accumulator():
+def test_hook_enabled_uses_accumulator():
     torch.manual_seed(6)
     partials = torch.randn(4, 7) * 0.1
     out = cross_block_accumulate_from_specs(partials, _specs())
     assert torch.allclose(out, partials.sum(-1), atol=1e-4, rtol=1e-4)
 
 
-def test_hook_invalid_mode_raises():
+def test_normalize_accepts_bool_and_dict():
+    assert normalize_xblock_accum(None)['enabled'] is False
+    assert normalize_xblock_accum(False)['enabled'] is False
+    assert normalize_xblock_accum(True)['enabled'] is True
+    cfg = normalize_xblock_accum({'bits': 44, 'scale_exp': 12})
+    assert cfg['bits'] == 44 and cfg['scale_exp'] == 12 and cfg['enabled'] is True
+
+
+def test_normalize_rejects_unknown_key():
     with pytest.raises(ValueError):
-        cross_block_accumulate_from_specs(
-            torch.zeros(1, 1), _specs(xblock_accum_mode='float')
-        )
+        normalize_xblock_accum({'bogus': 1})
+
+
+def test_normalize_rejects_bad_backend():
+    with pytest.raises(ValueError):
+        normalize_xblock_accum({'backend': 'cuda'})
+
+
+def test_normalize_rejects_bad_scale_exp_type():
+    with pytest.raises(TypeError):
+        normalize_xblock_accum({'scale_exp': 1.5})
+
+
+def test_hook_uses_configured_scale_exp():
+    torch.manual_seed(7)
+    partials = torch.full((1, 4), 1.0e6)
+    out = cross_block_accumulate_from_specs(
+        partials, _specs(bits=40, scale_exp=30, saturate=True)
+    )
+    hi = ((1 << 39) - 1) * (2 ** -30)
+    assert out.item() == pytest.approx(hi, rel=0, abs=1.0)
 
 
 if __name__ == "__main__":
