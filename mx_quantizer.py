@@ -277,6 +277,10 @@ class MXQuantizer:
                           f"conv '{clean_name}' ({reason}); using original MXConv2d.")
                 if use_blocked and want_hw:
                     conv_cls = MXConv2dHW
+                    print(f"[MXQuantizer] conv '{clean_name}' -> MXConv2dHW "
+                          f"(hw_fixed_point; bits={xblock_cfg.get('bits')}, "
+                          f"sat_mode={xblock_cfg.get('sat_mode')}, "
+                          f"e_layer_min={xblock_cfg.get('e_layer_min')})")
                 elif use_blocked:
                     conv_cls = MXConv2dBlocked
                 else:
@@ -316,6 +320,12 @@ class MXQuantizer:
             # re-builds its internal mx_specs and drops python attrs.
             if hasattr(mx_specs, 'xblock_accum'):
                 setattr(new, 'xblock_accum', getattr(mx_specs, 'xblock_accum'))
+
+            if isinstance(new, MXConv2dHW):
+                new._mx_layer_name = clean_name
+                cfg_e = getattr(mx_specs, 'xblock_accum', {}).get('e_layer_min')
+                if cfg_e is not None:
+                    new.e_layer_min = int(cfg_e)
 
             setattr(parent, leaf, new)
 

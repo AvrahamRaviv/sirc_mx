@@ -194,6 +194,10 @@ class MXConv2dHW(MXConv2d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.e_layer_min = None
+        self._mx_layer_name = None
+        self._hw_logged = False
+        self._sat_total = 0
+        self._sat_seen = 0
 
     def forward(self, x):
         if self.mx_none:
@@ -241,6 +245,18 @@ class MXConv2dHW(MXConv2d):
                 f"`xblock_accum.e_layer_min` in config."
             )
 
+        name = self._mx_layer_name or f"conv-{id(self):x}"
+        if not self._hw_logged:
+            print(
+                f"[MXConv2dHW {name}] HW path active | "
+                f"in={C} out={qw.shape[0]} k={tuple(self.kernel_size)} "
+                f"stride={tuple(self.stride)} pad={tuple(self.padding)} | "
+                f"bits={cfg['bits']} sat_mode={cfg['sat_mode']} "
+                f"e_layer_min={int(e_min)} backend={cfg['backend']}"
+            )
+            self._hw_logged = True
+
+        stats = {}
         out = hw_fxp_conv2d(
             qi, qw, bf_bias,
             e_layer_min=int(e_min),
@@ -252,7 +268,19 @@ class MXConv2dHW(MXConv2d):
             padding=self.padding,
             dilation=self.dilation,
             backend=cfg['backend'],
+            stats_sink=stats,
         )
+        sat_count = int(stats.get('sat_count', 0))
+        total = int(stats.get('total', 0))
+        self._sat_total += total
+        self._sat_seen += sat_count
+        if sat_count > 0:
+            pct = 100.0 * sat_count / max(total, 1)
+            print(
+                f"[MXConv2dHW {name}] saturated {sat_count}/{total} "
+                f"outputs ({pct:.2f}%) this forward"
+            )
+
         out = quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
         return out
 
