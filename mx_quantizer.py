@@ -16,11 +16,7 @@ from microxcaling.mx.linear import Linear as MXLinear
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
-from mx_fixed_point import (
-    fixed_point_accumulate,
-    validate_xblock_accum_bits,
-    _DEFAULT_BITS as _XBLOCK_ACCUM_DEFAULT_BITS,
-)
+from mx_fixed_point import normalize_xblock_accum
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked
 
 
@@ -224,40 +220,17 @@ class MXQuantizer:
         mx_specs['shared_exp_method'] = 'max'
         mx_specs['custom_cuda'] = True
 
-        # Extract xblock_accum_* keys — stored as attributes (NOT dict items) so
-        # microxcaling.apply_mx_specs does not reject them as unknown keys.
-        xblock_cfg = {
-            'xblock_accum_mode': 'fp32',
-            'xblock_accum_bits': _XBLOCK_ACCUM_DEFAULT_BITS,
-            'xblock_accum_saturate': True,
-            'xblock_accum_ste_mask': False,
-            'xblock_accum_backend': 'python',
-        }
+        # xblock_accum is a single nested config (bool or dict), modelled on ptq.
+        # Stored as python attribute so microxcaling.apply_mx_specs does not reject it.
+        xblock_raw = None
         if spec_dict is not None:
             spec_dict = dict(spec_dict)
-            for k in list(xblock_cfg.keys()):
-                if k in spec_dict:
-                    xblock_cfg[k] = spec_dict.pop(k)
+            if 'xblock_accum' in spec_dict:
+                xblock_raw = spec_dict.pop('xblock_accum')
             for k, v in spec_dict.items():
                 mx_specs[k] = v
 
-        if xblock_cfg['xblock_accum_mode'] not in ('fp32', 'fixed_point'):
-            raise ValueError(
-                f"xblock_accum_mode must be 'fp32' or 'fixed_point', "
-                f"got {xblock_cfg['xblock_accum_mode']!r}"
-            )
-        if xblock_cfg['xblock_accum_mode'] == 'fixed_point':
-            validate_xblock_accum_bits(xblock_cfg['xblock_accum_bits'])
-
-        if xblock_cfg['xblock_accum_backend'] not in ('python', 'triton'):
-            raise ValueError(
-                f"xblock_accum_backend must be 'python' or 'triton', "
-                f"got {xblock_cfg['xblock_accum_backend']!r}"
-            )
-
-        for k, v in xblock_cfg.items():
-            setattr(mx_specs, k, v)
-
+        setattr(mx_specs, 'xblock_accum', normalize_xblock_accum(xblock_raw))
         return mx_specs
 
     # =========================
@@ -286,7 +259,8 @@ class MXQuantizer:
             if parent is None:
                 continue
 
-            want_blocked = getattr(mx_specs, 'xblock_accum_mode', 'fp32') == 'fixed_point'
+            xblock_cfg = getattr(mx_specs, 'xblock_accum', None) or {}
+            want_blocked = bool(xblock_cfg.get('enabled', False))
             bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
 
             if is_conv:
@@ -297,7 +271,7 @@ class MXQuantizer:
                     reason = f"in_channels={module.in_channels} not divisible by block_size={bs}"
                 use_blocked = want_blocked and reason is None
                 if want_blocked and not use_blocked:
-                    print(f"[MXQuantizer] fixed_point blocked path skipped for "
+                    print(f"[MXQuantizer] xblock_accum blocked path skipped for "
                           f"conv '{clean_name}' ({reason}); using original MXConv2d.")
                 conv_cls = MXConv2dBlocked if use_blocked else MXConv2d
                 new = conv_cls(
@@ -317,7 +291,7 @@ class MXQuantizer:
                     reason = f"in_features={module.in_features} not divisible by block_size={bs}"
                 use_blocked = want_blocked and reason is None
                 if want_blocked and not use_blocked:
-                    print(f"[MXQuantizer] fixed_point blocked path skipped for "
+                    print(f"[MXQuantizer] xblock_accum blocked path skipped for "
                           f"linear '{clean_name}' ({reason}); using original MXLinear.")
                 linear_cls = MXLinearBlocked if use_blocked else MXLinear
                 new = linear_cls(
@@ -331,13 +305,10 @@ class MXQuantizer:
             new.weight = module.weight
             new.bias = module.bias
 
-            # Propagate xblock_accum_* attrs onto the new layer; microxcaling
+            # Propagate xblock_accum config onto the new layer; microxcaling
             # re-builds its internal mx_specs and drops python attrs.
-            for k in ('xblock_accum_mode', 'xblock_accum_bits',
-                      'xblock_accum_saturate', 'xblock_accum_ste_mask',
-                      'xblock_accum_backend'):
-                if hasattr(mx_specs, k):
-                    setattr(new, k, getattr(mx_specs, k))
+            if hasattr(mx_specs, 'xblock_accum'):
+                setattr(new, 'xblock_accum', getattr(mx_specs, 'xblock_accum'))
 
             setattr(parent, leaf, new)
 

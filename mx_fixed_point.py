@@ -114,53 +114,105 @@ def fixed_point_accumulate(
     return FixedPointAccumulator.apply(partials, total_bits, scale_exp, saturate, ste_mask)
 
 
-_VALID_MODES = ("fp32", "fixed_point")
 _VALID_BACKENDS = ("python", "triton")
 
 
-def _get_xblock(mx_specs, key, default):
-    """Read xblock_accum_* from a specs object.
+XBLOCK_ACCUM_DEFAULTS = {
+    "enabled": True,
+    "bits": _DEFAULT_BITS,
+    "backend": "python",
+    "scale_exp": None,   # None = auto-pick per forward from partial range
+    "saturate": True,
+    "ste_mask": False,
+}
+
+
+def normalize_xblock_accum(value):
+    """Normalize user-supplied xblock_accum config into a canonical dict.
+
+    Accepts:
+      - None / False → disabled (fall back to plain FP32 sum).
+      - True         → enabled with defaults.
+      - dict         → merged over defaults; unknown keys raise.
+
+    Validates bits range, backend, and scale_exp type.
+    """
+    if value is None or value is False:
+        return {**XBLOCK_ACCUM_DEFAULTS, "enabled": False}
+    if value is True:
+        return dict(XBLOCK_ACCUM_DEFAULTS)
+    if not isinstance(value, dict):
+        raise TypeError(
+            f"xblock_accum must be bool or dict, got {type(value).__name__}"
+        )
+
+    cfg = dict(XBLOCK_ACCUM_DEFAULTS)
+    for k, v in value.items():
+        if k not in cfg:
+            raise ValueError(
+                f"unknown xblock_accum key: {k!r}; "
+                f"valid keys: {sorted(cfg.keys())}"
+            )
+        cfg[k] = v
+
+    if cfg["enabled"]:
+        validate_xblock_accum_bits(cfg["bits"])
+        if cfg["backend"] not in _VALID_BACKENDS:
+            raise ValueError(
+                f"xblock_accum.backend must be in {_VALID_BACKENDS}, "
+                f"got {cfg['backend']!r}"
+            )
+        if cfg["scale_exp"] is not None and not isinstance(cfg["scale_exp"], int):
+            raise TypeError(
+                f"xblock_accum.scale_exp must be None or int, "
+                f"got {type(cfg['scale_exp']).__name__}"
+            )
+    return cfg
+
+
+def _get_xblock_cfg(mx_specs):
+    """Read the xblock_accum config dict from a specs object.
 
     Prefers python attribute (bypasses microxcaling apply_mx_specs key check),
     falls back to dict-style __getitem__ for plain-dict specs (used in tests).
+    Returns {'enabled': False, ...} when unset.
     """
-    if hasattr(mx_specs, key):
-        return getattr(mx_specs, key)
-    try:
-        return mx_specs[key]
-    except (KeyError, TypeError):
-        return default
+    if hasattr(mx_specs, 'xblock_accum'):
+        val = getattr(mx_specs, 'xblock_accum')
+    else:
+        try:
+            val = mx_specs['xblock_accum']
+        except (KeyError, TypeError):
+            val = None
+    if isinstance(val, dict) and 'enabled' in val:
+        return val
+    return normalize_xblock_accum(val)
 
 
 def cross_block_accumulate_from_specs(partials, mx_specs):
-    """
-    Hook entry: reduce per-block FP32 partials under the layer's mx_specs config.
+    """Reduce per-block FP32 partials under the layer's xblock_accum config.
 
-    Mode selected by mx_specs['xblock_accum_mode']:
-      - 'fp32'        : plain torch.sum on last dim (baseline, no emulation)
-      - 'fixed_point' : N-bit signed saturating int64-emulated accumulator
+    Disabled (or unset) → plain `partials.sum(-1)`.
+    Enabled → N-bit signed saturating int64-emulated accumulator (python or triton).
     """
-    mode = _get_xblock(mx_specs, 'xblock_accum_mode', 'fp32')
-    if mode not in _VALID_MODES:
-        raise ValueError(f"xblock_accum_mode={mode!r} not in {_VALID_MODES}")
-
-    if mode == "fp32":
+    cfg = _get_xblock_cfg(mx_specs)
+    if not cfg.get("enabled", False):
         return partials.sum(dim=-1)
 
-    bits = _get_xblock(mx_specs, 'xblock_accum_bits', _DEFAULT_BITS)
-    saturate = _get_xblock(mx_specs, 'xblock_accum_saturate', True)
-    ste_mask = _get_xblock(mx_specs, 'xblock_accum_ste_mask', False)
-    backend = _get_xblock(mx_specs, 'xblock_accum_backend', 'python')
-
-    if backend not in _VALID_BACKENDS:
-        raise ValueError(f"xblock_accum_backend={backend!r} not in {_VALID_BACKENDS}")
+    bits = cfg["bits"]
+    saturate = cfg["saturate"]
+    ste_mask = cfg["ste_mask"]
+    scale_exp = cfg["scale_exp"]
+    backend = cfg["backend"]
 
     if backend == "triton":
         from mx_fixed_point_triton import fixed_point_accumulate_triton
         return fixed_point_accumulate_triton(
-            partials, total_bits=bits, scale_exp=None, saturate=saturate, ste_mask=ste_mask
+            partials, total_bits=bits, scale_exp=scale_exp,
+            saturate=saturate, ste_mask=ste_mask,
         )
 
     return fixed_point_accumulate(
-        partials, total_bits=bits, scale_exp=None, saturate=saturate, ste_mask=ste_mask
+        partials, total_bits=bits, scale_exp=scale_exp,
+        saturate=saturate, ste_mask=ste_mask,
     )

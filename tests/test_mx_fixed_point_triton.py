@@ -34,12 +34,16 @@ class _FakeSpecs(dict):
 
 def _specs(**overrides):
     s = _FakeSpecs()
-    s['xblock_accum_mode'] = 'fixed_point'
-    s['xblock_accum_bits'] = 48
-    s['xblock_accum_saturate'] = True
-    s['xblock_accum_ste_mask'] = False
-    s['xblock_accum_backend'] = 'triton'
-    s.update(overrides)
+    cfg = {
+        'enabled': True,
+        'bits': 48,
+        'backend': 'triton',
+        'scale_exp': None,
+        'saturate': True,
+        'ste_mask': False,
+    }
+    cfg.update(overrides)
+    s['xblock_accum'] = cfg
     return s
 
 
@@ -64,8 +68,8 @@ def test_triton_parity_with_saturation():
 def test_triton_hook_dispatch():
     torch.manual_seed(1)
     partials = torch.randn(4, 7, device='cuda') * 0.1
-    out = cross_block_accumulate_from_specs(partials, _specs(xblock_accum_backend='triton'))
-    ref = cross_block_accumulate_from_specs(partials.cpu(), _specs(xblock_accum_backend='python')).cuda()
+    out = cross_block_accumulate_from_specs(partials, _specs(backend='triton'))
+    ref = cross_block_accumulate_from_specs(partials.cpu(), _specs(backend='python')).cuda()
     assert torch.allclose(out, ref, atol=1e-4, rtol=1e-4)
 
 
@@ -94,7 +98,7 @@ def test_triton_backend_not_enabled_by_default_and_cpu_fallback_errors_loud():
         pytest.skip("both triton and CUDA present; can't hit the error path")
     partials = torch.randn(2, 4)
     with pytest.raises(RuntimeError):
-        cross_block_accumulate_from_specs(partials, _specs(xblock_accum_backend='triton'))
+        cross_block_accumulate_from_specs(partials, _specs(backend='triton'))
 
 
 if __name__ == "__main__":
