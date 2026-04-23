@@ -17,7 +17,7 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
 from mx_fixed_point import normalize_xblock_accum
-from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked
+from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 
 
 class MXQuantizer:
@@ -261,6 +261,8 @@ class MXQuantizer:
 
             xblock_cfg = getattr(mx_specs, 'xblock_accum', None) or {}
             want_blocked = bool(xblock_cfg.get('enabled', False))
+            mode = xblock_cfg.get('mode', 'fp32_partial')
+            want_hw = want_blocked and mode == 'hw_fixed_point'
             bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
 
             if is_conv:
@@ -273,7 +275,12 @@ class MXQuantizer:
                 if want_blocked and not use_blocked:
                     print(f"[MXQuantizer] xblock_accum blocked path skipped for "
                           f"conv '{clean_name}' ({reason}); using original MXConv2d.")
-                conv_cls = MXConv2dBlocked if use_blocked else MXConv2d
+                if use_blocked and want_hw:
+                    conv_cls = MXConv2dHW
+                elif use_blocked:
+                    conv_cls = MXConv2dBlocked
+                else:
+                    conv_cls = MXConv2d
                 new = conv_cls(
                     module.in_channels,
                     module.out_channels,
