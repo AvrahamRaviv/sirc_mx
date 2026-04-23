@@ -178,6 +178,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
         qi_fp, qw_fp, bias_fp,
         e_layer_min, bs, bits, sat_mode, ste_mask,
         stride, padding, dilation, backend,
+        stats_sink=None,
     ):
         with torch.no_grad():
             qi_i8, Ea = extract_mxint8(qi_fp, bs, axis=1)
@@ -212,6 +213,11 @@ class HWFxpConv2dFn(torch.autograd.Function):
         if bias_fp is not None:
             out = out + bias_fp.view(1, -1, 1, 1)
 
+        if stats_sink is not None:
+            stats_sink["sat_count"] = int(sat.sum().item())
+            stats_sink["total"] = int(sat.numel())
+            stats_sink["backend"] = "triton" if use_triton else "python"
+
         ctx.save_for_backward(qi_fp, qw_fp, sat)
         ctx.has_bias = bias_fp is not None
         ctx.stride = (sH, sW)
@@ -236,12 +242,12 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 12 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
-        # sat_mode, ste_mask, stride, padding, dilation, backend
+        # forward took 13 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
-            None, None, None, None,
+            None, None, None, None, None,
         )
 
 
@@ -249,8 +255,13 @@ def hw_fxp_conv2d(
     qi_fp, qw_fp, bias_fp,
     e_layer_min, bs, bits=35, sat_mode="per_product", ste_mask=False,
     stride=1, padding=0, dilation=1, backend="python",
+    stats_sink=None,
 ):
-    """Public entry point; see `HWFxpConv2dFn.forward` for semantics."""
+    """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
+
+    `stats_sink` is an optional mutable dict; kernel fills in 'sat_count',
+    'total', and 'backend' after each forward for logging.
+    """
     if e_layer_min is None:
         raise RuntimeError(
             "hw_fxp_conv2d requires a static e_layer_min. Run "
@@ -260,6 +271,7 @@ def hw_fxp_conv2d(
         qi_fp, qw_fp, bias_fp,
         int(e_layer_min), int(bs), int(bits), str(sat_mode), bool(ste_mask),
         stride, padding, dilation, str(backend),
+        stats_sink,
     )
 
 
