@@ -333,6 +333,30 @@ def test_calibration_sets_e_layer_min():
 # Dispatcher
 # ----------------------------------------------------------------------
 
+def test_mxconv2dhw_pad_channels_handles_nondivisible():
+    """C=3 (RGB-style first conv) with pad_channels=True must run via HW path."""
+    torch.manual_seed(13)
+    sp = _specs()
+    hw = MXConv2dHW(3, 16, 3, padding=1, bias=True, mx_specs=sp)
+    _hw_attrs(hw, bits=48, e_layer_min=-12)
+    hw.e_layer_min = -12
+    hw.eval()
+    with torch.no_grad():
+        y = hw(torch.randn(1, 3, 8, 8))
+    assert y.shape == (1, 16, 8, 8)
+    assert torch.isfinite(y).all()
+
+
+def test_mxconv2dhw_pad_channels_disabled_raises():
+    sp = _specs()
+    hw = MXConv2dHW(3, 16, 3, padding=1, bias=False, mx_specs=sp)
+    _hw_attrs(hw, bits=48, e_layer_min=-12)
+    hw.xblock_accum["pad_channels"] = False
+    hw.e_layer_min = -12
+    with pytest.raises(AssertionError, match="pad_channels=True"):
+        hw(torch.randn(1, 3, 8, 8))
+
+
 def test_dispatch_hw_fixed_point_uses_mxconv2dhw(tmp_path):
     import json
     from mx_quantizer import MXQuantizer

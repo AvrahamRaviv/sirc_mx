@@ -130,6 +130,8 @@ XBLOCK_ACCUM_DEFAULTS = {
     "mode": "fp32_partial",       # 'fp32_partial' (legacy einsum+xblock_accum) or 'hw_fixed_point'
     "sat_mode": "per_product",    # 'per_product' (HW-faithful) or 'per_block' (sum-then-sat; fast)
     "e_layer_min": None,          # int; required for 'hw_fixed_point' inference (set via calibration)
+    "pad_channels": True,         # if True, MXConv2dHW pads C up to a multiple of bs (zeros).
+                                  # Disable to force fallback to MXConv2d for non-divisible layers.
 }
 
 
@@ -186,6 +188,11 @@ def normalize_xblock_accum(value):
             raise TypeError(
                 f"xblock_accum.e_layer_min must be None or int, "
                 f"got {type(cfg['e_layer_min']).__name__}"
+            )
+        if not isinstance(cfg["pad_channels"], bool):
+            raise TypeError(
+                f"xblock_accum.pad_channels must be bool, "
+                f"got {type(cfg['pad_channels']).__name__}"
             )
     return cfg
 
