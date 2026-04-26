@@ -208,17 +208,36 @@ class MXConv2dHW(MXConv2d):
         sp = self.mx_specs
         bs = sp['block_size']
         B, C, H, W = x.shape
-        assert C % bs == 0, (
-            f"MXConv2dHW requires in_channels ({C}) divisible by block_size ({bs})"
-        )
         if sp['a_elem_format'] != 'int8' or sp['w_elem_format'] != 'int8':
             raise RuntimeError(
                 "MXConv2dHW models integer HW; set a_elem_format and "
                 "w_elem_format to 'int8'."
             )
 
+        cfg_early = _get_xblock_cfg(self)
+        pad_channels = bool(cfg_early.get('pad_channels', True))
+        if C % bs != 0:
+            if not pad_channels:
+                raise AssertionError(
+                    f"MXConv2dHW requires in_channels ({C}) divisible by "
+                    f"block_size ({bs}); set xblock_accum.pad_channels=True "
+                    f"to allow zero-padding."
+                )
+            pad = bs - (C % bs)
+            x = F.pad(x, (0, 0, 0, 0, 0, pad))           # pad C with zeros
+            weight = F.pad(self.weight, (0, 0, 0, 0, 0, pad))
+            B, C, H, W = x.shape
+            if not getattr(self, '_pad_logged', False):
+                print(
+                    f"[MXConv2dHW {self._mx_layer_name or '?'}] zero-padding "
+                    f"in_channels {C - pad} -> {C} to satisfy block_size={bs}"
+                )
+                self._pad_logged = True
+        else:
+            weight = self.weight
+
         bf_in = quantize_elemwise_op(x, mx_specs=sp, round=sp['round_output'])
-        bf_w = quantize_elemwise_op(self.weight, mx_specs=sp, round=sp['round_weight'])
+        bf_w = quantize_elemwise_op(weight, mx_specs=sp, round=sp['round_weight'])
         if self.bias is not None:
             bf_bias = quantize_elemwise_op(self.bias, mx_specs=sp, round=sp['round_weight'])
         else:
