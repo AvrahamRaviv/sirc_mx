@@ -314,7 +314,16 @@ def calibrate_e_layer_min(model, data_iter, num_batches=8, forward_fn=None):
     """
     from mx_layers_blocked import MXConv2dHW  # local import to avoid cycle
 
-    layers = [m for m in model.modules() if isinstance(m, MXConv2dHW)]
+    all_hw = [m for m in model.modules() if isinstance(m, MXConv2dHW)]
+    if not all_hw:
+        return {}
+
+    # Generic-call friendly: skip layers whose e_layer_min is already pinned.
+    layers = [m for m in all_hw if m.e_layer_min is None]
+    skipped = len(all_hw) - len(layers)
+    if skipped:
+        print(f"[calibrate_e_layer_min] {skipped}/{len(all_hw)} layers already "
+              f"have e_layer_min set; skipping them.")
     if not layers:
         return {}
 
@@ -342,5 +351,6 @@ def calibrate_e_layer_min(model, data_iter, num_batches=8, forward_fn=None):
             if st is not None and st.running_min is not None:
                 m.e_layer_min = int(st.running_min)
                 result[m] = m.e_layer_min
-            delattr(m, "_calibration_state")
+            if hasattr(m, "_calibration_state"):
+                delattr(m, "_calibration_state")
     return result
