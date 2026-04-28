@@ -132,6 +132,10 @@ XBLOCK_ACCUM_DEFAULTS = {
     "e_layer_min": None,          # int; required for 'hw_fixed_point' inference (set via calibration)
     "pad_channels": True,         # if True, MXConv2dHW pads C up to a multiple of bs (zeros).
                                   # Disable to force fallback to MXConv2d for non-divisible layers.
+    "verbose": 1,                 # 0 = silent, 1 = quant-time summary + sampled per-layer log,
+                                  # 2 = full per-forward / per-layer logging.
+    "verbose_sample_every": 100,  # at verbose=1, emit one saturation summary per N forwards
+                                  # per layer (only if non-zero saturation observed).
 }
 
 
@@ -193,6 +197,16 @@ def normalize_xblock_accum(value):
             raise TypeError(
                 f"xblock_accum.pad_channels must be bool, "
                 f"got {type(cfg['pad_channels']).__name__}"
+            )
+        if not isinstance(cfg["verbose"], int) or cfg["verbose"] < 0 or cfg["verbose"] > 2:
+            raise ValueError(
+                f"xblock_accum.verbose must be int in [0, 2], "
+                f"got {cfg['verbose']!r}"
+            )
+        if not isinstance(cfg["verbose_sample_every"], int) or cfg["verbose_sample_every"] < 1:
+            raise ValueError(
+                f"xblock_accum.verbose_sample_every must be a positive int, "
+                f"got {cfg['verbose_sample_every']!r}"
             )
     return cfg
 

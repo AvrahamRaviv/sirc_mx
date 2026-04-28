@@ -243,6 +243,19 @@ class MXQuantizer:
         if layer_map is None:
             layer_map = self._build_layer_map()
 
+        # Determine verbose level once from the first xblock-enabled mx_specs.
+        verbose = 1
+        for spec in layer_map.values():
+            xc = getattr(spec, 'xblock_accum', None)
+            if xc and xc.get('enabled'):
+                verbose = int(xc.get('verbose', 1))
+                break
+
+        replace_summary = {
+            'hw': [], 'blocked': [], 'mx_default_conv': [],
+            'mx_default_linear': [], 'fallback_conv': [], 'fallback_linear': [],
+        }
+
         for full_name, module in model.named_modules():
             is_conv = isinstance(module, nn.Conv2d) and not isinstance(module, MXConv2d)
             is_linear = isinstance(module, nn.Linear) and not isinstance(module, MXLinear)
@@ -274,18 +287,24 @@ class MXQuantizer:
                     reason = f"in_channels={module.in_channels} not divisible by block_size={bs}"
                 use_blocked = want_blocked and reason is None
                 if want_blocked and not use_blocked:
-                    print(f"[MXQuantizer] xblock_accum blocked path skipped for "
-                          f"conv '{clean_name}' ({reason}); using original MXConv2d.")
+                    if verbose >= 2:
+                        print(f"[MXQuantizer] xblock_accum blocked path skipped for "
+                              f"conv '{clean_name}' ({reason}); using original MXConv2d.")
+                    replace_summary['fallback_conv'].append((clean_name, reason))
                 if use_blocked and want_hw:
                     conv_cls = MXConv2dHW
-                    print(f"[MXQuantizer] conv '{clean_name}' -> MXConv2dHW "
-                          f"(hw_fixed_point; bits={xblock_cfg.get('bits')}, "
-                          f"sat_mode={xblock_cfg.get('sat_mode')}, "
-                          f"e_layer_min={xblock_cfg.get('e_layer_min')})")
+                    if verbose >= 2:
+                        print(f"[MXQuantizer] conv '{clean_name}' -> MXConv2dHW "
+                              f"(hw_fixed_point; bits={xblock_cfg.get('bits')}, "
+                              f"sat_mode={xblock_cfg.get('sat_mode')}, "
+                              f"e_layer_min={xblock_cfg.get('e_layer_min')})")
+                    replace_summary['hw'].append(clean_name)
                 elif use_blocked:
                     conv_cls = MXConv2dBlocked
+                    replace_summary['blocked'].append(clean_name)
                 else:
                     conv_cls = MXConv2d
+                    replace_summary['mx_default_conv'].append(clean_name)
                 new = conv_cls(
                     module.in_channels,
                     module.out_channels,
@@ -303,9 +322,15 @@ class MXQuantizer:
                     reason = f"in_features={module.in_features} not divisible by block_size={bs}"
                 use_blocked = want_blocked and reason is None
                 if want_blocked and not use_blocked:
-                    print(f"[MXQuantizer] xblock_accum blocked path skipped for "
-                          f"linear '{clean_name}' ({reason}); using original MXLinear.")
+                    if verbose >= 2:
+                        print(f"[MXQuantizer] xblock_accum blocked path skipped for "
+                              f"linear '{clean_name}' ({reason}); using original MXLinear.")
+                    replace_summary['fallback_linear'].append((clean_name, reason))
                 linear_cls = MXLinearBlocked if use_blocked else MXLinear
+                if use_blocked:
+                    replace_summary['blocked'].append(clean_name)
+                else:
+                    replace_summary['mx_default_linear'].append(clean_name)
                 new = linear_cls(
                     module.in_features,
                     module.out_features,
@@ -329,6 +354,26 @@ class MXQuantizer:
                     new.e_layer_min = int(cfg_e)
 
             setattr(parent, leaf, new)
+
+        if verbose >= 1:
+            n_hw = len(replace_summary['hw'])
+            n_blk = len(replace_summary['blocked'])
+            n_def_c = len(replace_summary['mx_default_conv'])
+            n_def_l = len(replace_summary['mx_default_linear'])
+            n_fb_c = len(replace_summary['fallback_conv'])
+            n_fb_l = len(replace_summary['fallback_linear'])
+            print(
+                f"[MXQuantizer] replace summary: "
+                f"hw={n_hw} blocked={n_blk} "
+                f"mxconv={n_def_c} mxlinear={n_def_l} "
+                f"fallback_conv={n_fb_c} fallback_linear={n_fb_l}"
+            )
+            if n_fb_c or n_fb_l:
+                reasons = {}
+                for _, r in replace_summary['fallback_conv'] + replace_summary['fallback_linear']:
+                    reasons[r] = reasons.get(r, 0) + 1
+                tally = ", ".join(f"{r}: {n}" for r, n in reasons.items())
+                print(f"[MXQuantizer] fallback reasons: {tally}")
 
     def _build_layer_map(self):
         """

@@ -301,6 +301,39 @@ class _CalibrationState:
         self.running_min = cand if self.running_min is None else min(self.running_min, cand)
 
 
+def report_hw_stats(model, reset=False):
+    """Print and return aggregated saturation stats per MXConv2dHW layer.
+
+    Useful as a per-epoch summary when running with verbose=0 or 1. With
+    `reset=True`, lifetime counters are zeroed after reporting.
+    """
+    from mx_layers_blocked import MXConv2dHW
+    rows = []
+    for m in model.modules():
+        if not isinstance(m, MXConv2dHW):
+            continue
+        name = m._mx_layer_name or f"conv-{id(m):x}"
+        sat = int(m._sat_seen_life)
+        tot = int(m._sat_total_life)
+        fwd = int(m._fwd_count)
+        pct = (100.0 * sat / tot) if tot else 0.0
+        rows.append((name, fwd, sat, tot, pct))
+        if reset:
+            m._sat_seen_life = 0
+            m._sat_total_life = 0
+            m._sat_seen_window = 0
+            m._sat_total_window = 0
+            m._fwd_count = 0
+
+    rows.sort(key=lambda r: -r[4])   # worst first
+    print(f"[MXConv2dHW] saturation report ({len(rows)} layers):")
+    for name, fwd, sat, tot, pct in rows[:20]:
+        print(f"  {pct:6.3f}%  sat={sat}/{tot}  fwd={fwd}  {name}")
+    if len(rows) > 20:
+        print(f"  ... and {len(rows) - 20} more layers (sorted by % desc)")
+    return rows
+
+
 def calibrate_e_layer_min(model, data_iter, num_batches=8, forward_fn=None):
     """Populate `e_layer_min` on every `MXConv2dHW` layer by sweeping inputs.
 

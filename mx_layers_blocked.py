@@ -196,8 +196,14 @@ class MXConv2dHW(MXConv2d):
         self.e_layer_min = None
         self._mx_layer_name = None
         self._hw_logged = False
-        self._sat_total = 0
-        self._sat_seen = 0
+        self._pad_logged = False
+        self._fwd_count = 0
+        # Lifetime totals (used by report_hw_stats).
+        self._sat_total_life = 0
+        self._sat_seen_life = 0
+        # Sampling-window counters (reset every verbose_sample_every forwards).
+        self._sat_total_window = 0
+        self._sat_seen_window = 0
 
     def forward(self, x):
         if self.mx_none:
@@ -216,6 +222,7 @@ class MXConv2dHW(MXConv2d):
 
         cfg_early = _get_xblock_cfg(self)
         pad_channels = bool(cfg_early.get('pad_channels', True))
+        verbose = int(cfg_early.get('verbose', 1))
         if C % bs != 0:
             if not pad_channels:
                 raise AssertionError(
@@ -227,7 +234,7 @@ class MXConv2dHW(MXConv2d):
             x = F.pad(x, (0, 0, 0, 0, 0, pad))           # pad C with zeros
             weight = F.pad(self.weight, (0, 0, 0, 0, 0, pad))
             B, C, H, W = x.shape
-            if not getattr(self, '_pad_logged', False):
+            if verbose >= 2 and not self._pad_logged:
                 print(
                     f"[MXConv2dHW {self._mx_layer_name or '?'}] zero-padding "
                     f"in_channels {C - pad} -> {C} to satisfy block_size={bs}"
@@ -265,7 +272,7 @@ class MXConv2dHW(MXConv2d):
             )
 
         name = self._mx_layer_name or f"conv-{id(self):x}"
-        if not self._hw_logged:
+        if verbose >= 2 and not self._hw_logged:
             print(
                 f"[MXConv2dHW {name}] HW path active | "
                 f"in={C} out={qw.shape[0]} k={tuple(self.kernel_size)} "
@@ -291,14 +298,29 @@ class MXConv2dHW(MXConv2d):
         )
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))
-        self._sat_total += total
-        self._sat_seen += sat_count
-        if sat_count > 0:
+        self._fwd_count += 1
+        self._sat_total_life += total
+        self._sat_seen_life += sat_count
+        self._sat_total_window += total
+        self._sat_seen_window += sat_count
+
+        if verbose >= 2 and sat_count > 0:
             pct = 100.0 * sat_count / max(total, 1)
             print(
                 f"[MXConv2dHW {name}] saturated {sat_count}/{total} "
                 f"outputs ({pct:.2f}%) this forward"
             )
+        elif verbose >= 1:
+            sample_every = int(cfg_early.get('verbose_sample_every', 100))
+            if self._fwd_count % sample_every == 0 and self._sat_seen_window > 0:
+                pct = 100.0 * self._sat_seen_window / max(self._sat_total_window, 1)
+                print(
+                    f"[MXConv2dHW {name}] sat sample over last {sample_every} "
+                    f"forwards: {self._sat_seen_window}/{self._sat_total_window} "
+                    f"outputs ({pct:.3f}%)"
+                )
+                self._sat_seen_window = 0
+                self._sat_total_window = 0
 
         out = quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
         return out
