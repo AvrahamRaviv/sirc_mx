@@ -1,7 +1,7 @@
 import torch
 
 _MIN_BITS = 32
-_MAX_BITS = 48
+_MAX_BITS = 64
 _DEFAULT_BITS = 48
 _VALID_MODES = ("fp32_partial", "hw_fixed_point")
 _VALID_SAT_MODES = ("per_product", "per_block")
