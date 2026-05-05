@@ -41,6 +41,7 @@ if _TRITON_AVAILABLE:
         qw_ptr,         # *i8,  [O, nb, BS, kK]
         Ea_ptr,         # *i16, [M, nb, kK]
         Ew_ptr,         # *i16, [O, nb, kK]
+        bias_ptr,       # *i64, [O]   (only read if HAS_BIAS)
         out_ptr,        # *fp32,[M, O]
         sat_ptr,        # *i8,  [M, O]
         M, O, nb, kK,
@@ -52,6 +53,7 @@ if _TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         SAT_PER_PRODUCT: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
     ):
         pid_m = tl.program_id(axis=0)
         pid_o = tl.program_id(axis=1)
@@ -121,6 +123,15 @@ if _TRITON_AVAILABLE:
                     acc = tl.where(over, hi, acc)
                     acc = tl.where(under, lo, acc)
 
+        if HAS_BIAS:
+            b_int = tl.load(bias_ptr + pid_o).to(tl.int64)
+            acc = acc + b_int
+            over = acc > hi
+            under = acc < lo
+            sat = sat | over | under
+            acc = tl.where(over, hi, acc)
+            acc = tl.where(under, lo, acc)
+
         out = acc.to(tl.float32) * inv_scale_ref
         out_off = offs_m * O + pid_o
         tl.store(out_ptr + out_off, out, mask=mask_m)
@@ -176,6 +187,7 @@ def _hw_fxp_conv2d_triton(
     qi_i8, qw_i8, Ea, Ew,
     e_layer_min, stride, padding, dilation,
     bs, bits, sat_mode,
+    bias_fp=None,
 ):
     _require_triton_cuda()
     if not qi_i8.is_cuda:
@@ -201,14 +213,25 @@ def _hw_fxp_conv2d_triton(
     inv_scale_ref = float(2.0 ** int(e_layer_min))
     sat_per_product = 1 if sat_mode == "per_product" else 0
 
+    has_bias = bias_fp is not None
+    if has_bias:
+        # Project bias onto the accumulator's fixed-point grid:
+        #   acc represents value * 2^(-e_layer_min); so bias_int = round(b * 2^(-e_layer_min)).
+        scale_to_acc = float(2.0 ** (-int(e_layer_min)))
+        bias_int = (bias_fp.detach().to(torch.float64).to(device) * scale_to_acc) \
+            .round().to(torch.int64).contiguous()
+    else:
+        bias_int = torch.empty(O, dtype=torch.int64, device=device)
+
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
 
     _hw_fxp_conv_kernel[grid](
-        qi_flat, qw_flat, Ea_flat, Ew_flat, out, sat,
+        qi_flat, qw_flat, Ea_flat, Ew_flat, bias_int, out, sat,
         M, O, nb, kK,
         int(e_layer_min), int(two_bias), int(lo), int(hi), inv_scale_ref,
         BLOCK_M=BLOCK_M, BS=bs, SAT_PER_PRODUCT=sat_per_product,
+        HAS_BIAS=1 if has_bias else 0,
     )
 
     # Caller reshapes to [B, O, H_out, W_out]. We return [B, O, L] and sat [B, O, L].
