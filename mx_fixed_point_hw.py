@@ -72,6 +72,7 @@ def _hw_fxp_conv2d_ref(
     qi_i8, qw_i8, Ea, Ew,
     e_layer_min, stride, padding, dilation,
     bs, bits, sat_mode,
+    bias_fp=None,
 ):
     """Pure-torch reference for the HW fixed-point conv2d kernel.
 
@@ -157,6 +158,15 @@ def _hw_fxp_conv2d_ref(
                 acc, sat_step = _sat(acc, lo, hi)
                 sat = sat | sat_step
 
+    if bias_fp is not None:
+        # Project bias onto acc grid: bias_int = round(b * 2^(-e_layer_min)).
+        scale_to_acc = float(2.0 ** (-e_min))
+        bias_int = (bias_fp.detach().to(torch.float64) * scale_to_acc) \
+            .round().to(torch.int64).to(device).view(1, O, 1)
+        acc = acc + bias_int
+        acc, sat_step = _sat(acc, lo, hi)
+        sat = sat | sat_step
+
     out = acc.to(torch.float32) * float(2.0 ** e_min)
     return out, sat
 
@@ -191,12 +201,14 @@ class HWFxpConv2dFn(torch.autograd.Function):
                 qi_i8, qw_i8, Ea, Ew,
                 int(e_layer_min), stride, padding, dilation,
                 bs, int(bits), sat_mode,
+                bias_fp=bias_fp,
             )
         else:
             out_flat, sat_flat = _hw_fxp_conv2d_ref(
                 qi_i8, qw_i8, Ea, Ew,
                 int(e_layer_min), stride, padding, dilation,
                 bs, int(bits), sat_mode,
+                bias_fp=bias_fp,
             )
 
         B, _, H, W = qi_fp.shape
@@ -210,8 +222,8 @@ class HWFxpConv2dFn(torch.autograd.Function):
 
         out = out_flat.view(B, O, H_out, W_out).to(qi_fp.dtype)
         sat = sat_flat.view(B, O, H_out, W_out)
-        if bias_fp is not None:
-            out = out + bias_fp.view(1, -1, 1, 1)
+        # Bias is now added inside the kernel (HW-faithful: into the int
+        # accumulator on the common e_layer_min grid). Do NOT add post-de-shift.
 
         if stats_sink is not None:
             stats_sink["sat_count"] = int(sat.sum().item())
