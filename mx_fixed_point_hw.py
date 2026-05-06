@@ -264,7 +264,10 @@ class HWFxpConv2dFn(torch.autograd.Function):
         W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
         assert H_out * W_out == out_flat.shape[-1]
 
-        out = out_flat.view(B, O, H_out, W_out).to(qi_fp.dtype)
+        # Clone so the return is not a view of `out_flat`. Downstream inplace ops
+        # (e.g. F.relu_ on the next layer's input) would otherwise trigger
+        # PyTorch's "view+inplace inside custom Function" guard.
+        out = out_flat.view(B, O, H_out, W_out).to(qi_fp.dtype).clone()
         sat = sat_flat.view(B, O, H_out, W_out)
         # Bias is now added inside the kernel (HW-faithful: into the int
         # accumulator on the common e_layer_min grid). Do NOT add post-de-shift.
