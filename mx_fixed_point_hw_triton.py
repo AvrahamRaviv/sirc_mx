@@ -1,18 +1,19 @@
 """Fused Triton kernel for the HW-faithful fixed-point Conv2d path.
 
 Complements `mx_fixed_point_hw._hw_fxp_conv2d_ref`. Same numerics:
-per-product int8 x int8 -> int16 multiply, signed shift by
-`Ew + Ea - 2*MANTISSA_BIAS - e_layer_min`, saturating int-N add into a
+per-product intN x intN multiply, signed shift by
+`Ew + Ea - 2*mant_bias - e_layer_min`, saturating int-bits add into a
 single wide accumulator. Parallel over (M = B*L, O), serial over the
 K/bs reduction so the HW pipeline is emulated lane-by-lane.
+
+Operands are promoted to int32 in the launcher so a single kernel
+handles every MXINT format (int8..int16); product math runs in int64.
 
 Importable without Triton (gated on `_TRITON_AVAILABLE`).
 """
 
 import torch
 import torch.nn.functional as F
-
-from mx_fixed_point_hw import MANTISSA_BIAS
 
 try:
     import triton
@@ -37,8 +38,8 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _hw_fxp_conv_kernel(
-        qi_ptr,         # *i8,  [M, nb, BS, kK]
-        qw_ptr,         # *i8,  [O, nb, BS, kK]
+        qi_ptr,         # *i32, [M, nb, BS, kK]   (operands promoted to int32 in launcher)
+        qw_ptr,         # *i32, [O, nb, BS, kK]
         Ea_ptr,         # *i16, [M, nb, kK]
         Ew_ptr,         # *i16, [O, nb, kK]
         bias_ptr,       # *i64, [O]   (only read if HAS_BIAS)
@@ -46,7 +47,7 @@ if _TRITON_AVAILABLE:
         sat_ptr,        # *i8,  [M, O]
         M, O, nb, kK,
         e_layer_min,    # i32
-        two_bias,       # i32
+        two_bias,       # i32  (= 2 * mant_bias for the chosen MXINT format)
         lo,             # i64
         hi,             # i64
         inv_scale_ref,  # fp32  = 2^e_layer_min
@@ -143,15 +144,15 @@ def _prepare_tensors(qi_i8, qw_i8, Ea, Ew, stride, padding, dilation):
 
     Input shapes
     ------------
-    qi_i8 : [B, C, H, W]      int8
-    qw_i8 : [O, C, kH, kW]    int8
+    qi_i8 : [B, C, H, W]      int8 or int16 (intN, N<=16)
+    qw_i8 : [O, C, kH, kW]    int8 or int16
     Ea    : [B, nb, H, W]     int16
     Ew    : [O, nb, kH, kW]   int16
 
-    Output layout
+    Output layout (operands promoted to int32 for a single kernel path)
     -------------
-    qi_flat  : [M, nb, BS, kK]   int8, M = B * L
-    qw_flat  : [O, nb, BS, kK]   int8
+    qi_flat  : [M, nb, BS, kK]   int32, M = B * L
+    qw_flat  : [O, nb, BS, kK]   int32
     Ea_flat  : [M, nb, kK]       int16
     Ew_flat  : [O, nb, kK]       int16
     (M, L)
@@ -162,13 +163,13 @@ def _prepare_tensors(qi_i8, qw_i8, Ea, Ew, stride, padding, dilation):
     bs = C // nb
     kK = kH * kW
 
-    # im2col on int8 via float
+    # im2col via float (int dtypes not supported by F.unfold), then cast back.
     qi_unf = F.unfold(
         qi_i8.to(torch.float32), (kH, kW),
         dilation=dilation, padding=padding, stride=stride,
     )  # [B, C*kK, L]
     L = qi_unf.shape[-1]
-    qi_unf = qi_unf.view(B, nb, bs, kK, L).permute(0, 4, 1, 2, 3).contiguous().to(torch.int8)
+    qi_unf = qi_unf.view(B, nb, bs, kK, L).permute(0, 4, 1, 2, 3).contiguous().to(torch.int32)
     qi_flat = qi_unf.view(B * L, nb, bs, kK)
 
     Ea_unf = F.unfold(
@@ -178,7 +179,7 @@ def _prepare_tensors(qi_i8, qw_i8, Ea, Ew, stride, padding, dilation):
     Ea_unf = Ea_unf.view(B, nb, kK, L).permute(0, 3, 1, 2).contiguous().to(torch.int16)
     Ea_flat = Ea_unf.view(B * L, nb, kK)
 
-    qw_flat = qw_i8.view(O, nb, bs, kK).contiguous()
+    qw_flat = qw_i8.view(O, nb, bs, kK).to(torch.int32).contiguous()
     Ew_flat = Ew.view(O, nb, kK).contiguous()
     return qi_flat, qw_flat, Ea_flat, Ew_flat, B * L, L, nb, bs, kK
 
@@ -188,6 +189,7 @@ def _hw_fxp_conv2d_triton(
     e_layer_min, stride, padding, dilation,
     bs, bits, sat_mode,
     bias_fp=None,
+    mant_bias=6,
 ):
     _require_triton_cuda()
     if not qi_i8.is_cuda:
@@ -209,7 +211,7 @@ def _hw_fxp_conv2d_triton(
 
     lo = -(1 << (bits - 1))
     hi = (1 << (bits - 1)) - 1
-    two_bias = 2 * MANTISSA_BIAS
+    two_bias = 2 * int(mant_bias)
     inv_scale_ref = float(2.0 ** int(e_layer_min))
     sat_per_product = 1 if sat_mode == "per_product" else 0
 

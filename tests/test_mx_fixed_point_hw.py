@@ -32,7 +32,9 @@ from mx_fixed_point import (
 from mx_fixed_point_hw import (
     MANTISSA_BIAS,
     _hw_fxp_conv2d_ref,
+    _int_format_params,
     calibrate_e_layer_min,
+    extract_mxint,
     extract_mxint8,
 )
 from mx_layers_blocked import MXConv2dBlocked, MXConv2dHW
@@ -426,6 +428,132 @@ def test_dispatch_fp32_partial_still_uses_blocked(tmp_path):
     model = q.quant(Net())
     assert isinstance(model.conv, MXConv2dBlocked)
     assert not isinstance(model.conv, MXConv2dHW)
+
+
+# ----------------------------------------------------------------------
+# Parametric MXINT format support (int8, int10, int12, int16)
+# ----------------------------------------------------------------------
+
+def _specs_fmt(fmt, block_size=32):
+    sp = _specs(block_size=block_size)
+    sp["a_elem_format"] = fmt
+    sp["w_elem_format"] = fmt
+    return sp
+
+
+@pytest.mark.parametrize("fmt,expected_bias,expected_max", [
+    ("int8", 6, 127),
+    ("int10", 8, 511),
+    ("int12", 10, 2047),
+    ("int16", 14, 32767),
+])
+def test_int_format_params(fmt, expected_bias, expected_max):
+    mbits, mant_bias, max_val, _ = _int_format_params(fmt)
+    assert mant_bias == expected_bias
+    assert max_val == expected_max
+
+
+def test_int_format_params_rejects_fp():
+    with pytest.raises(ValueError):
+        _int_format_params("fp8_e4m3")
+
+
+@pytest.mark.parametrize("fmt", ["int8", "int10", "int12", "int16"])
+def test_extract_mxint_roundtrip(fmt):
+    """Extract + reconstruct must equal the on-lattice tensor for any MXINT format."""
+    torch.manual_seed(0)
+    sp = _specs_fmt(fmt, block_size=32)
+    x = torch.randn(2, 64, 4, 4)
+    bf = quantize_elemwise_op(x, mx_specs=sp, round=sp["round_output"])
+    q = quantize_mx_op(bf, sp, elem_format=fmt, axes=[1])
+
+    q_int, E = extract_mxint(q, bs=32, axis=1, fmt=fmt)
+    _, mant_bias, max_val, store_dtype = _int_format_params(fmt)
+    assert q_int.dtype == store_dtype
+    assert q_int.abs().max().item() <= max_val
+
+    B, C, H, W = q.shape
+    nb = C // 32
+    scale = torch.pow(torch.tensor(2.0), E.to(torch.float32) - mant_bias)
+    scale = scale.unsqueeze(2).expand(B, nb, 32, H, W).reshape(B, C, H, W)
+    recon = q_int.to(torch.float32) * scale
+    assert torch.equal(recon, q)
+
+
+def test_extract_mxint8_alias_matches_extract_mxint():
+    """Back-compat alias must produce identical output to fmt='int8' path."""
+    torch.manual_seed(0)
+    sp = _specs(block_size=32)
+    x = torch.randn(2, 64, 4, 4)
+    q = _quantize(x, sp)
+
+    q_a, E_a = extract_mxint8(q, bs=32, axis=1)
+    q_b, E_b = extract_mxint(q, bs=32, axis=1, fmt="int8")
+    assert torch.equal(q_a, q_b)
+    assert torch.equal(E_a, E_b)
+
+
+@pytest.mark.parametrize("fmt", ["int8", "int10", "int12", "int16"])
+def test_mxconv2dhw_runs_for_all_int_formats(fmt):
+    """At bits=64, output finite, no NaN, no overflow for any supported MXINT format."""
+    torch.manual_seed(13)
+    sp = _specs_fmt(fmt, block_size=32)
+    hw = MXConv2dHW(32, 8, 3, padding=1, bias=True, mx_specs=sp)
+    _hw_attrs(hw, bits=64)
+
+    data = [torch.randn(1, 32, 8, 8) for _ in range(2)]
+
+    class _W(nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, x): return self.m(x)
+
+    wrapper = _W(hw)
+    calibrate_e_layer_min(wrapper, data, num_batches=2)
+    assert hw.e_layer_min is not None
+
+    hw.eval()
+    with torch.no_grad():
+        y = hw(torch.randn(1, 32, 8, 8))
+    assert torch.isfinite(y).all()
+
+
+def test_mxconv2dhw_int8_parity_old_vs_new_path():
+    """int8 path through new fmt-aware code must match the legacy MANTISSA_BIAS=6 path."""
+    torch.manual_seed(17)
+    sp = _specs(block_size=32)
+    hw = MXConv2dHW(32, 8, 3, padding=1, bias=False, mx_specs=sp)
+    _hw_attrs(hw, bits=48)
+
+    data = [torch.randn(1, 32, 8, 8) for _ in range(2)]
+
+    class _W(nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, x): return self.m(x)
+
+    calibrate_e_layer_min(_W(hw), data, num_batches=2)
+
+    x = torch.randn(1, 32, 8, 8)
+    hw.eval()
+    with torch.no_grad():
+        y_hw = hw(x)
+
+    # Reference: F.conv2d on quantized operands then output elemwise quant.
+    qi = _quantize(x, sp)
+    qw = _quantize(hw.weight, sp, is_weight=True)
+    y_ref = F.conv2d(qi, qw, padding=1)
+    y_ref = quantize_elemwise_op(y_ref, mx_specs=sp, round=sp["round_output"])
+    assert torch.allclose(y_hw, y_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_mxconv2dhw_rejects_mixed_a_w_format():
+    sp = _specs()
+    sp["a_elem_format"] = "int8"
+    sp["w_elem_format"] = "int12"
+    hw = MXConv2dHW(32, 8, 3, padding=1, bias=False, mx_specs=sp)
+    _hw_attrs(hw, bits=48, e_layer_min=-12)
+    hw.e_layer_min = -12
+    with pytest.raises(RuntimeError, match="a_elem_format == w_elem_format"):
+        hw(torch.randn(1, 32, 6, 6))
 
 
 if __name__ == "__main__":

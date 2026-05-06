@@ -1,14 +1,15 @@
 """HW-faithful fixed-point emulation for MX Conv2d.
 
-Real hardware has a single 8b x 8b -> 16b multiplier per BCU (not a block
-dot product). Each product is shifted by `Ew + Ea - E_layer_min` and
-pushed into a narrow (default 35b) saturating fixed-point accumulator,
+Real hardware has a single Nb x Nb -> 2Nb multiplier per BCU (not a block
+dot product). Each product is shifted by `Ew + Ea - 2*mant_bias - E_layer_min`
+and pushed into a narrow saturating fixed-point accumulator,
 product-by-product. Intra-block reduction happens inside the fixed-point
 accumulator, not in FP32.
 
 This module provides:
-  * `extract_mxint8` - recover int8 values and shared exponent from a
-    tensor already quantised by microxcaling's `quantize_mx_op`.
+  * `extract_mxint` - recover intN values and shared exponent from a
+    tensor already quantised by microxcaling's `quantize_mx_op`. Supports
+    any MXINT format (int2..int16). `extract_mxint8` is a back-compat alias.
   * `_hw_fxp_conv2d_ref` - pure-torch reference that computes the same
     numerics as the kernel (parallel over B,O,L; serial over K/bs).
   * `HWFxpConv2dFn` - autograd Function with STE backward (treats forward
@@ -17,29 +18,62 @@ This module provides:
   * `calibrate_e_layer_min` - sweep representative inputs and freeze the
     per-layer static `e_layer_min` attribute.
 
-Only MXINT8 is supported. The FP8/MXFP paths are rejected; the HW flow
-we model is integer-multiply + integer-accumulate.
+Only MXINT formats are supported. FP8/MXFP paths are rejected.
 """
 
 import torch
 import torch.nn.functional as F
 
-MANTISSA_BIAS = 6  # MXINT8 step size is 2^(E - 6); int values live in [-127, 127].
+MANTISSA_BIAS = 6  # legacy: MXINT8 mantissa bias. New code: use _int_format_params.
 
 
-def extract_mxint8(x_q_fp32, bs, axis):
-    """Recover (int8, shared_exp_int16) from an MXINT8-quantised FP32 tensor.
+def _int_format_params(fmt):
+    """Returns (mbits, mant_bias, max_val, store_dtype) for an MXINT format.
 
-    `x_q_fp32` is assumed to already lie on the MXINT8 lattice (produced by
-    `microxcaling.mx.quantize_mx_op` with elem_format='int8'). The recovery
-    is exact on-lattice.
+    Raises ValueError for non-int formats.
+    """
+    from microxcaling.mx.formats import _get_format_params, ElemFormat
+
+    if isinstance(fmt, str):
+        try:
+            elem = ElemFormat.from_str(fmt)
+        except Exception as e:
+            raise ValueError(f"Unknown elem_format: {fmt!r}") from e
+    else:
+        elem = fmt
+
+    ebits, mbits, _, _, _ = _get_format_params(elem)
+    if ebits != 0:
+        raise ValueError(
+            f"HW fixed-point path requires intN format; got {fmt!r} "
+            f"(ebits={ebits}, not int)."
+        )
+    mant_bias = mbits - 2
+    max_val = (1 << (mbits - 1)) - 1
+    store_dtype = torch.int8 if mbits <= 8 else torch.int16
+    return mbits, mant_bias, max_val, store_dtype
+
+
+def extract_mxint(x_q_fp32, bs, axis, fmt='int8'):
+    """Recover (intN, shared_exp_int16) from an MXINT-quantised FP32 tensor.
+
+    `x_q_fp32` is assumed to already lie on the MXINT lattice (produced by
+    `microxcaling.mx.quantize_mx_op` with the matching elem_format). The
+    recovery is exact on-lattice.
+
+    Parameters
+    ----------
+    fmt : str | ElemFormat — any MXINT format supported by microxcaling
+          (int2, int4, int5, int6, int7, int8, int10, int12, int16).
 
     Returns
     -------
-    int8_tensor : same shape as `x_q_fp32`, dtype int8
-    shared_exp  : `x_q_fp32` shape with `axis` reduced from C to nb = C/bs,
-                  dtype int16
+    int_tensor : same shape as `x_q_fp32`, dtype int8 (N<=8) or int16 (N>8)
+    shared_exp : `x_q_fp32` shape with `axis` reduced from C to nb = C/bs,
+                 dtype int16
     """
+    _, mant_bias, max_val, store_dtype = _int_format_params(fmt)
+
     x = x_q_fp32.detach().to(torch.float32)
     x_last = x.movedim(axis, -1).contiguous()
     prefix = x_last.shape[:-1]
@@ -54,12 +88,17 @@ def extract_mxint8(x_q_fp32, bs, axis):
     E = torch.floor(torch.log2(safe))
     E = torch.where(nonzero, E, torch.zeros_like(E))
 
-    scale_inv = torch.pow(torch.tensor(2.0, device=x.device), MANTISSA_BIAS - E)
-    q = torch.round(xb * scale_inv).clamp_(-127, 127).to(torch.int8)
+    scale_inv = torch.pow(torch.tensor(2.0, device=x.device), mant_bias - E)
+    q = torch.round(xb * scale_inv).clamp_(-max_val, max_val).to(store_dtype)
 
     q_full = q.view(*prefix, C).movedim(-1, axis).contiguous()
     E_full = E.squeeze(-1).to(torch.int16).movedim(-1, axis).contiguous()
     return q_full, E_full
+
+
+def extract_mxint8(x_q_fp32, bs, axis):
+    """Back-compat alias: extract_mxint with fmt='int8'."""
+    return extract_mxint(x_q_fp32, bs, axis, fmt='int8')
 
 
 def _sat(x, lo, hi):
@@ -73,6 +112,7 @@ def _hw_fxp_conv2d_ref(
     e_layer_min, stride, padding, dilation,
     bs, bits, sat_mode,
     bias_fp=None,
+    mant_bias=MANTISSA_BIAS,
 ):
     """Pure-torch reference for the HW fixed-point conv2d kernel.
 
@@ -121,7 +161,7 @@ def _hw_fxp_conv2d_ref(
 
     lo = -(1 << (bits - 1))
     hi = (1 << (bits - 1)) - 1
-    two_bias = 2 * MANTISSA_BIAS
+    two_bias = 2 * int(mant_bias)
     e_min = int(e_layer_min)
 
     device = qi_i8.device
@@ -189,10 +229,12 @@ class HWFxpConv2dFn(torch.autograd.Function):
         e_layer_min, bs, bits, sat_mode, ste_mask,
         stride, padding, dilation, backend,
         stats_sink=None,
+        fmt='int8',
     ):
+        _, mant_bias, _, _ = _int_format_params(fmt)
         with torch.no_grad():
-            qi_i8, Ea = extract_mxint8(qi_fp, bs, axis=1)
-            qw_i8, Ew = extract_mxint8(qw_fp, bs, axis=1)
+            qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
+            qw_i8, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
 
         use_triton = (backend == "triton" and qi_fp.is_cuda)
         if use_triton:
@@ -202,6 +244,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
                 int(e_layer_min), stride, padding, dilation,
                 bs, int(bits), sat_mode,
                 bias_fp=bias_fp,
+                mant_bias=int(mant_bias),
             )
         else:
             out_flat, sat_flat = _hw_fxp_conv2d_ref(
@@ -209,6 +252,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
                 int(e_layer_min), stride, padding, dilation,
                 bs, int(bits), sat_mode,
                 bias_fp=bias_fp,
+                mant_bias=int(mant_bias),
             )
 
         B, _, H, W = qi_fp.shape
@@ -254,12 +298,12 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 13 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
-        # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink
+        # forward took 14 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink, fmt
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         )
 
 
@@ -268,11 +312,13 @@ def hw_fxp_conv2d(
     e_layer_min, bs, bits=35, sat_mode="per_product", ste_mask=False,
     stride=1, padding=0, dilation=1, backend="python",
     stats_sink=None,
+    fmt='int8',
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
     `stats_sink` is an optional mutable dict; kernel fills in 'sat_count',
     'total', and 'backend' after each forward for logging.
+    `fmt` is the MXINT element format ('int8', 'int10', 'int12', 'int16', ...).
     """
     if e_layer_min is None:
         raise RuntimeError(
@@ -284,6 +330,7 @@ def hw_fxp_conv2d(
         int(e_layer_min), int(bs), int(bits), str(sat_mode), bool(ste_mask),
         stride, padding, dilation, str(backend),
         stats_sink,
+        str(fmt),
     )
 
 
@@ -291,25 +338,26 @@ def hw_fxp_conv2d(
 # Calibration
 # ------------------------------------------------------------------
 
-def _compute_min_shift_exp(qi_fp, qw_fp, bs):
+def _compute_min_shift_exp(qi_fp, qw_fp, bs, fmt='int8'):
     """Return layer-wide min(Ew + Ea - 2*mantissa_bias) over all block pairs.
 
     Ea and Ew are independent (no shared index), so the joint min is simply
     min(Ea) + min(Ew).
     """
-    _, Ea = extract_mxint8(qi_fp, bs, axis=1)
-    _, Ew = extract_mxint8(qw_fp, bs, axis=1)
-    return int(Ea.amin().item()) + int(Ew.amin().item()) - 2 * MANTISSA_BIAS
+    _, mant_bias, _, _ = _int_format_params(fmt)
+    _, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
+    _, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
+    return int(Ea.amin().item()) + int(Ew.amin().item()) - 2 * int(mant_bias)
 
 
 class _CalibrationState:
-    """Per-layer running min(Ew + Ea - 12) collector."""
+    """Per-layer running min(Ew + Ea - 2*mant_bias) collector."""
 
     def __init__(self):
         self.running_min = None
 
-    def update(self, qi_fp, qw_fp, bs):
-        cand = _compute_min_shift_exp(qi_fp, qw_fp, bs)
+    def update(self, qi_fp, qw_fp, bs, fmt='int8'):
+        cand = _compute_min_shift_exp(qi_fp, qw_fp, bs, fmt=fmt)
         self.running_min = cand if self.running_min is None else min(self.running_min, cand)
 
 

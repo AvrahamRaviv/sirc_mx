@@ -214,10 +214,18 @@ class MXConv2dHW(MXConv2d):
         sp = self.mx_specs
         bs = sp['block_size']
         B, C, H, W = x.shape
-        if sp['a_elem_format'] != 'int8' or sp['w_elem_format'] != 'int8':
+        a_fmt = sp['a_elem_format']
+        w_fmt = sp['w_elem_format']
+        if a_fmt != w_fmt:
             raise RuntimeError(
-                "MXConv2dHW models integer HW; set a_elem_format and "
-                "w_elem_format to 'int8'."
+                f"MXConv2dHW requires a_elem_format == w_elem_format "
+                f"(got a={a_fmt!r}, w={w_fmt!r})."
+            )
+        if not (isinstance(a_fmt, str) and a_fmt.startswith('int')):
+            raise RuntimeError(
+                f"MXConv2dHW models integer HW; set a_elem_format and "
+                f"w_elem_format to an MXINT format (int8, int10, int12, "
+                f"int16, ...). Got {a_fmt!r}."
             )
 
         cfg_early = _get_xblock_cfg(self)
@@ -259,7 +267,7 @@ class MXConv2dHW(MXConv2d):
         # path so downstream layers see sensible activations.
         cal = getattr(self, '_calibration_state', None)
         if cal is not None:
-            cal.update(qi, qw, bs)
+            cal.update(qi, qw, bs, fmt=a_fmt)
             return self._fp32_blocked_forward(qi, qw, bf_bias, H, W)
 
         cfg = _get_xblock_cfg(self)
@@ -295,6 +303,7 @@ class MXConv2dHW(MXConv2d):
             dilation=self.dilation,
             backend=cfg['backend'],
             stats_sink=stats,
+            fmt=a_fmt,
         )
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))
