@@ -25,11 +25,30 @@ import torch.nn.functional as F
 
 from microxcaling.mx.linear import Linear as MXLinear
 from microxcaling.mx.convolution import Conv2d as MXConv2d
-from microxcaling.mx.mx_ops import quantize_mx_op
+from microxcaling.mx.mx_ops import quantize_mx_op as _quantize_mx_op_raw
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
 from mx_fixed_point_hw import hw_fxp_conv2d
+
+
+def quantize_mx_op(x, *args, **kwargs):
+    """STE wrapper around microxcaling's quantize_mx_op.
+
+    The underlying op does not propagate gradient (Microsoft's MXLinear /
+    MXConv2d compensate by wrapping the whole forward in a custom
+    autograd.Function with an explicit backward). Our blocked / HW layers
+    call quantize_mx_op directly, so without an STE shim the gradient
+    chain dies at this op and weight/input grads come out as 0, which
+    silently breaks training.
+
+    Forward = the quantized value. Backward = identity (STE).
+    """
+    with torch.no_grad():
+        x_q = _quantize_mx_op_raw(x, *args, **kwargs)
+    if not x.requires_grad:
+        return x_q
+    return x + (x_q - x).detach()
 
 
 class MXLinearBlocked(MXLinear):
