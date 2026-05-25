@@ -86,7 +86,7 @@ def _pair(v):
 
 def _ascii_hist(values, bins=12, width=40, label=""):
     """Counts-per-bin ASCII histogram of a 1-D float tensor."""
-    v = values.flatten().float()
+    v = values.detach().flatten().float().cpu()
     if v.numel() == 0:
         return f"  {label}: (empty)"
     lo = _f(v.min())
@@ -107,7 +107,7 @@ def _ascii_hist(values, bins=12, width=40, label=""):
 
 def _int_hist(int_values, label=""):
     """Histogram over discrete integer values (e.g. shared exponents)."""
-    v = int_values.flatten().long()
+    v = int_values.detach().flatten().long().cpu()
     if v.numel() == 0:
         return f"  {label}: (empty)"
     lo = int(v.min().item())
@@ -125,7 +125,7 @@ def _int_hist(int_values, label=""):
 
 
 def _sparkline(values):
-    v = values.flatten().float()
+    v = values.detach().flatten().float().cpu()
     if v.numel() == 0:
         return ""
     lo = _f(v.min())
