@@ -305,6 +305,11 @@ class MXQuantizer:
                 else:
                     conv_cls = MXConv2d
                     replace_summary['mx_default_conv'].append(clean_name)
+                if mx_specs.get('block_axes') is not None and conv_cls is not MXConv2d:
+                    print(f"[MXQuantizer] WARNING: conv '{clean_name}' uses "
+                          f"{conv_cls.__name__}; mx_specs['block_axes']="
+                          f"{mx_specs.get('block_axes')} is ignored (only MXConv2d "
+                          f"fwd reads it).")
                 new = conv_cls(
                     module.in_channels,
                     module.out_channels,
