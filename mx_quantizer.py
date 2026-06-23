@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from microxcaling.mx.convolution import Conv2d as MXConv2d
+from microxcaling.mx.transpose_convolution import ConvTranspose2d as MXConvTranspose2d
 from microxcaling.mx.linear import Linear as MXLinear
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
@@ -252,14 +253,18 @@ class MXQuantizer:
                 break
 
         replace_summary = {
-            'hw': [], 'blocked': [], 'mx_default_conv': [],
+            'hw': [], 'blocked': [], 'mx_default_conv': [], 'mx_default_convT': [],
             'mx_default_linear': [], 'fallback_conv': [], 'fallback_linear': [],
         }
 
         for full_name, module in model.named_modules():
-            is_conv = isinstance(module, nn.Conv2d) and not isinstance(module, MXConv2d)
+            is_convT = (isinstance(module, nn.ConvTranspose2d)
+                        and not isinstance(module, MXConvTranspose2d))
+            # nn.ConvTranspose2d is NOT a subclass of nn.Conv2d — keep is_conv exclusive.
+            is_conv = (isinstance(module, nn.Conv2d) and not isinstance(module, MXConv2d)
+                       and not is_convT)
             is_linear = isinstance(module, nn.Linear) and not isinstance(module, MXLinear)
-            if not (is_conv or is_linear):
+            if not (is_conv or is_convT or is_linear):
                 continue
 
             clean_name = full_name[len("module."):] if full_name.startswith("module.") else full_name
@@ -278,7 +283,25 @@ class MXQuantizer:
             want_hw = want_blocked and mode == 'hw_fixed_point'
             bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
 
-            if is_conv:
+            if is_convT:
+                # ConvTranspose2d: plain MX only (no HW / blocked variants).
+                if want_blocked and verbose >= 1:
+                    print(f"[MXQuantizer] xblock_accum ignored for convT "
+                          f"'{clean_name}'; ConvTranspose2d only supports plain MX.")
+                new = MXConvTranspose2d(
+                    module.in_channels,
+                    module.out_channels,
+                    module.kernel_size,
+                    stride=module.stride,
+                    padding=module.padding,
+                    output_padding=module.output_padding,
+                    dilation=module.dilation,
+                    groups=module.groups,
+                    bias=module.bias is not None,
+                    mx_specs=mx_specs,
+                )
+                replace_summary['mx_default_convT'].append(clean_name)
+            elif is_conv:
                 reason = None
                 hw_pad = want_hw and bool(xblock_cfg.get('pad_channels', True))
                 if want_blocked and module.groups != 1:
@@ -366,13 +389,14 @@ class MXQuantizer:
             n_hw = len(replace_summary['hw'])
             n_blk = len(replace_summary['blocked'])
             n_def_c = len(replace_summary['mx_default_conv'])
+            n_def_ct = len(replace_summary['mx_default_convT'])
             n_def_l = len(replace_summary['mx_default_linear'])
             n_fb_c = len(replace_summary['fallback_conv'])
             n_fb_l = len(replace_summary['fallback_linear'])
             print(
                 f"[MXQuantizer] replace summary: "
                 f"hw={n_hw} blocked={n_blk} "
-                f"mxconv={n_def_c} mxlinear={n_def_l} "
+                f"mxconv={n_def_c} mxconvT={n_def_ct} mxlinear={n_def_l} "
                 f"fallback_conv={n_fb_c} fallback_linear={n_fb_l}"
             )
             if n_fb_c or n_fb_l:
@@ -421,11 +445,24 @@ class MXQuantizer:
 
     def _create_mx_module(self, orig_module, mx_specs):
         """
-        Build an MXConv2d or MXLinear from an existing nn.Conv2d / nn.Linear,
-        sharing the original weight and bias tensors.
+        Build an MXConv2d / MXConvTranspose2d / MXLinear from an existing
+        nn.Conv2d / nn.ConvTranspose2d / nn.Linear, sharing weight and bias.
         Used for temporary isolated-sensitivity measurement and for _replace_layers.
         """
-        if isinstance(orig_module, nn.Conv2d):
+        if isinstance(orig_module, nn.ConvTranspose2d):
+            new = MXConvTranspose2d(
+                orig_module.in_channels,
+                orig_module.out_channels,
+                orig_module.kernel_size,
+                stride=orig_module.stride,
+                padding=orig_module.padding,
+                output_padding=orig_module.output_padding,
+                dilation=orig_module.dilation,
+                groups=orig_module.groups,
+                bias=orig_module.bias is not None,
+                mx_specs=mx_specs,
+            )
+        elif isinstance(orig_module, nn.Conv2d):
             new = MXConv2d(
                 orig_module.in_channels,
                 orig_module.out_channels,
@@ -459,10 +496,10 @@ class MXQuantizer:
         if "layers" in self.config:
             return [l if isinstance(l, str) else l["name"]
                     for l in self.config["layers"]]
-        # auto-discover all Conv2d / Linear (excluding already-MX layers)
+        # auto-discover all Conv2d / ConvTranspose2d / Linear (excluding already-MX layers)
         return [n for n, m in model.named_modules()
-                if isinstance(m, (nn.Conv2d, nn.Linear))
-                and not isinstance(m, (MXConv2d, MXLinear))]
+                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear))
+                and not isinstance(m, (MXConv2d, MXConvTranspose2d, MXLinear))]
 
     def _get_parent(self, model, full_name):
         parts = full_name.split(".")
@@ -672,6 +709,10 @@ class MXQuantizer:
 
         No backward pass required.
         Memory: O(in_dim²) per layer — activations are never stored in full.
+
+        Note: MXConvTranspose2d layers are intentionally excluded — the GPTQ
+        Hessian uses conv im2col (F.unfold), which does not model the transposed
+        conv. Their weights still get MX-quantized on-the-fly in forward.
         """
         self._log(log, f"PTQ | Phase 1: collecting Hessians ({max_batches} batches) ...")
         hessians = self._collect_activations(model, data, forward_fn, log, max_batches)
@@ -881,7 +922,7 @@ class MXQuantizer:
                   quant_model._quant_errors by the caller.
         """
         quant_names = {n for n, m in quant_model.named_modules()
-                       if isinstance(m, (MXConv2d, MXLinear))}
+                       if isinstance(m, (MXConv2d, MXConvTranspose2d, MXLinear))}
         fp32_layer_map = {n: m for n, m in fp32_model.named_modules()
                           if n in quant_names}
 
@@ -988,18 +1029,24 @@ class MXQuantizer:
     # =========================
     def _print_stat(self, model, log=None):
         """
-        Prints replaced and missed Conv2d / Linear layers.
+        Prints replaced and missed Conv2d / ConvTranspose2d / Linear layers.
         """
-        num_mx_conv, num_mx_linear = 0, 0
-        num_fp_conv, num_fp_linear = 0, 0
+        num_mx_conv, num_mx_linear, num_mx_convT = 0, 0, 0
+        num_fp_conv, num_fp_linear, num_fp_convT = 0, 0, 0
 
         for name, module in model.named_modules():
-            if isinstance(module, MXConv2d):
+            if isinstance(module, MXConvTranspose2d):
+                self._log(log, f"[ConvTranspose2d->MX] {name}: {module}")
+                num_mx_convT += 1
+            elif isinstance(module, MXConv2d):
                 self._log(log, f"[Conv2d->MX] {name}: {module}")
                 num_mx_conv += 1
             elif isinstance(module, MXLinear):
                 self._log(log, f"[Linear->MX] {name}: {module}")
                 num_mx_linear += 1
+            elif isinstance(module, nn.ConvTranspose2d):
+                self._log(log, f"[MISSED] {name}: still nn.ConvTranspose2d!")
+                num_fp_convT += 1
             elif isinstance(module, nn.Conv2d):
                 self._log(log, f"[MISSED] {name}: still nn.Conv2d!")
                 num_fp_conv += 1
@@ -1008,4 +1055,5 @@ class MXQuantizer:
                 num_fp_linear += 1
 
         self._log(log, f"MX convs: {num_mx_conv}, regular convs: {num_fp_conv}, "
+                       f"MX convTs: {num_mx_convT}, regular convTs: {num_fp_convT}, "
                        f"MX linears: {num_mx_linear}, regular linears: {num_fp_linear}.")
