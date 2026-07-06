@@ -24,12 +24,12 @@ from microxcaling.mx import MxSpecs
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
-from mx_fixed_point import (
+from fixed_point.mx_fixed_point import (
     XBLOCK_ACCUM_DEFAULTS,
     normalize_xblock_accum,
     validate_xblock_accum_bits,
 )
-from mx_fixed_point_hw import (
+from fixed_point.mx_fixed_point_hw import (
     MANTISSA_BIAS,
     _hw_fxp_conv2d_ref,
     _int_format_params,

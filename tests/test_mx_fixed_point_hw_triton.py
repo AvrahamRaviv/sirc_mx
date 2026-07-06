@@ -31,7 +31,7 @@ from microxcaling.mx import MxSpecs  # noqa: E402
 from microxcaling.mx.mx_ops import quantize_mx_op  # noqa: E402
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op  # noqa: E402
 
-from mx_fixed_point_hw import (  # noqa: E402
+from fixed_point.mx_fixed_point_hw import (  # noqa: E402
     MANTISSA_BIAS,
     _hw_fxp_conv2d_ref,
     extract_mxint8,
@@ -63,7 +63,7 @@ def _prep(x, w, sp):
 @pytest.mark.parametrize("kernel,stride,padding", [(1, 1, 0), (3, 1, 1), (3, 2, 1)])
 @pytest.mark.parametrize("sat_mode", ["per_product", "per_block"])
 def test_triton_matches_ref(kernel, stride, padding, sat_mode):
-    from mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
+    from fixed_point.mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
 
     torch.manual_seed(3)
     sp = _specs()
@@ -85,7 +85,7 @@ def test_triton_matches_ref(kernel, stride, padding, sat_mode):
 
 
 def test_triton_saturation_trigger():
-    from mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
+    from fixed_point.mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
 
     torch.manual_seed(7)
     sp = _specs()

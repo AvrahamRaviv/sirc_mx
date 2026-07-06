@@ -81,7 +81,7 @@ class FixedPointAccumulatorTriton(torch.autograd.Function):
     def forward(ctx, partials, total_bits, scale_exp, saturate, ste_mask):
         _require_triton_cuda()
 
-        from mx_fixed_point import _auto_scale_exp, validate_xblock_accum_bits
+        from .mx_fixed_point import _auto_scale_exp, validate_xblock_accum_bits
 
         total_bits = int(total_bits)
         validate_xblock_accum_bits(total_bits)

@@ -30,8 +30,8 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from mx_layers_blocked import (
     MXConv2dHW, MXConv2dBlocked, quantize_mx_op,
 )
-from mx_fixed_point_hw import extract_mxint, _int_format_params
-from mx_fixed_point import _get_xblock_cfg
+from fixed_point.mx_fixed_point_hw import extract_mxint, _int_format_params
+from fixed_point.mx_fixed_point import _get_xblock_cfg
 
 
 _SPARK = "▁▂▃▄▅▆▇█"

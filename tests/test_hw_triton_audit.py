@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, "/Users/avrahamraviv/PycharmProjects")
 sys.path.insert(0, "/home/avrahamra/PycharmProjects")
 
-from mx_fixed_point_hw import _hw_fxp_conv2d_ref
+from fixed_point.mx_fixed_point_hw import _hw_fxp_conv2d_ref
 
 
 def _make_synthetic(shape_qi=(1, 32, 8, 8), shape_qw=(8, 32, 3, 3),

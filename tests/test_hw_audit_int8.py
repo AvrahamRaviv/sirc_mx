@@ -24,7 +24,7 @@ from microxcaling.mx import MxSpecs
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
-from mx_fixed_point_hw import (
+from fixed_point.mx_fixed_point_hw import (
     _hw_fxp_conv2d_ref,
     calibrate_e_layer_min,
     extract_mxint,

@@ -238,7 +238,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
 
         use_triton = (backend == "triton" and qi_fp.is_cuda)
         if use_triton:
-            from mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
+            from .mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
             out_flat, sat_flat = _hw_fxp_conv2d_triton(
                 qi_i8, qw_i8, Ea, Ew,
                 int(e_layer_min), stride, padding, dilation,

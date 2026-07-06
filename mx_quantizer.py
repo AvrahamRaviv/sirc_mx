@@ -17,7 +17,7 @@ from microxcaling.mx.linear import Linear as MXLinear
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
-from mx_fixed_point import normalize_xblock_accum
+from fixed_point.mx_fixed_point import normalize_xblock_accum
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 
 

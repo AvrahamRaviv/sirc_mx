@@ -6,14 +6,14 @@ import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from mx_fixed_point import (
+from fixed_point.mx_fixed_point import (
     FixedPointAccumulator,
     cross_block_accumulate_from_specs,
     fixed_point_accumulate,
 )
 
 try:
-    from mx_fixed_point_triton import (
+    from fixed_point.mx_fixed_point_triton import (
         FixedPointAccumulatorTriton,
         _TRITON_AVAILABLE,
         fixed_point_accumulate_triton,

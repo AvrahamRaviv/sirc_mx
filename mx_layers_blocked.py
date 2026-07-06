@@ -28,8 +28,8 @@ from microxcaling.mx.convolution import Conv2d as MXConv2d
 from microxcaling.mx.mx_ops import quantize_mx_op as _quantize_mx_op_raw
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
-from mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
-from mx_fixed_point_hw import hw_fxp_conv2d
+from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
+from fixed_point.mx_fixed_point_hw import hw_fxp_conv2d
 
 
 def quantize_mx_op(x, *args, **kwargs):

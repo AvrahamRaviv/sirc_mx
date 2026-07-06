@@ -23,7 +23,7 @@ sys.path.insert(0, "/home/avrahamra/PycharmProjects")
 from microxcaling.mx import MxSpecs
 from microxcaling.mx.convolution import Conv2d as MXConv2d
 
-from mx_fixed_point_hw import calibrate_e_layer_min
+from fixed_point.mx_fixed_point_hw import calibrate_e_layer_min
 from mx_layers_blocked import MXConv2dHW
 
 

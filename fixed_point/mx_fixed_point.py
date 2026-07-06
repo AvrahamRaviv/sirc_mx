@@ -247,7 +247,7 @@ def cross_block_accumulate_from_specs(partials, mx_specs):
     backend = cfg["backend"]
 
     if backend == "triton":
-        from mx_fixed_point_triton import fixed_point_accumulate_triton
+        from .mx_fixed_point_triton import fixed_point_accumulate_triton
         return fixed_point_accumulate_triton(
             partials, total_bits=bits, scale_exp=scale_exp,
             saturate=saturate, ste_mask=ste_mask,
