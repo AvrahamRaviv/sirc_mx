@@ -531,6 +531,89 @@ class TestMeasureError(unittest.TestCase):
         self.assertFalse(hasattr(m, "_quant_errors"))
 
 
+class TestCollectStats(unittest.TestCase):
+    """Tests for quantization statistics collection (model._quant_stats)."""
+
+    _DATA = [torch.randn(4, 3, 8, 8) for _ in range(3)]
+    _ALL = ("conv1", "conv2", "fc1", "fc2")
+
+    def setUp(self):
+        self.model = SimpleNet()
+        self.tmp = tempfile.mkdtemp()
+
+    def _config(self, extra=None):
+        cfg = {"mx_specs": _CPU_SPECS, "layers": list(self._ALL),
+               "ptq": False, "measure_error": False}
+        if extra:
+            cfg.update(extra)
+        return cfg
+
+    def test_config_true_attaches_stats_and_json(self):
+        q = _make_quantizer(self._config({"collect_stats": True}), self.tmp)
+        m = q.quant(self.model, data=self._DATA)
+        self.assertTrue(hasattr(m, "_quant_stats"))
+        stats = m._quant_stats
+        for name in self._ALL:
+            self.assertIn(name, stats["layers"])
+            e = stats["layers"][name]
+            self.assertGreater(e["weight"]["error"]["sqnr_db"], 0.0)
+            self.assertGreater(e["activation"]["error"]["sqnr_db"], 0.0)
+            self.assertIsNotNone(e["output_error"]["isolated"])
+            # fp32_model available inside quant() -> propagated error merged
+            self.assertIsNotNone(e["output_error"]["propagated"])
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "quant_stats.json")))
+
+    def test_key_absent_skips(self):
+        q = _make_quantizer(self._config(), self.tmp)
+        m = q.quant(self.model, data=self._DATA)
+        self.assertFalse(hasattr(m, "_quant_stats"))
+
+    def test_false_and_disabled_skip(self):
+        for cfg in (False, {"enabled": False}):
+            q = _make_quantizer(self._config({"collect_stats": cfg}), self.tmp)
+            m = q.quant(SimpleNet(), data=self._DATA)
+            self.assertFalse(hasattr(m, "_quant_stats"))
+
+    def test_dict_config_no_json(self):
+        q = _make_quantizer(self._config(
+            {"collect_stats": {"enabled": True, "batches": 2, "save_json": False}}),
+            self.tmp)
+        m = q.quant(self.model, data=self._DATA)
+        self.assertTrue(hasattr(m, "_quant_stats"))
+        self.assertEqual(m._quant_stats["meta"]["n_batches"], 2)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "quant_stats.json")))
+
+    def test_no_data_weights_only(self):
+        q = _make_quantizer(self._config({"collect_stats": True}), self.tmp)
+        m = q.quant(self.model)
+        stats = m._quant_stats
+        for name in self._ALL:
+            self.assertIsNotNone(stats["layers"][name]["weight"])
+            self.assertIsNone(stats["layers"][name]["activation"])
+            self.assertIsNone(stats["layers"][name]["output_error"]["isolated"])
+
+    def test_standalone_call(self):
+        q = _make_quantizer(self._config(), self.tmp)
+        m = q.quant(self.model, data=self._DATA)
+        self.assertFalse(hasattr(m, "_quant_stats"))
+        stats = q.collect_stats(m, data=self._DATA)
+        self.assertIs(m._quant_stats, stats)
+        for name in self._ALL:
+            self.assertIn(name, stats["layers"])
+        # standalone without fp32_model: propagated stays None
+        self.assertIsNone(stats["layers"]["conv1"]["output_error"]["propagated"])
+
+    def test_isolated_matches_propagated_for_first_layer(self):
+        """conv1 sees identical inputs in both models -> isolated == propagated."""
+        cfg = {"mx_specs": _CPU_SPECS, "layers": ["conv1"],
+               "ptq": False, "measure_error": False, "collect_stats": True}
+        q = _make_quantizer(cfg, self.tmp)
+        m = q.quant(self.model, data=self._DATA)
+        e = m._quant_stats["layers"]["conv1"]["output_error"]
+        self.assertAlmostEqual(e["isolated"]["sqnr_db"],
+                               e["propagated"]["sqnr_db"], delta=0.5)
+
+
 class TestAutoMixedPrecision(unittest.TestCase):
     """Tests for automated per-layer precision assignment via 'auto_mixed' config."""
 

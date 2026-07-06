@@ -19,6 +19,7 @@ from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
+from mx_stats import collect_stats as _collect_stats_impl
 
 
 class MXQuantizer:
@@ -95,6 +96,15 @@ class MXQuantizer:
         "layers": [...]
     }
     Shorthand to disable: "ptq": false
+
+    5. Quantization statistics (per-block stats + quant error, off by default):
+    {
+        "collect_stats": {"enabled": true, "batches": 32, "histograms": false,
+                          "output_error": true, "detail": false, "save_json": true},
+        "layers": [...]
+    }
+    Shorthand to enable with defaults: "collect_stats": true
+    Also callable standalone: quantizer.collect_stats(quant_model, data=cal)
 
     Priority (highest to lowest): per-layer mx_specs > group > global mx_specs > defaults
     Note: scale_bits is shared between weights and activations (library limitation).
@@ -185,8 +195,55 @@ class MXQuantizer:
             errors = self._measure_error(fp32_model, model, data, forward_fn, log, ptq_batches)
             model._quant_errors = errors
 
+        stats_cfg = self.config.get("collect_stats", False)
+        if stats_cfg is True or (isinstance(stats_cfg, dict) and stats_cfg.get("enabled", True)):
+            self.collect_stats(model, data, forward_fn, log, fp32_model=fp32_model)
+
         self._print_stat(model, log)
         return model
+
+    def collect_stats(self, model, data=None, forward_fn=None, log=None,
+                      fp32_model=None, **overrides):
+        """
+        Collect per-block / per-layer quantization statistics on an
+        already-quantized model (see mx_stats.collect_stats for details).
+
+        Per MX layer, for weights and (with data) activations:
+          - per-block max_abs / variance / mean_abs / dynamic range,
+            underflow rate, shared-exponent distribution
+          - quantization error err = x - Q(x): SQNR dB, MSE, max abs err, cos sim
+          - isolated layer-output error (fp32 functional vs quantized forward) —
+            the level at which plain/Blocked/HW variants actually differ
+          - propagated output error (merged from _measure_error) when
+            fp32_model and data are both given
+
+        Options come from the optional "collect_stats" config key
+        ({"enabled", "batches", "histograms", "output_error", "detail",
+        "save_json"}) and can be overridden via **overrides.
+
+        Returns the stats dict; also attached as model._quant_stats and,
+        unless save_json is false, dumped to save_dir/quant_stats.json.
+        """
+        cfg = self.config.get("collect_stats", {}) if self.config else {}
+        if isinstance(cfg, bool):
+            cfg = {}
+        opts = dict(max_batches=cfg.get("batches", 32),
+                    histograms=cfg.get("histograms", False),
+                    detail=cfg.get("detail", False),
+                    output_error=cfg.get("output_error", True))
+        opts.update(overrides)
+        save_path = (os.path.join(self.save_dir, "quant_stats.json")
+                     if cfg.get("save_json", True) else None)
+        stats = _collect_stats_impl(model, data, forward_fn, log=log,
+                                    save_path=save_path, **opts)
+        if stats and fp32_model is not None and data is not None:
+            propagated = self._measure_error(fp32_model, model, data,
+                                             forward_fn, log, opts["max_batches"])
+            for name, metrics in propagated.items():
+                if name in stats["layers"]:
+                    stats["layers"][name]["output_error"]["propagated"] = metrics
+        model._quant_stats = stats
+        return stats
 
     # =========================
     # Config
