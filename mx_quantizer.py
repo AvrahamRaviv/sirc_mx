@@ -386,12 +386,13 @@ class MXQuantizer:
                     conv_cls = MXConv2d
                     replace_summary['mx_default_conv'].append(clean_name)
                 _axes_keys = {k: mx_specs.get(k) for k in
-                              ('block_axes', 'block_axes_act', 'block_axes_wt')
+                              ('block_axes', 'block_axes_act', 'block_axes_wt',
+                               'block_shape', 'block_shape_act', 'block_shape_wt')
                               if mx_specs.get(k) is not None}
                 if _axes_keys and conv_cls is not MXConv2d:
                     print(f"[MXQuantizer] WARNING: conv '{clean_name}' uses "
                           f"{conv_cls.__name__}; {_axes_keys} is ignored "
-                          f"(only MXConv2d fwd reads block_axes*).")
+                          f"(only MXConv2d fwd reads block_axes*/block_shape*).")
                 new = conv_cls(
                     module.in_channels,
                     module.out_channels,
