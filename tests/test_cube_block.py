@@ -123,6 +123,32 @@ def test_custom_cuda_cube_matches_torch_gpu():
     assert torch.allclose(ref, got, atol=1e-4)
 
 
+def test_full_axis_minus_one():
+    """block_shape entry -1 spans the whole axis (one block), equal to passing
+    that axis's exact length; adapts per layer."""
+    torch.manual_seed(0)
+    A = torch.randn(2, 32, 6, 8)  # C=32, H=6, W=8
+    q_neg = _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[16, -1, -1],
+                         custom_cuda=False)
+    q_exp = _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[16, 6, 8],
+                         custom_cuda=False)
+    assert torch.equal(q_neg, q_exp)
+    # all -1 == one block over the full C,H,W cube
+    q_all = _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[-1, -1, -1],
+                         custom_cuda=False)
+    q_full = _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[32, 6, 8],
+                          custom_cuda=False)
+    assert torch.equal(q_all, q_full)
+
+
+def test_bad_negative_block_raises():
+    """Only -1 is a valid negative; other negatives error."""
+    A = torch.randn(1, 8, 4, 4)
+    with pytest.raises(Exception):
+        _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[4, -2, -1],
+                     custom_cuda=False)
+
+
 def _build_conv(specs, seed=1):
     torch.manual_seed(seed)
     return MXConv2d(8, 4, 3, padding=1, bias=False, mx_specs=specs)
