@@ -5,7 +5,9 @@ Covers the block_shape extension:
   - microxcaling _quantize_mx accepts a per-axis block_size list
   - list-of-1 is equivalent to a scalar block_size (backward compat)
   - a rectangular cube matches a hand-rolled per-cube MX reference
-  - custom_cuda + multi-axis block_shape raises a clear error
+  - custom_cuda + multi-axis routes through the single-axis kernel via a
+    reshape (permute cube dims -> merge -> single-axis quant); the reshape
+    route is bit-identical to the direct torch multi-axis path
   - MXConv2d honors block_shape_act / block_shape_wt in forward
   - MXQuantizer wires block_shape* from config end-to-end
 """
@@ -22,7 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, "/Users/avrahamraviv/PycharmProjects")
 sys.path.insert(0, "/home/avrahamra/PycharmProjects")
 
-from microxcaling.mx.mx_ops import _quantize_mx
+from microxcaling.mx.mx_ops import _quantize_mx, _quantize_mx_cube
 from microxcaling.mx.elemwise_ops import _quantize_elemwise_core
 from microxcaling.mx.formats import _get_format_params
 from microxcaling.mx import MxSpecs
@@ -86,12 +88,39 @@ def test_cube_padding_non_divisible_axis():
     assert torch.isfinite(q).all()
 
 
-def test_custom_cuda_multi_axis_raises():
-    """Per-axis cube + custom_cuda is unsupported and must error clearly."""
-    A = torch.randn(2, 8, 4, 4)
-    with pytest.raises(NotImplementedError):
-        _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[2, 4, 4],
-                     custom_cuda=True)
+@pytest.mark.parametrize("shape,axes,bs", [
+    ((2, 8, 4, 4), [1, 2, 3], [2, 4, 4]),
+    ((1, 4, 4, 4), [1, 2, 3], [2, 2, 2]),   # arbitrary cube -> ordering
+    ((2, 8, 4, 4), [1, 2, 3], [4, 2, 2]),
+    ((1, 6, 5, 5), [1, 2, 3], [2, 2, 2]),   # non-divisible -> padding
+    ((2, 8, 4, 4), [3, 1, 2], [4, 2, 4]),   # unsorted axes
+])
+def test_cube_helper_matches_direct(shape, axes, bs):
+    """The custom_cuda cube route (permute->merge->single-axis) is bit-identical
+    to the direct torch multi-axis path. Exercised with custom_cuda=False so the
+    reshape logic runs on CPU; on GPU only the inner reduction swaps to the
+    kernel."""
+    torch.manual_seed(0)
+    A = torch.randn(*shape)
+    direct = _quantize_mx(A, 8, 'int8', axes=axes, block_size=bs,
+                          custom_cuda=False)
+    cube = _quantize_mx_cube(A, 8, 'int8', axes=list(axes),
+                             block_size=list(bs), custom_cuda=False)
+    assert torch.equal(direct, cube)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="custom_cuda kernels require a CUDA device")
+def test_custom_cuda_cube_matches_torch_gpu():
+    """On GPU the custom_cuda cube path (single-axis kernel) matches the torch
+    multi-axis path within kernel tolerance."""
+    torch.manual_seed(0)
+    A = torch.randn(2, 16, 8, 8, device='cuda')
+    ref = _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[4, 4, 4],
+                       custom_cuda=False)
+    got = _quantize_mx(A, 8, 'int8', axes=[1, 2, 3], block_size=[4, 4, 4],
+                       custom_cuda=True)
+    assert torch.allclose(ref, got, atol=1e-4)
 
 
 def _build_conv(specs, seed=1):
