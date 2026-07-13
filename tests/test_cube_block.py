@@ -179,6 +179,98 @@ def test_mxconv2d_block_shape_scalar_equiv_default():
     assert torch.equal(y_default, y_shape)
 
 
+def _mx_block_1d_ref(vec, bs):
+    """Hand-rolled MX quant of a 1D vector, blocked by bs along its length.
+    Tail block shorter than bs is processed as-is (zero-padding would not change
+    the block max, so this matches the padded kernel path)."""
+    ebits, mbits, emax, max_norm, _ = _get_format_params('int8')
+    scale_emax = 2 ** (8 - 1) - 1
+    out = vec.clone()
+    for s in range(0, vec.numel(), bs):
+        blk = vec[s:s + bs]
+        se = torch.floor(torch.log2(blk.abs().max())).item() - emax
+        se = max(min(se, scale_emax), -scale_emax)
+        scaled = blk / (2 ** se)
+        eq = _quantize_elemwise_core(
+            scaled, mbits, ebits, max_norm, round='nearest',
+            allow_denorm=True, saturate_normals=True, custom_cuda=False)
+        out[s:s + bs] = eq * (2 ** se)
+    return out
+
+
+def test_flatten_wt_matches_manual_reference():
+    """NPE weight flatten: per filter, flatten [Cin,kH,kW] -> 1D, block by bs.
+    Matches a hand-rolled per-filter 1D-blocked reference."""
+    torch.manual_seed(0)
+    W = torch.randn(6, 4, 3, 3)          # [Cout, Cin, kH, kW], Cin*9=36
+    bs = 8
+    Cout = W.shape[0]
+    q = _quantize_mx(W.reshape(Cout, -1), 8, 'int8', axes=[1], block_size=bs,
+                     custom_cuda=False).reshape(W.shape)
+    ref = W.clone()
+    for o in range(Cout):
+        ref[o] = _mx_block_1d_ref(W[o].reshape(-1), bs).reshape(W[o].shape)
+    assert torch.allclose(q, ref, atol=1e-6)
+
+
+def test_flatten_wt_non_divisible_padding():
+    """Flattened length not a multiple of block_size -> padded internally,
+    original shape restored, all finite."""
+    torch.manual_seed(0)
+    W = torch.randn(3, 5, 3, 3)          # Cin*9 = 45, not divisible by 32
+    q = _quantize_mx(W.reshape(3, -1), 8, 'int8', axes=[1], block_size=32,
+                     custom_cuda=False).reshape(W.shape)
+    assert q.shape == W.shape
+    assert torch.isfinite(q).all()
+
+
+def test_mxconv2d_flatten_wt_forward():
+    """MXConv2d fwd honors flatten_wt: output finite, shape matches, differs
+    from the default channel-blocked output."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 6, 6)
+    y_default = _build_conv(_cpu_specs())(x)
+    y_flat = _build_conv(_cpu_specs(block_size=32, flatten_wt=True))(x)
+    assert y_flat.shape == y_default.shape
+    assert torch.isfinite(y_flat).all()
+    assert not torch.allclose(y_default, y_flat)
+
+
+def test_mxconv2d_flatten_wt_with_cube_act():
+    """flatten_wt (weight) composes with a cube act block independently."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 6, 6)
+    y = _build_conv(_cpu_specs(
+        block_size=32, flatten_wt=True,
+        block_axes_act=[1, 2, 3], block_shape_act=[4, 2, 2]))(x)
+    assert torch.isfinite(y).all()
+
+
+def test_quantizer_end_to_end_flatten_wt():
+    """MXQuantizer plumbs flatten_wt + block_axes_act (X) from JSON config
+    through to a working forward pass."""
+    from simple_net import SimpleNet
+    from mx_quantizer import MXQuantizer
+
+    tmp = tempfile.mkdtemp()
+    cfg = {
+        "mx_specs": {
+            "w_elem_format": "int8", "a_elem_format": "int8",
+            "block_size": 32, "custom_cuda": False,
+            "block_axes_act": [3], "flatten_wt": True,
+        },
+        "layers": ["conv2"], "ptq": False, "measure_error": False,
+    }
+    with open(os.path.join(tmp, "mx_config.json"), "w") as f:
+        json.dump(cfg, f)
+
+    model = MXQuantizer(save_dir=tmp).quant(SimpleNet())
+    assert isinstance(model.conv2, MXConv2d)
+    y = model(torch.randn(2, 3, 8, 8))
+    assert y.shape == (2, 10)
+    assert torch.isfinite(y).all()
+
+
 def test_quantizer_end_to_end_cube():
     """MXQuantizer plumbs block_shape* from JSON config through to a working
     forward pass."""
