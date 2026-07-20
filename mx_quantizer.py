@@ -388,7 +388,7 @@ class MXQuantizer:
                 _axes_keys = {k: mx_specs.get(k) for k in
                               ('block_axes', 'block_axes_act', 'block_axes_wt',
                                'block_shape', 'block_shape_act', 'block_shape_wt',
-                               'flatten_wt')
+                               'block_size_wt', 'flatten_wt')
                               if mx_specs.get(k)}
                 if _axes_keys and conv_cls is not MXConv2d:
                     print(f"[MXQuantizer] WARNING: conv '{clean_name}' uses "

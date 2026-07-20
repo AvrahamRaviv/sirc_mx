@@ -246,6 +246,74 @@ def test_mxconv2d_flatten_wt_with_cube_act():
     assert torch.isfinite(y).all()
 
 
+def test_block_size_wt_default_backward_compat():
+    """block_size_wt unset (None) reproduces the plain shared-block_size result
+    exactly, for both the scalar weight path and the flatten_wt path."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 6, 6)
+    # scalar (non-flatten) weight path
+    y_ref = _build_conv(_cpu_specs(block_size=4))(x)
+    y_none = _build_conv(_cpu_specs(block_size=4, block_size_wt=None))(x)
+    y_same = _build_conv(_cpu_specs(block_size=4, block_size_wt=4))(x)
+    assert torch.equal(y_ref, y_none)
+    assert torch.equal(y_ref, y_same)
+    # flatten_wt path
+    y_flat_ref = _build_conv(_cpu_specs(block_size=32, flatten_wt=True))(x)
+    y_flat_wt = _build_conv(_cpu_specs(block_size=32, flatten_wt=True,
+                                       block_size_wt=32))(x)
+    assert torch.equal(y_flat_ref, y_flat_wt)
+
+
+def test_block_size_wt_scalar_path_overrides_weight():
+    """Non-flatten path: block_size_wt sets the weight block independently while
+    activations keep block_size. Different weight block => different output."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 6, 6)
+    y_ref = _build_conv(_cpu_specs(block_size=4))(x)              # wt block 4
+    y_wt = _build_conv(_cpu_specs(block_size=4, block_size_wt=8))(x)  # wt block 8
+    assert y_wt.shape == y_ref.shape
+    assert torch.isfinite(y_wt).all()
+    assert not torch.allclose(y_ref, y_wt)
+
+
+def test_block_size_wt_flatten_overrides_weight():
+    """flatten_wt path: block_size_wt sizes the flattened weight stream; a size
+    different from block_size changes the weight quant (and thus the output)."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 6, 6)
+    y32 = _build_conv(_cpu_specs(block_size=32, flatten_wt=True))(x)
+    y8 = _build_conv(_cpu_specs(block_size=32, flatten_wt=True,
+                                block_size_wt=8))(x)
+    assert torch.isfinite(y8).all()
+    assert not torch.allclose(y32, y8)
+
+
+def test_block_size_wt_ignored_when_cube_wt_set():
+    """block_shape_wt (cube) keeps precedence: block_size_wt is ignored when a
+    weight cube shape is set."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 8, 6, 6)
+    base = dict(block_size=4, block_axes_wt=[1], block_shape_wt=[4])
+    y_cube = _build_conv(_cpu_specs(**base))(x)
+    y_cube_bs = _build_conv(_cpu_specs(block_size_wt=8, **base))(x)
+    assert torch.equal(y_cube, y_cube_bs)
+
+
+def test_block_size_wt_matches_manual_reference_flatten():
+    """flatten_wt weight with block_size_wt != block_size matches a hand-rolled
+    per-filter 1D reference blocked by block_size_wt."""
+    torch.manual_seed(0)
+    W = torch.randn(6, 4, 3, 3)          # Cin*9 = 36
+    bs_wt = 8
+    Cout = W.shape[0]
+    q = _quantize_mx(W.reshape(Cout, -1), 8, 'int8', axes=[1], block_size=bs_wt,
+                     custom_cuda=False).reshape(W.shape)
+    ref = W.clone()
+    for o in range(Cout):
+        ref[o] = _mx_block_1d_ref(W[o].reshape(-1), bs_wt).reshape(W[o].shape)
+    assert torch.allclose(q, ref, atol=1e-6)
+
+
 def test_quantizer_end_to_end_flatten_wt():
     """MXQuantizer plumbs flatten_wt + block_axes_act (X) from JSON config
     through to a working forward pass."""
