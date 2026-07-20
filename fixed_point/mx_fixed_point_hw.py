@@ -101,6 +101,75 @@ def extract_mxint8(x_q_fp32, bs, axis):
     return extract_mxint(x_q_fp32, bs, axis, fmt='int8')
 
 
+def _mxint_mantissa_exp(xb, mant_bias, max_val, store_dtype):
+    """Shared MXINT block decode over the last axis of `xb` ([..., blk_len]).
+
+    Returns (q, E): integer mantissas (same shape) and the per-block shared
+    exponent E (shape [..., 1]). Mirrors `extract_mxint`'s math exactly.
+    """
+    max_abs = xb.abs().amax(dim=-1, keepdim=True)
+    nonzero = max_abs > 0
+    safe = torch.where(nonzero, max_abs, torch.ones_like(max_abs))
+    E = torch.floor(torch.log2(safe))
+    E = torch.where(nonzero, E, torch.zeros_like(E))
+    scale_inv = torch.pow(torch.tensor(2.0, device=xb.device), mant_bias - E)
+    q = torch.round(xb * scale_inv).clamp_(-max_val, max_val).to(store_dtype)
+    return q, E
+
+
+def extract_mxint_flatten(qw_fp, bs, fmt='int8'):
+    """NPE weight decode: per output filter, flatten [Cin,kH,kW] -> 1D and block
+    by `bs` along that stream (blocks cross channel boundaries; tail block is
+    partial, zero-padded internally — zeros do not change the block max).
+
+    Returns
+    -------
+    q_full : same shape as `qw_fp` ([O,Cin,kH,kW]), intN mantissas.
+    E_full : same shape, int16 — each weight element carries its flatten-block
+             shared exponent (full resolution, drives the bs=1 ref).
+    """
+    _, mant_bias, max_val, store_dtype = _int_format_params(fmt)
+    x = qw_fp.detach().to(torch.float32)
+    O = x.shape[0]
+    flat = x.reshape(O, -1)                       # [O, Cin*kH*kW]
+    K = flat.shape[1]
+    nb = (K + bs - 1) // bs
+    pad = nb * bs - K
+    if pad:
+        flat = F.pad(flat, (0, pad))              # tail zeros; block max unchanged
+    xb = flat.view(O, nb, bs)
+    q, E = _mxint_mantissa_exp(xb, mant_bias, max_val, store_dtype)
+    q_full = q.view(O, nb * bs)[:, :K].reshape(qw_fp.shape).contiguous()
+    E_full = E.expand(O, nb, bs).reshape(O, nb * bs)[:, :K] \
+        .reshape(qw_fp.shape).to(torch.int16).contiguous()
+    return q_full, E_full
+
+
+def extract_mxint_xblock(qi_fp, bs, fmt='int8'):
+    """NPE activation decode: block along W (width, axis=3) by `bs`, per (b,c,y)
+    (tail X-block partial, zero-padded internally).
+
+    Returns
+    -------
+    q_full : same shape as `qi_fp` ([B,C,H,W]), intN mantissas.
+    E_full : same shape, int16 — each activation element carries its X-block
+             shared exponent (full resolution, drives the bs=1 ref).
+    """
+    _, mant_bias, max_val, store_dtype = _int_format_params(fmt)
+    x = qi_fp.detach().to(torch.float32)
+    B, C, H, W = x.shape
+    nb = (W + bs - 1) // bs
+    pad = nb * bs - W
+    if pad:
+        x = F.pad(x, (0, pad))                    # pad width; block max unchanged
+    xb = x.view(B, C, H, nb, bs)
+    q, E = _mxint_mantissa_exp(xb, mant_bias, max_val, store_dtype)
+    q_full = q.view(B, C, H, nb * bs)[..., :W].reshape(qi_fp.shape).contiguous()
+    E_full = E.expand(B, C, H, nb, bs).reshape(B, C, H, nb * bs)[..., :W] \
+        .reshape(qi_fp.shape).to(torch.int16).contiguous()
+    return q_full, E_full
+
+
 def _sat(x, lo, hi):
     """Clamp to [lo, hi] and return (clamped, over|under mask)."""
     sat = (x < lo) | (x > hi)
@@ -211,6 +280,35 @@ def _hw_fxp_conv2d_ref(
     return out, sat
 
 
+def _hw_fxp_conv2d_ref_npe(
+    qi_i8, qw_i8, Ea_full, Ew_full,
+    e_layer_min, stride, padding, dilation,
+    bits, sat_mode,
+    bias_fp=None, mant_bias=MANTISSA_BIAS,
+):
+    """NPE reference: the two operands carry independent, full-resolution
+    per-element shared exponents (weight = flatten-block, act = X-block). This
+    is exactly the channel-mode ref with effective bs=1 (one lane per channel),
+    so no separate kernel is needed — the shift/accumulate/saturate/de-shift
+    logic is identical.
+
+    Ea_full : [B,C,H,W]     int16 (X-block exp broadcast per element)
+    Ew_full : [O,C,kH,kW]   int16 (flatten-block exp broadcast per element)
+    """
+    if sat_mode == "per_block":
+        raise ValueError(
+            "sat_mode='per_block' is not supported for NPE blockify: the weight "
+            "flatten-block and activation X-block decouple, so per-block grouping "
+            "is undefined. Use sat_mode='per_product'."
+        )
+    return _hw_fxp_conv2d_ref(
+        qi_i8, qw_i8, Ea_full, Ew_full,
+        e_layer_min, stride, padding, dilation,
+        bs=1, bits=bits, sat_mode=sat_mode,
+        bias_fp=bias_fp, mant_bias=mant_bias,
+    )
+
+
 class HWFxpConv2dFn(torch.autograd.Function):
     """HW-faithful fixed-point Conv2d forward + STE backward.
 
@@ -230,30 +328,48 @@ class HWFxpConv2dFn(torch.autograd.Function):
         stride, padding, dilation, backend,
         stats_sink=None,
         fmt='int8',
+        act_blockify='channel', weight_blockify='channel',
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
-        with torch.no_grad():
-            qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
-            qw_i8, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
+        npe = (act_blockify == "xblock" and weight_blockify == "flatten")
 
-        use_triton = (backend == "triton" and qi_fp.is_cuda)
-        if use_triton:
-            from .mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
-            out_flat, sat_flat = _hw_fxp_conv2d_triton(
+        if npe:
+            # NPE: independent per-element exponents (act X-block, weight
+            # flatten-block). Torch ref only in Phase 1 (triton is Phase 2).
+            with torch.no_grad():
+                qi_i8, Ea = extract_mxint_xblock(qi_fp, bs, fmt=fmt)
+                qw_i8, Ew = extract_mxint_flatten(qw_fp, bs, fmt=fmt)
+            use_triton = False
+            out_flat, sat_flat = _hw_fxp_conv2d_ref_npe(
                 qi_i8, qw_i8, Ea, Ew,
                 int(e_layer_min), stride, padding, dilation,
-                bs, int(bits), sat_mode,
+                int(bits), sat_mode,
                 bias_fp=bias_fp,
                 mant_bias=int(mant_bias),
             )
         else:
-            out_flat, sat_flat = _hw_fxp_conv2d_ref(
-                qi_i8, qw_i8, Ea, Ew,
-                int(e_layer_min), stride, padding, dilation,
-                bs, int(bits), sat_mode,
-                bias_fp=bias_fp,
-                mant_bias=int(mant_bias),
-            )
+            with torch.no_grad():
+                qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
+                qw_i8, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
+
+            use_triton = (backend == "triton" and qi_fp.is_cuda)
+            if use_triton:
+                from .mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
+                out_flat, sat_flat = _hw_fxp_conv2d_triton(
+                    qi_i8, qw_i8, Ea, Ew,
+                    int(e_layer_min), stride, padding, dilation,
+                    bs, int(bits), sat_mode,
+                    bias_fp=bias_fp,
+                    mant_bias=int(mant_bias),
+                )
+            else:
+                out_flat, sat_flat = _hw_fxp_conv2d_ref(
+                    qi_i8, qw_i8, Ea, Ew,
+                    int(e_layer_min), stride, padding, dilation,
+                    bs, int(bits), sat_mode,
+                    bias_fp=bias_fp,
+                    mant_bias=int(mant_bias),
+                )
 
         B, _, H, W = qi_fp.shape
         O, _, kH, kW = qw_fp.shape
@@ -301,12 +417,14 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 14 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
-        # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink, fmt
+        # forward took 16 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink,
+        # fmt, act_blockify, weight_blockify
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None,
         )
 
 
@@ -316,12 +434,17 @@ def hw_fxp_conv2d(
     stride=1, padding=0, dilation=1, backend="python",
     stats_sink=None,
     fmt='int8',
+    act_blockify='channel', weight_blockify='channel',
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
     `stats_sink` is an optional mutable dict; kernel fills in 'sat_count',
     'total', and 'backend' after each forward for logging.
     `fmt` is the MXINT element format ('int8', 'int10', 'int12', 'int16', ...).
+    `act_blockify`/`weight_blockify` select NPE blockify: defaults
+    'channel'/'channel' (block both along Cin); NPE = 'xblock'/'flatten'
+    (activation along W, weight per-filter flattened). NPE uses the torch ref
+    only in Phase 1 (triton is Phase 2).
     """
     if e_layer_min is None:
         raise RuntimeError(
@@ -334,6 +457,7 @@ def hw_fxp_conv2d(
         stride, padding, dilation, str(backend),
         stats_sink,
         str(fmt),
+        str(act_blockify), str(weight_blockify),
     )
 
 
@@ -341,15 +465,22 @@ def hw_fxp_conv2d(
 # Calibration
 # ------------------------------------------------------------------
 
-def _compute_min_shift_exp(qi_fp, qw_fp, bs, fmt='int8'):
+def _compute_min_shift_exp(qi_fp, qw_fp, bs, fmt='int8',
+                           act_blockify='channel', weight_blockify='channel'):
     """Return layer-wide min(Ew + Ea - 2*mantissa_bias) over all block pairs.
 
     Ea and Ew are independent (no shared index), so the joint min is simply
-    min(Ea) + min(Ew).
+    min(Ea) + min(Ew) — holds for both channel and NPE blockings.
     """
     _, mant_bias, _, _ = _int_format_params(fmt)
-    _, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
-    _, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
+    if act_blockify == "xblock":
+        _, Ea = extract_mxint_xblock(qi_fp, bs, fmt=fmt)
+    else:
+        _, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
+    if weight_blockify == "flatten":
+        _, Ew = extract_mxint_flatten(qw_fp, bs, fmt=fmt)
+    else:
+        _, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
     return int(Ea.amin().item()) + int(Ew.amin().item()) - 2 * int(mant_bias)
 
 
@@ -359,8 +490,12 @@ class _CalibrationState:
     def __init__(self):
         self.running_min = None
 
-    def update(self, qi_fp, qw_fp, bs, fmt='int8'):
-        cand = _compute_min_shift_exp(qi_fp, qw_fp, bs, fmt=fmt)
+    def update(self, qi_fp, qw_fp, bs, fmt='int8',
+               act_blockify='channel', weight_blockify='channel'):
+        cand = _compute_min_shift_exp(
+            qi_fp, qw_fp, bs, fmt=fmt,
+            act_blockify=act_blockify, weight_blockify=weight_blockify,
+        )
         self.running_min = cand if self.running_min is None else min(self.running_min, cand)
 
 

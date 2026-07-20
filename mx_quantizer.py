@@ -361,9 +361,15 @@ class MXQuantizer:
             elif is_conv:
                 reason = None
                 hw_pad = want_hw and bool(xblock_cfg.get('pad_channels', True))
+                # NPE (weight flatten + act X-block) needs no channel divisibility:
+                # the weight flattens per filter and the activation blocks along W.
+                is_npe = (want_hw
+                          and xblock_cfg.get('weight_blockify') == 'flatten'
+                          and xblock_cfg.get('act_blockify') == 'xblock')
                 if want_blocked and module.groups != 1:
                     reason = f"groups={module.groups}"
-                elif want_blocked and bs > 0 and module.in_channels % bs != 0 and not hw_pad:
+                elif (want_blocked and bs > 0 and module.in_channels % bs != 0
+                        and not hw_pad and not is_npe):
                     reason = f"in_channels={module.in_channels} not divisible by block_size={bs}"
                 use_blocked = want_blocked and reason is None
                 if want_blocked and not use_blocked:

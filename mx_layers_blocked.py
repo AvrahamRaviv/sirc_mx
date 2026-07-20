@@ -250,7 +250,12 @@ class MXConv2dHW(MXConv2d):
         cfg_early = _get_xblock_cfg(self)
         pad_channels = bool(cfg_early.get('pad_channels', True))
         verbose = int(cfg_early.get('verbose', 1))
-        if C % bs != 0:
+        # NPE blockify: weight per-filter flatten + activation X-block. Needs no
+        # channel divisibility/padding (flatten handles any Cin; X-block is on W).
+        act_blockify = cfg_early.get('act_blockify', 'channel')
+        weight_blockify = cfg_early.get('weight_blockify', 'channel')
+        npe = (act_blockify == "xblock" and weight_blockify == "flatten")
+        if not npe and C % bs != 0:
             if not pad_channels:
                 raise AssertionError(
                     f"MXConv2dHW requires in_channels ({C}) divisible by "
@@ -277,8 +282,19 @@ class MXConv2dHW(MXConv2d):
         else:
             bf_bias = None
 
-        qi = quantize_mx_op(bf_in, sp, elem_format=sp['a_elem_format'], axes=[1])
-        qw = quantize_mx_op(bf_w, sp, elem_format=sp['w_elem_format'], axes=[1])
+        if npe:
+            # Fake-quant with the NPE blockings so extract_mxint_{xblock,flatten}
+            # recover a consistent lattice (and STE grads flow). Activation blocks
+            # along W (axis=3); weight flattens each filter [Cin,kH,kW]->1D.
+            qi = quantize_mx_op(bf_in, sp, elem_format=sp['a_elem_format'],
+                                axes=[3], block_size=bs)
+            flat = bf_w.reshape(bf_w.shape[0], -1)
+            flat = quantize_mx_op(flat, sp, elem_format=sp['w_elem_format'],
+                                  axes=[1], block_size=bs)
+            qw = flat.reshape(bf_w.shape)
+        else:
+            qi = quantize_mx_op(bf_in, sp, elem_format=sp['a_elem_format'], axes=[1])
+            qw = quantize_mx_op(bf_w, sp, elem_format=sp['w_elem_format'], axes=[1])
         if qw.dtype == torch.bfloat16 and qi.dtype != torch.bfloat16:
             qw = qw.to(qi.dtype)
 
@@ -286,7 +302,8 @@ class MXConv2dHW(MXConv2d):
         # path so downstream layers see sensible activations.
         cal = getattr(self, '_calibration_state', None)
         if cal is not None:
-            cal.update(qi, qw, bs, fmt=a_fmt)
+            cal.update(qi, qw, bs, fmt=a_fmt,
+                       act_blockify=act_blockify, weight_blockify=weight_blockify)
             return self._fp32_blocked_forward(qi, qw, bf_bias, H, W)
 
         cfg = _get_xblock_cfg(self)
@@ -323,6 +340,8 @@ class MXConv2dHW(MXConv2d):
             backend=cfg['backend'],
             stats_sink=stats,
             fmt=a_fmt,
+            act_blockify=act_blockify,
+            weight_blockify=weight_blockify,
         )
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))
@@ -362,6 +381,14 @@ class MXConv2dHW(MXConv2d):
         O = qw.shape[0]
         kH, kW = qw.shape[2], qw.shape[3]
         kK = kH * kW
+
+        # NPE (or any non-divisible Cin): the channel-blocked reshape below does
+        # not apply; a plain conv is an equivalent FP32 reference for producing
+        # downstream activations during calibration.
+        if C % bs != 0:
+            out = F.conv2d(qi, qw, bf_bias, self.stride, self.padding,
+                           self.dilation, self.groups)
+            return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
         nb = C // bs
 
         x_unf = F.unfold(qi, (kH, kW),

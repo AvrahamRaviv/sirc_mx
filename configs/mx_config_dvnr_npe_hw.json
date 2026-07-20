@@ -1,0 +1,27 @@
+{
+  "mx_specs": {
+    "a_elem_format": "int8",
+    "w_elem_format": "int8",
+    "block_size": 32,
+    "scale_bits": 8,
+    "shared_exp_method": "max",
+    "custom_cuda": true,
+    "xblock_accum": {
+      "enabled": true,
+      "mode": "hw_fixed_point",
+      "bits": 35,
+      "backend": "python",
+      "sat_mode": "per_product",
+      "weight_blockify": "flatten",
+      "act_blockify": "xblock",
+      "e_layer_min": -20
+    }
+  },
+  "layers": [
+    "first_stage.neck_module.neck.fpn_reduce_dim",
+    "first_stage.neck_module.neck.downscale1",
+    "first_stage.detection_head_module.bbox_embed.layers.conv_0",
+    "first_stage.detection_head_module.bbox_embed.layers.conv_1"
+  ],
+  "ptq": false
+}

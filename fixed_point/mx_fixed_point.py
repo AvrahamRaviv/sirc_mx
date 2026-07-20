@@ -5,6 +5,8 @@ _MAX_BITS = 64
 _DEFAULT_BITS = 48
 _VALID_MODES = ("fp32_partial", "hw_fixed_point")
 _VALID_SAT_MODES = ("per_product", "per_block")
+_VALID_WEIGHT_BLOCKIFY = ("channel", "flatten")
+_VALID_ACT_BLOCKIFY = ("channel", "xblock")
 
 
 def validate_xblock_accum_bits(bits):
@@ -129,6 +131,10 @@ XBLOCK_ACCUM_DEFAULTS = {
     # HW-faithful emulation knobs. Only consulted when mode == 'hw_fixed_point'.
     "mode": "fp32_partial",       # 'fp32_partial' (legacy einsum+xblock_accum) or 'hw_fixed_point'
     "sat_mode": "per_product",    # 'per_product' (HW-faithful) or 'per_block' (sum-then-sat; fast)
+    # NPE blockify (hw_fixed_point only). Defaults 'channel'/'channel' = block both
+    # operands along Cin (current behavior). NPE = weight 'flatten' + act 'xblock'.
+    "weight_blockify": "channel", # 'channel' (block Cin) or 'flatten' (per-filter [Cin,kH,kW]->1D)
+    "act_blockify": "channel",    # 'channel' (block Cin) or 'xblock' (block along W/width)
     "e_layer_min": None,          # int; required for 'hw_fixed_point' inference (set via calibration)
     "pad_channels": True,         # if True, MXConv2dHW pads C up to a multiple of bs (zeros).
                                   # Disable to force fallback to MXConv2d for non-divisible layers.
@@ -207,6 +213,24 @@ def normalize_xblock_accum(value):
             raise ValueError(
                 f"xblock_accum.verbose_sample_every must be a positive int, "
                 f"got {cfg['verbose_sample_every']!r}"
+            )
+        if cfg["weight_blockify"] not in _VALID_WEIGHT_BLOCKIFY:
+            raise ValueError(
+                f"xblock_accum.weight_blockify must be in {_VALID_WEIGHT_BLOCKIFY}, "
+                f"got {cfg['weight_blockify']!r}"
+            )
+        if cfg["act_blockify"] not in _VALID_ACT_BLOCKIFY:
+            raise ValueError(
+                f"xblock_accum.act_blockify must be in {_VALID_ACT_BLOCKIFY}, "
+                f"got {cfg['act_blockify']!r}"
+            )
+        # Phase 1 supports only the two documented combinations.
+        _combo = (cfg["act_blockify"], cfg["weight_blockify"])
+        if _combo not in (("channel", "channel"), ("xblock", "flatten")):
+            raise ValueError(
+                f"unsupported blockify combination act={cfg['act_blockify']!r}, "
+                f"weight={cfg['weight_blockify']!r}; supported: "
+                f"('channel','channel') [default] or ('xblock','flatten') [NPE]"
             )
     return cfg
 
