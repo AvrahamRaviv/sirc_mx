@@ -342,6 +342,7 @@ class MXConv2dHW(MXConv2d):
             fmt=a_fmt,
             act_blockify=act_blockify,
             weight_blockify=weight_blockify,
+            npe_triton_variant=cfg.get('npe_triton_variant', 'reuse'),
         )
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))

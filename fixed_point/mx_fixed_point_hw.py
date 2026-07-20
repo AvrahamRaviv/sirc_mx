@@ -329,24 +329,50 @@ class HWFxpConv2dFn(torch.autograd.Function):
         stats_sink=None,
         fmt='int8',
         act_blockify='channel', weight_blockify='channel',
+        npe_triton_variant='reuse',
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
         npe = (act_blockify == "xblock" and weight_blockify == "flatten")
 
         if npe:
             # NPE: independent per-element exponents (act X-block, weight
-            # flatten-block). Torch ref only in Phase 1 (triton is Phase 2).
+            # flatten-block). GPU via triton ('reuse' = existing kernel at bs=1,
+            # or 'opt' = dedicated per-lane kernel); torch ref otherwise.
             with torch.no_grad():
                 qi_i8, Ea = extract_mxint_xblock(qi_fp, bs, fmt=fmt)
                 qw_i8, Ew = extract_mxint_flatten(qw_fp, bs, fmt=fmt)
-            use_triton = False
-            out_flat, sat_flat = _hw_fxp_conv2d_ref_npe(
-                qi_i8, qw_i8, Ea, Ew,
-                int(e_layer_min), stride, padding, dilation,
-                int(bits), sat_mode,
-                bias_fp=bias_fp,
-                mant_bias=int(mant_bias),
-            )
+            use_triton = (backend == "triton" and qi_fp.is_cuda)
+            if use_triton:
+                if sat_mode == "per_block":
+                    raise ValueError(
+                        "sat_mode='per_block' is not supported for NPE blockify; "
+                        "use sat_mode='per_product'."
+                    )
+                from .mx_fixed_point_hw_triton import (
+                    _hw_fxp_conv2d_triton, _hw_fxp_conv2d_triton_npe,
+                )
+                if npe_triton_variant == "opt":
+                    out_flat, sat_flat = _hw_fxp_conv2d_triton_npe(
+                        qi_i8, qw_i8, Ea, Ew,
+                        int(e_layer_min), stride, padding, dilation,
+                        int(bits), sat_mode,
+                        bias_fp=bias_fp, mant_bias=int(mant_bias),
+                    )
+                else:  # 'reuse': existing kernel with effective bs=1
+                    out_flat, sat_flat = _hw_fxp_conv2d_triton(
+                        qi_i8, qw_i8, Ea, Ew,
+                        int(e_layer_min), stride, padding, dilation,
+                        1, int(bits), sat_mode,
+                        bias_fp=bias_fp, mant_bias=int(mant_bias),
+                    )
+            else:
+                out_flat, sat_flat = _hw_fxp_conv2d_ref_npe(
+                    qi_i8, qw_i8, Ea, Ew,
+                    int(e_layer_min), stride, padding, dilation,
+                    int(bits), sat_mode,
+                    bias_fp=bias_fp,
+                    mant_bias=int(mant_bias),
+                )
         else:
             with torch.no_grad():
                 qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
@@ -417,14 +443,14 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 16 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # forward took 17 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
         # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink,
-        # fmt, act_blockify, weight_blockify
+        # fmt, act_blockify, weight_blockify, npe_triton_variant
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
             None, None, None, None, None, None,
-            None, None,
+            None, None, None,
         )
 
 
@@ -435,6 +461,7 @@ def hw_fxp_conv2d(
     stats_sink=None,
     fmt='int8',
     act_blockify='channel', weight_blockify='channel',
+    npe_triton_variant='reuse',
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
@@ -443,8 +470,9 @@ def hw_fxp_conv2d(
     `fmt` is the MXINT element format ('int8', 'int10', 'int12', 'int16', ...).
     `act_blockify`/`weight_blockify` select NPE blockify: defaults
     'channel'/'channel' (block both along Cin); NPE = 'xblock'/'flatten'
-    (activation along W, weight per-filter flattened). NPE uses the torch ref
-    only in Phase 1 (triton is Phase 2).
+    (activation along W, weight per-filter flattened). `npe_triton_variant`
+    picks the NPE+triton kernel ('reuse' existing kernel at bs=1, or 'opt'
+    dedicated per-lane kernel); both are bit-identical.
     """
     if e_layer_min is None:
         raise RuntimeError(
@@ -458,6 +486,7 @@ def hw_fxp_conv2d(
         stats_sink,
         str(fmt),
         str(act_blockify), str(weight_blockify),
+        str(npe_triton_variant),
     )
 
 
