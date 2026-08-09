@@ -42,11 +42,12 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
+from mx_layers_act import MXActQuant
 from mx_debug import _ascii_hist
 
 _RESERVOIR_CAP = 65536
 _MX_TYPES = (MXConv2dHW, MXConv2dBlocked, MXConvTranspose2d, MXConv2d,
-             MXLinearBlocked, MXLinear)
+             MXLinearBlocked, MXLinear, MXActQuant)
 
 
 def _log(log, msg):
@@ -71,6 +72,10 @@ def _layer_type_name(module):
 
 def _layer_quant_axes(module):
     """Return (act_axes, wt_axes) matching each layer's forward quantization."""
+    if isinstance(module, MXActQuant):
+        # No weights; act axes are per input — report input 0, the rest live
+        # under the entry's "inputs" list.
+        return list(module.axes_per_input[0]), []
     sp = module.mx_specs
     if isinstance(module, (MXConv2dHW, MXConv2dBlocked)):
         return [1], [1]
@@ -354,6 +359,31 @@ def _make_stats_hook(name, state, output_error=True):
     return hook
 
 
+def _make_act_stats_hook(name, state):
+    """Hook for MXActQuant: per-input operand stats, no weights, no output error.
+
+    The forward hook's `inp` tuple holds the wrapper's positional args, i.e. the
+    same tensors `MXActQuant.quant_input` quantizes, pre-quantization.
+    """
+    def hook(mod, inp, out):
+        with torch.no_grad():
+            st = state[name]
+            for i, x in enumerate(inp):
+                if i >= len(mod.specs_per_input):
+                    break
+                sp = mod.specs_per_input[i]
+                if sp is None or sp["a_elem_format"] is None:
+                    continue
+                if not torch.is_tensor(x) or not x.is_floating_point():
+                    continue
+                axes = mod.axes_per_input[i]
+                bf, q = _quant_operand(x.detach().float(), sp,
+                                       sp["a_elem_format"], axes, "round_output")
+                _tensor_block_stats(bf, q, axes, sp["block_size"], st["inputs"][i])
+            st["n_calls"] += 1
+    return hook
+
+
 def _sort_key(entry):
     """Worst-first ordering: out-SQNR, fallback act, then weight; nan/missing last."""
     for section in ("output_error", "activation", "weight"):
@@ -495,15 +525,23 @@ def collect_stats(model, data=None, forward_fn=None, *,
 
     state = {}
     for name, m in mx_layers:
-        state[name] = {"weight": _weight_stats(m, detail=detail),
-                       "act": _TensorStats(),
-                       "out_err": _ErrAccum(),
-                       "n_calls": 0}
+        if isinstance(m, MXActQuant):
+            # One sink per quantized input; "act" aliases input 0 so the
+            # network-level aggregation below stays uniform.
+            sinks = [_TensorStats() for _ in m.specs_per_input]
+            state[name] = {"weight": None, "inputs": sinks, "act": sinks[0],
+                           "out_err": _ErrAccum(), "n_calls": 0}
+        else:
+            state[name] = {"weight": _weight_stats(m, detail=detail),
+                           "act": _TensorStats(),
+                           "out_err": _ErrAccum(),
+                           "n_calls": 0}
 
     n_batches = 0
     if data is not None:
         handles = [m.register_forward_hook(
-                       _make_stats_hook(n, state, output_error=output_error))
+                       _make_act_stats_hook(n, state) if isinstance(m, MXActQuant)
+                       else _make_stats_hook(n, state, output_error=output_error))
                    for n, m in mx_layers]
 
         def _fwd(m, batch):
@@ -536,13 +574,23 @@ def collect_stats(model, data=None, forward_fn=None, *,
         st = state[name]
         sp = m.mx_specs
         act_axes, wt_axes = _layer_quant_axes(m)
+        is_act_only = isinstance(m, MXActQuant)
         entry = {
             "layer_type": _layer_type_name(m),
-            "w_elem_format": sp["w_elem_format"],
+            "w_elem_format": None if is_act_only else sp["w_elem_format"],
             "a_elem_format": sp["a_elem_format"],
             "block_size": sp["block_size"],
             "act_axes": list(act_axes), "wt_axes": list(wt_axes),
         }
+        if is_act_only:
+            entry["inputs"] = [
+                None if isp is None else
+                dict(sink.finalize(histograms=histograms),
+                     a_elem_format=isp["a_elem_format"],
+                     block_size=isp["block_size"],
+                     axes=list(m.axes_per_input[i]))
+                for i, (isp, sink) in enumerate(zip(m.specs_per_input, st["inputs"]))
+            ]
         if st["weight"] is not None:
             entry["weight"] = dict(st["weight"].finalize(histograms=histograms),
                                    shape=list(m.weight.shape),

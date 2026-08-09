@@ -19,6 +19,7 @@ from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
+from mx_layers_act import MXActQuant
 from mx_stats import collect_stats as _collect_stats_impl
 
 
@@ -450,6 +451,11 @@ class MXQuantizer:
 
             setattr(parent, leaf, new)
 
+        # Param-free ops (kind == 'act_quant') are wrapped after the conv/linear
+        # pass: wrapping inserts an `.inner` level in the module path, which
+        # would break name lookup for any conv/linear nested under them.
+        n_act = self._wrap_act_layers(model, verbose=verbose)
+
         if verbose >= 1:
             n_hw = len(replace_summary['hw'])
             n_blk = len(replace_summary['blocked'])
@@ -462,6 +468,7 @@ class MXQuantizer:
                 f"[MXQuantizer] replace summary: "
                 f"hw={n_hw} blocked={n_blk} "
                 f"mxconv={n_def_c} mxconvT={n_def_ct} mxlinear={n_def_l} "
+                f"act_quant={n_act} "
                 f"fallback_conv={n_fb_c} fallback_linear={n_fb_l}"
             )
             if n_fb_c or n_fb_l:
@@ -494,6 +501,8 @@ class MXQuantizer:
                 spec_dict = global_specs
             else:
                 name = layer["name"]
+                if layer.get("kind") == "act_quant":
+                    continue          # handled by _build_act_map / MXActQuant
                 if "mx_specs" in layer:
                     spec_dict = layer["mx_specs"]
                 elif "group" in layer:
@@ -507,6 +516,98 @@ class MXQuantizer:
             layer_map[name] = self._build_mx_specs(spec_dict)
 
         return layer_map
+
+    def _build_act_map(self):
+        """Parse `kind: "act_quant"` config entries.
+
+        Returns:
+            dict: layer_name -> (specs_per_input, axes_per_input)
+
+        Entry format (one per parameter-free module to wrap):
+            {"name": "warp", "kind": "act_quant",
+             "inputs": [
+               {"mx_specs": {...}, "axes": [1]},     # input 0
+               {"group": "low_precision", "axes": [-1]},  # input 1
+               null                                   # input 2: not quantized
+             ]}
+
+        Per-input spec priority mirrors layers: "mx_specs" > "group" > global.
+        `axes` defaults to [1] (channel axis for NCHW activations).
+        """
+        if not self.config or "layers" not in self.config:
+            return {}
+
+        global_specs = self.config.get("mx_specs", None)
+        groups = self.config.get("groups", {})
+        act_map = {}
+
+        for layer in self.config["layers"]:
+            if not isinstance(layer, dict) or layer.get("kind") != "act_quant":
+                continue
+            name = layer["name"]
+            inputs = layer.get("inputs")
+            if not inputs:
+                raise ValueError(
+                    f"act_quant layer '{name}' must define a non-empty 'inputs' list")
+
+            specs_per_input, axes_per_input = [], []
+            for i, ent in enumerate(inputs):
+                if ent is None:
+                    specs_per_input.append(None)
+                    axes_per_input.append([1])
+                    continue
+                if "mx_specs" in ent:
+                    spec_dict = ent["mx_specs"]
+                elif "group" in ent:
+                    group_name = ent["group"]
+                    if group_name not in groups:
+                        raise ValueError(
+                            f"Group '{group_name}' (act_quant '{name}' input {i}) "
+                            f"not defined in config 'groups'")
+                    spec_dict = groups[group_name]
+                else:
+                    spec_dict = global_specs
+                specs_per_input.append(self._build_mx_specs(spec_dict))
+                axes = ent.get("axes", [1])
+                if len(axes) != 1:
+                    raise ValueError(
+                        f"act_quant '{name}' input {i}: exactly one quant axis "
+                        f"supported, got {axes}")
+                axes_per_input.append(axes)
+
+            act_map[name] = (specs_per_input, axes_per_input)
+
+        return act_map
+
+    def _wrap_act_layers(self, model, verbose=1):
+        """Wrap configured parameter-free modules in MXActQuant. Returns count."""
+        act_map = self._build_act_map()
+        if not act_map:
+            return 0
+
+        wrapped = set()
+        for full_name, module in list(model.named_modules()):
+            clean_name = (full_name[len("module."):]
+                          if full_name.startswith("module.") else full_name)
+            if clean_name not in act_map or isinstance(module, MXActQuant):
+                continue
+            parent, leaf = self._get_parent(model, full_name)
+            if parent is None:
+                continue
+            specs_per_input, axes_per_input = act_map[clean_name]
+            new = MXActQuant(module, specs_per_input, axes_per_input)
+            new._mx_layer_name = clean_name
+            setattr(parent, leaf, new)
+            wrapped.add(clean_name)
+            if verbose >= 2:
+                print(f"[MXQuantizer] act_quant '{clean_name}' -> "
+                      f"MXActQuant({new.extra_repr()})")
+
+        missing = sorted(set(act_map) - wrapped)
+        if missing and verbose >= 1:
+            print(f"[MXQuantizer] WARNING: act_quant layers not found in model: "
+                  f"{missing}")
+        return len(wrapped)
 
     def _create_mx_module(self, orig_module, mx_specs):
         """
@@ -560,7 +661,8 @@ class MXQuantizer:
         """
         if "layers" in self.config:
             return [l if isinstance(l, str) else l["name"]
-                    for l in self.config["layers"]]
+                    for l in self.config["layers"]
+                    if isinstance(l, str) or l.get("kind") != "act_quant"]
         # auto-discover all Conv2d / ConvTranspose2d / Linear (excluding already-MX layers)
         return [n for n, m in model.named_modules()
                 if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear))
@@ -1099,8 +1201,13 @@ class MXQuantizer:
         num_mx_conv, num_mx_linear, num_mx_convT = 0, 0, 0
         num_fp_conv, num_fp_linear, num_fp_convT = 0, 0, 0
 
+        num_mx_act = 0
+
         for name, module in model.named_modules():
-            if isinstance(module, MXConvTranspose2d):
+            if isinstance(module, MXActQuant):
+                self._log(log, f"[ActQuant->MX] {name}: {module.extra_repr()}")
+                num_mx_act += 1
+            elif isinstance(module, MXConvTranspose2d):
                 self._log(log, f"[ConvTranspose2d->MX] {name}: {module}")
                 num_mx_convT += 1
             elif isinstance(module, MXConv2d):
@@ -1121,4 +1228,5 @@ class MXQuantizer:
 
         self._log(log, f"MX convs: {num_mx_conv}, regular convs: {num_fp_conv}, "
                        f"MX convTs: {num_mx_convT}, regular convTs: {num_fp_convT}, "
-                       f"MX linears: {num_mx_linear}, regular linears: {num_fp_linear}.")
+                       f"MX linears: {num_mx_linear}, regular linears: {num_fp_linear}, "
+                       f"MX act-quant wrappers: {num_mx_act}.")
