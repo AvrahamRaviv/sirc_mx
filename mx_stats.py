@@ -41,6 +41,7 @@ from microxcaling.mx.linear import Linear as MXLinear
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
+from fixed_point.mx_fixed_point import _get_xblock_cfg
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 from mx_layers_act import MXActQuant
 from mx_debug import _ascii_hist
@@ -70,13 +71,36 @@ def _layer_type_name(module):
     return type(module).__name__
 
 
+def _npe_blockify(module):
+    """(act_blockify, weight_blockify) actually used by an MXConv2dHW forward."""
+    if not isinstance(module, MXConv2dHW):
+        return "channel", "channel"
+    cfg = _get_xblock_cfg(module)
+    return (cfg.get("act_blockify", "channel"),
+            cfg.get("weight_blockify", "channel"))
+
+
+def _is_npe(module):
+    """True when the HW forward takes the NPE path (act X-block + weight flatten)."""
+    act_b, wt_b = _npe_blockify(module)
+    return act_b == "xblock" and wt_b == "flatten"
+
+
 def _layer_quant_axes(module):
-    """Return (act_axes, wt_axes) matching each layer's forward quantization."""
+    """Return (act_axes, wt_axes) matching each layer's forward quantization.
+
+    For NPE-mode MXConv2dHW the weight axis refers to the *flattened* weight
+    [O, Cin*kH*kW], not the 4D tensor — see `_weight_stats`.
+    """
     if isinstance(module, MXActQuant):
         # No weights; act axes are per input — report input 0, the rest live
         # under the entry's "inputs" list.
         return list(module.axes_per_input[0]), []
     sp = module.mx_specs
+    if isinstance(module, MXConv2dHW) and _is_npe(module):
+        # mx_layers_blocked.MXConv2dHW.forward: acts block along W (axes=[3]),
+        # weights flatten per filter then block along the flat axis.
+        return [3], [1]
     if isinstance(module, (MXConv2dHW, MXConv2dBlocked)):
         return [1], [1]
     if isinstance(module, MXConvTranspose2d):
@@ -319,6 +343,11 @@ def _weight_stats(module, detail=False):
     sink = _TensorStats()
     with torch.no_grad():
         w = module.weight.data.float()
+        if isinstance(module, MXConv2dHW) and _is_npe(module):
+            # NPE flattens each filter [Cin,kH,kW] -> 1D and blocks the flat
+            # axis, so a block spans kernel taps as well as channels. Blocking
+            # the 4D tensor on Cin would group entirely different elements.
+            w = w.reshape(w.shape[0], -1)
         bf_w, q_w = _quant_operand(w, sp, w_fmt, wt_axes, "round_weight")
         _tensor_block_stats(bf_w, q_w, wt_axes, sp["block_size"], sink,
                             detail=detail)
@@ -582,6 +611,13 @@ def collect_stats(model, data=None, forward_fn=None, *,
             "block_size": sp["block_size"],
             "act_axes": list(act_axes), "wt_axes": list(wt_axes),
         }
+        if isinstance(m, MXConv2dHW):
+            act_b, wt_b = _npe_blockify(m)
+            entry["act_blockify"], entry["weight_blockify"] = act_b, wt_b
+            if _is_npe(m):
+                # wt_axes indexes the flattened weight, not the 4D tensor
+                entry["wt_shape_blocked"] = [m.weight.shape[0],
+                                             int(m.weight[0].numel())]
         if is_act_only:
             entry["inputs"] = [
                 None if isp is None else

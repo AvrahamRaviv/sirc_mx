@@ -17,9 +17,10 @@ sys.path.insert(0, '/home/avrahamra/PycharmProjects')
 from microxcaling.mx import MxSpecs
 from microxcaling.mx.convolution import Conv2d as MXConv2d
 from microxcaling.mx.mx_ops import quantize_mx_op
+from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from fixed_point.mx_fixed_point_hw import extract_mxint
-from mx_layers_blocked import MXConv2dBlocked
+from mx_layers_blocked import MXConv2dBlocked, MXConv2dHW
 import mx_debug
 import mx_stats
 from mx_stats import (_blockify, _RunningStat, _ErrAccum, _TensorStats,
@@ -238,6 +239,82 @@ def test_variants_blocked():
     assert e["act_axes"] == [1] and e["wt_axes"] == [1]
     assert math.isfinite(e["output_error"]["isolated"]["sqnr_db"])
     assert math.isfinite(e["weight"]["error"]["sqnr_db"])
+
+
+def _hw_layer(npe, cin=8, cout=4, k=3, bs=32):
+    """MXConv2dHW configured for the NPE (act X-block + weight flatten) path or not."""
+    layer = MXConv2dHW(cin, cout, k, padding=1, bias=False, mx_specs=_specs('int8', bs))
+    layer.xblock_accum = {
+        "enabled": True, "mode": "hw_fixed_point", "bits": 48,
+        "sat_mode": "per_product", "e_layer_min": -20, "backend": "python",
+        "scale_exp": None, "saturate": True, "ste_mask": False,
+        "weight_blockify": "flatten" if npe else "channel",
+        "act_blockify": "xblock" if npe else "channel",
+    }
+    return layer
+
+
+def test_npe_hw_stats_use_forward_blocking():
+    """NPE MXConv2dHW: acts block on W, weights block the flattened filter.
+
+    Regression: _layer_quant_axes used to return [1], [1] unconditionally, so
+    every operand stat described a blocking the NPE forward never performs.
+    """
+    torch.manual_seed(11)
+    layer = _hw_layer(npe=True, cin=8, cout=4, k=3, bs=32)
+    m = nn.Sequential(layer)
+    x = torch.randn(1, 8, 8, 64)
+    stats = collect_stats(m, data=[x], output_error=False, save_path=None)
+    e = stats["layers"]["0"]
+
+    assert e["act_axes"] == [3] and e["wt_axes"] == [1]
+    assert e["act_blockify"] == "xblock" and e["weight_blockify"] == "flatten"
+    # weight blocked as [O, Cin*kH*kW] = [4, 72] -> ceil(72/32) = 3 blocks per filter
+    assert e["wt_shape_blocked"] == [4, 72]
+    assert e["weight"]["n_blocks"] == 4 * 3
+    # acts blocked along W: B*C*H * ceil(W/32) = 1*8*8*2
+    assert e["activation"]["n_blocks"] == 8 * 8 * 2
+
+
+def test_npe_weight_stats_match_forward_lattice():
+    """Weight quant error must be measured on the lattice the forward builds."""
+    torch.manual_seed(12)
+    layer = _hw_layer(npe=True, cin=32, cout=4, k=3, bs=32)
+    # Craft weights where the two blockings genuinely differ: the (0,0) tap is
+    # large, every other tap tiny. Blocking on Cin keeps taps separate (each
+    # block uniform); flattening interleaves them, so ~3.5 large values per
+    # 32-wide block force the small ones to underflow.
+    with torch.no_grad():
+        layer.weight.fill_(1e-4)
+        layer.weight[:, :, 0, 0] = 1.0
+    stats = collect_stats(nn.Sequential(layer), data=None, save_path=None)
+    got = stats["layers"]["0"]["weight"]["error"]["sqnr_db"]
+
+    sp = layer.mx_specs
+    with torch.no_grad():
+        w = layer.weight.data.float()
+        bf = quantize_elemwise_op(w, mx_specs=sp, round=sp['round_weight'])
+        flat = quantize_mx_op(bf.reshape(w.shape[0], -1), sp,
+                              elem_format=sp['w_elem_format'], axes=[1],
+                              block_size=sp['block_size'])
+        ref = mx_debug._sqnr_db(bf.reshape(w.shape[0], -1), flat)
+    assert abs(got - ref) < 1e-4
+
+    # and it differs from the old 4D Cin-axis blocking
+    with torch.no_grad():
+        wrong = quantize_mx_op(bf, sp, elem_format=sp['w_elem_format'], axes=[1])
+        ref_wrong = mx_debug._sqnr_db(bf, wrong)
+    assert abs(ref - ref_wrong) > 1e-3, "test would not catch a regression"
+
+
+def test_non_npe_hw_stats_keep_channel_blocking():
+    torch.manual_seed(13)
+    layer = _hw_layer(npe=False, cin=32, cout=4, k=3, bs=32)
+    stats = collect_stats(nn.Sequential(layer), data=[torch.randn(1, 32, 8, 8)],
+                          output_error=False, save_path=None)
+    e = stats["layers"]["0"]
+    assert e["act_axes"] == [1] and e["wt_axes"] == [1]
+    assert "wt_shape_blocked" not in e
 
 
 def test_json_dump_roundtrip():
