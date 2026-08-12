@@ -331,6 +331,120 @@ def test_out_quant_entry_does_not_leak_into_the_conv_layer_map():
     assert hasattr(qm.model, "_mx_out_quant")       # hook still installed
 
 
+# =============================================================================
+# collect_stats integration
+# =============================================================================
+
+def _stats_cfg(**over):
+    cfg = _out_quant_cfg(**over)
+    cfg["mx_specs"] = {"w_elem_format": "int8", "a_elem_format": "int8",
+                       "block_size": 32, "custom_cuda": False}
+    cfg["layers"].append("model.conv")
+    return cfg
+
+
+def test_collect_stats_reports_out_quant_section():
+    import mx_stats
+
+    with tempfile.TemporaryDirectory() as d:
+        _write_cfg(d, _stats_cfg())
+        qm = MXQuantizer(save_dir=d).quant(Wrapper())
+
+    data = [torch.randn(2, 4, 8, 8) for _ in range(3)]
+    stats = mx_stats.collect_stats(qm, data=data, max_batches=3)
+
+    oq = stats["out_quant"]["model"]
+    assert oq["format"] == "Q8.8 signed/16b round=half_away"
+    assert oq["frac_bits"] == 8 and oq["total_bits"] == 16
+    assert oq["window"] == "calibration"
+    assert oq["n_calls"] == 3
+    assert oq["n_elems"] == 3 * 2 * 2 * 8 * 8
+    assert oq["clip_rate"] == 0.0            # small random values, nothing clips
+    assert oq["sqnr_db"] > 0
+
+
+def test_collect_stats_out_quant_window_excludes_earlier_forwards():
+    """Counters run cumulatively through training, so the reported window must
+    cover only the calibration batches — not everything the model ever saw."""
+    import mx_stats
+
+    with tempfile.TemporaryDirectory() as d:
+        _write_cfg(d, _stats_cfg())
+        qm = MXQuantizer(save_dir=d).quant(Wrapper())
+
+    for _ in range(5):                       # stand-in for prior training steps
+        qm(torch.randn(2, 4, 8, 8))
+    before = qm.model._mx_out_quant["n_calls"]
+    assert before == 5
+
+    stats = mx_stats.collect_stats(
+        qm, data=[torch.randn(2, 4, 8, 8) for _ in range(2)], max_batches=2)
+
+    assert stats["out_quant"]["model"]["n_calls"] == 2
+    assert qm.model._mx_out_quant["n_calls"] == 7      # hook keeps counting
+
+
+def test_collect_stats_out_quant_clip_rate():
+    import mx_stats
+
+    with tempfile.TemporaryDirectory() as d:
+        _write_cfg(d, _stats_cfg())
+        qm = MXQuantizer(save_dir=d).quant(Wrapper())
+
+    with torch.no_grad():                    # force everything out of range
+        qm.model.conv.bias.fill_(1e4)
+        qm.model.conv.weight.zero_()
+    stats = mx_stats.collect_stats(
+        qm, data=[torch.randn(2, 4, 8, 8)], max_batches=1)
+
+    assert stats["out_quant"]["model"]["clip_rate"] == 1.0
+
+
+def test_collect_stats_out_quant_survives_json_dump():
+    import mx_stats
+
+    with tempfile.TemporaryDirectory() as d:
+        _write_cfg(d, _stats_cfg())
+        qm = MXQuantizer(save_dir=d).quant(Wrapper())
+        path = os.path.join(d, "quant_stats.json")
+        mx_stats.collect_stats(qm, data=[torch.randn(2, 4, 8, 8)],
+                               max_batches=1, save_path=path)
+        loaded = json.load(open(path))
+
+    assert loaded["out_quant"]["model"]["format"] == "Q8.8 signed/16b round=half_away"
+    assert loaded["out_quant"]["model"]["clip_rate"] == 0.0
+
+
+def test_collect_stats_without_out_quant_has_empty_section():
+    import mx_stats
+
+    cfg = {"ptq": False, "measure_error": False,
+           "mx_specs": {"w_elem_format": "int8", "a_elem_format": "int8",
+                        "block_size": 32, "custom_cuda": False},
+           "layers": ["model.conv"]}
+    with tempfile.TemporaryDirectory() as d:
+        _write_cfg(d, cfg)
+        qm = MXQuantizer(save_dir=d).quant(Wrapper())
+
+    stats = mx_stats.collect_stats(qm, data=[torch.randn(2, 4, 8, 8)],
+                                   max_batches=1)
+    assert stats["out_quant"] == {}
+
+
+def test_collect_stats_works_with_out_quant_but_no_mx_layers():
+    """An out-quant-only config must not hit the 'no MX layers' early return."""
+    import mx_stats
+
+    with tempfile.TemporaryDirectory() as d:
+        _write_cfg(d, _out_quant_cfg())
+        qm = MXQuantizer(save_dir=d).quant(Wrapper())
+
+    stats = mx_stats.collect_stats(qm, data=[torch.randn(2, 4, 8, 8)],
+                                   max_batches=1)
+    assert stats["out_quant"]["model"]["n_calls"] == 1
+    assert stats["layers"] == {}
+
+
 def test_missing_module_name_warns_and_installs_nothing(capsys):
     with tempfile.TemporaryDirectory() as d:
         _write_cfg(d, _out_quant_cfg(name="does.not.exist"))

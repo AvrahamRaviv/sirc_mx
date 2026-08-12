@@ -20,6 +20,12 @@ Design notes:
   * After PTQ the stored weights already lie on the MX lattice, so weight
     quant error is ~0 by construction. That is correct (it reflects the
     operand actually entering forward) and is flagged via "ptq_note".
+
+Fixed-point output quant ("out_quant" key) is reported separately from the
+per-layer table. It has a static scale (2^-frac_bits), so shared exponents,
+block dynamic range and underflow — the whole block-floating-point vocabulary
+above — do not apply to it. The two numbers that do: clip rate (MX cannot
+overflow, a static scale can) and SQNR.
 """
 
 import json
@@ -42,6 +48,7 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from fixed_point.mx_fixed_point import _get_xblock_cfg
+from fixed_point.fxp_quant import fxp_format_str, fxp_stats_value
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 from mx_layers_act import MXActQuant
 from mx_debug import _ascii_hist
@@ -440,6 +447,76 @@ def _fmt_pct(v):
     return "    -" if v is None else f"{100 * v:4.1f}%"
 
 
+def _fmt_clip(v):
+    """Clip rates are usually tiny but never negligible — keep the small digits."""
+    return "-" if v is None else f"{100 * v:.3f}%"
+
+
+# =============================================================================
+# Fixed-point output quant (static scale — not MX, so not part of the block table)
+# =============================================================================
+
+def _out_quant_modules(model):
+    """(name, module) for every module carrying a fixed-point out-quant hook."""
+    return [(n, m) for n, m in model.named_modules()
+            if hasattr(m, "_mx_out_quant")]
+
+
+def _out_quant_counters(module):
+    """Read the hook's running counters back to host floats."""
+    st = module._mx_out_quant
+    return {"n": st["n"], "n_calls": st["n_calls"],
+            "n_clipped": fxp_stats_value(st["n_clipped"]),
+            "sum_sq": fxp_stats_value(st["sum_sq"]),
+            "sum_sq_err": fxp_stats_value(st["sum_sq_err"])}
+
+
+def _out_quant_entry(module, before=None):
+    """Summarize one out-quant hook over the calibration window.
+
+    The hook's counters are cumulative over the module's whole life — they keep
+    running through training — so the snapshot taken before the calibration
+    loop is subtracted to describe just those batches. With no forwards in
+    between, the cumulative totals are reported instead and flagged via
+    "window", so the number is never silently mislabelled.
+    """
+    now = _out_quant_counters(module)
+    cfg = module._mx_out_quant["cfg"]
+
+    if before is not None and now["n"] > before["n"]:
+        cur = {k: now[k] - before[k] for k in now}
+        window = "calibration"
+    else:
+        cur, window = now, "cumulative"
+
+    sqnr = None
+    if cur["sum_sq_err"] > 0 and cur["sum_sq"] > 0:
+        sqnr = 10.0 * math.log10(cur["sum_sq"] / cur["sum_sq_err"])
+
+    return {
+        "format": fxp_format_str(cfg),
+        "total_bits": cfg["total_bits"], "frac_bits": cfg["frac_bits"],
+        "signed": cfg["signed"], "round": cfg["round"],
+        "saturate": cfg["saturate"],
+        "window": window,
+        "n_elems": cur["n"], "n_calls": cur["n_calls"],
+        "n_clipped": cur["n_clipped"],
+        "clip_rate": (cur["n_clipped"] / cur["n"]) if cur["n"] else None,
+        "sqnr_db": sqnr,
+    }
+
+
+def _print_out_quant(stats, log=None):
+    """One line per out-quant hook. Clip rate is the number that matters: MX
+    cannot overflow (shared exponent tracks the block max) but a static scale
+    can, silently."""
+    for name, e in (stats.get("out_quant") or {}).items():
+        _log(log, f"  [OutQuant] {name or '<root>'}: {e['format']} | "
+                  f"clip {_fmt_clip(e['clip_rate'])} | "
+                  f"SQNR {_fmt_db(e['sqnr_db']).strip()} dB "
+                  f"| {e['n_calls']} calls ({e['window']})")
+
+
 def _exp_hist(counts, label, width=40):
     """ASCII histogram over a shared-exponent counts dict (mx_debug._int_hist style)."""
     if not counts:
@@ -548,9 +625,15 @@ def collect_stats(model, data=None, forward_fn=None, *,
     """
     mx_layers = [(n, m) for n, m in model.named_modules()
                  if isinstance(m, _MX_TYPES)]
-    if not mx_layers:
+    out_quant_layers = _out_quant_modules(model)
+    if not mx_layers and not out_quant_layers:
         _log(log, "collect_stats | WARNING: no MX layers found, skipping.")
         return {}
+
+    # The out-quant hooks are permanent (installed at quant time) and their
+    # counters run cumulatively, so snapshot them here to report the delta over
+    # just this calibration run.
+    oq_before = {n: _out_quant_counters(m) for n, m in out_quant_layers}
 
     state = {}
     for name, m in mx_layers:
@@ -676,9 +759,12 @@ def collect_stats(model, data=None, forward_fn=None, *,
                  "detail": detail},
         "layers": layers,
         "network": network,
+        "out_quant": {n: _out_quant_entry(m, oq_before.get(n))
+                      for n, m in out_quant_layers},
     }
 
     _print_table(stats, log)
+    _print_out_quant(stats, log)
     if histograms:
         _print_histograms(stats, state, log)
     if save_path is not None:
