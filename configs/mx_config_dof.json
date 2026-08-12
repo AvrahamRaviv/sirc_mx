@@ -18,6 +18,16 @@
       "npe_triton_variant": "reuse"
     }
   },
+  "groups": {
+    "convT_plain": {
+      "w_elem_format": "int8",
+      "a_elem_format": "int8",
+      "block_size": 32,
+      "scale_bits": 8,
+      "shared_exp_method": "max",
+      "custom_cuda": true
+    }
+  },
     "layers": [
 	"model.block2.conv0.0.0",
 	"model.block2.conv0.1.0",
@@ -49,6 +59,11 @@
 	"model.feature_pyramid_extractor.convs.1.1.0",
 	"model.feature_pyramid_extractor.convs.2.0.0",
 	"model.feature_pyramid_extractor.convs.2.1.0",
+	{"name": "model.block2.conv1",           "group": "convT_plain"},
+	{"name": "model.block2.convtranspose_2", "group": "convT_plain"},
+	{"name": "model.block3.conv1",           "group": "convT_plain"},
+	{"name": "model.block3.convtranspose_2", "group": "convT_plain"},
+	{"name": "model.block4.conv1",           "group": "convT_plain"},
 	{"name": "model.warp", "kind": "act_quant",
 	 "inputs": [
 	   {"mx_specs": {"a_elem_format": "int8", "block_size": 32, "scale_bits": 8,
