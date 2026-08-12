@@ -18,9 +18,56 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum
+from fixed_point.fxp_quant import (
+    fake_quant_fxp, fxp_clip_stats, fxp_format_str, fxp_stats_value,
+    normalize_out_quant,
+)
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 from mx_layers_act import MXActQuant
 from mx_stats import collect_stats as _collect_stats_impl
+
+
+def _out_quant_tensor(t, state):
+    """Quantize one output tensor and fold its error into the running stats."""
+    cfg = state["cfg"]
+    if not torch.is_tensor(t) or not t.is_floating_point():
+        return t
+
+    q = fake_quant_fxp(
+        t,
+        frac_bits=cfg["frac_bits"], total_bits=cfg["total_bits"],
+        signed=cfg["signed"], round_mode=cfg["round"],
+        saturate=cfg["saturate"], clip_grad=cfg["clip_grad"],
+    )
+    n, n_clip, ssq, sse = fxp_clip_stats(
+        t, q, frac_bits=cfg["frac_bits"], total_bits=cfg["total_bits"],
+        signed=cfg["signed"], round_mode=cfg["round"],
+    )
+    state["n"] += n
+    state["n_clipped"] += n_clip
+    state["sum_sq"] += ssq
+    state["sum_sq_err"] += sse
+    return q
+
+
+def _out_quant_hook(mod, inp, out):
+    """Forward hook: replace a module's output with its fixed-point quantization.
+
+    Module-level (not a closure over the module) so that deepcopying a
+    quantized model keeps each copy's hook bound to its own state.
+    """
+    state = mod._mx_out_quant
+    state["n_calls"] += 1
+    sel = state["cfg"]["outputs"]
+
+    if torch.is_tensor(out):
+        return _out_quant_tensor(out, state)
+    if isinstance(out, (tuple, list)):
+        keep = range(len(out)) if sel == "all" else sel
+        new = [_out_quant_tensor(o, state) if i in keep else o
+               for i, o in enumerate(out)]
+        return type(out)(new) if isinstance(out, list) else tuple(new)
+    return out          # dict / dataclass outputs: left alone
 
 
 class MXQuantizer:
@@ -106,6 +153,21 @@ class MXQuantizer:
     }
     Shorthand to enable with defaults: "collect_stats": true
     Also callable standalone: quantizer.collect_stats(quant_model, data=cal)
+
+    6. Fixed-point output quantization (static scale, not MX):
+    {
+        "layers": [
+            {"name": "model", "kind": "out_quant",
+             "total_bits": 16, "frac_bits": 8, "signed": true,
+             "round": "half_away", "saturate": true, "clip_grad": false}
+        ]
+    }
+    The named module's output is snapped to a lattice of step 2^-frac_bits and
+    clamped to the word's range — e.g. Q8.8 signed = step 1/256, range
+    [-128, +127.996]. Attached as a forward hook, so state_dict keys are
+    unchanged. Reported by _print_stat as clip rate + SQNR; clip rate is the
+    number that matters, since a static scale (unlike MX) can overflow.
+    "outputs" (default "all") selects indices when the module returns a tuple.
 
     Priority (highest to lowest): per-layer mx_specs > group > global mx_specs > defaults
     Note: scale_bits is shared between weights and activations (library limitation).
@@ -456,6 +518,11 @@ class MXQuantizer:
         # would break name lookup for any conv/linear nested under them.
         n_act = self._wrap_act_layers(model, verbose=verbose)
 
+        # Output fixed-point quant (kind == 'out_quant') goes last. It attaches a
+        # forward hook rather than wrapping, so module paths and state_dict keys
+        # are untouched — required, since this usually targets the whole model.
+        n_out = self._install_out_quant(model, verbose=verbose)
+
         if verbose >= 1:
             n_hw = len(replace_summary['hw'])
             n_blk = len(replace_summary['blocked'])
@@ -468,7 +535,7 @@ class MXQuantizer:
                 f"[MXQuantizer] replace summary: "
                 f"hw={n_hw} blocked={n_blk} "
                 f"mxconv={n_def_c} mxconvT={n_def_ct} mxlinear={n_def_l} "
-                f"act_quant={n_act} "
+                f"act_quant={n_act} out_quant={n_out} "
                 f"fallback_conv={n_fb_c} fallback_linear={n_fb_l}"
             )
             if n_fb_c or n_fb_l:
@@ -501,8 +568,8 @@ class MXQuantizer:
                 spec_dict = global_specs
             else:
                 name = layer["name"]
-                if layer.get("kind") == "act_quant":
-                    continue          # handled by _build_act_map / MXActQuant
+                if layer.get("kind") in ("act_quant", "out_quant"):
+                    continue          # handled by _build_act_map / _build_out_map
                 if "mx_specs" in layer:
                     spec_dict = layer["mx_specs"]
                 elif "group" in layer:
@@ -609,6 +676,97 @@ class MXQuantizer:
                   f"{missing}")
         return len(wrapped)
 
+    def _build_out_map(self):
+        """Parse `kind: "out_quant"` config entries.
+
+        Returns:
+            dict: layer_name -> normalized out_quant config
+
+        Entry format (one per module whose output leaves in fixed point):
+            {"name": "model", "kind": "out_quant",
+             "total_bits": 16, "frac_bits": 8, "signed": true,
+             "round": "half_away", "saturate": true, "clip_grad": false}
+
+        Unlike MX, the scale here is static (2^-frac_bits), so there is no
+        mx_specs / group indirection — the format is spelled out on the entry.
+        """
+        if not self.config or "layers" not in self.config:
+            return {}
+
+        out_map = {}
+        for layer in self.config["layers"]:
+            if not isinstance(layer, dict) or layer.get("kind") != "out_quant":
+                continue
+            name = layer["name"]
+            cfg_dict = {k: v for k, v in layer.items()
+                        if k not in ("name", "kind")}
+            out_map[name] = normalize_out_quant(cfg_dict)
+
+        return out_map
+
+    def _install_out_quant(self, model, verbose=1):
+        """Attach fixed-point output quant hooks. Returns count.
+
+        A forward hook is used rather than a wrapper module: this normally
+        targets the top-level model, and wrapping that would insert an `.inner`
+        level into every parameter name, breaking checkpoint load/save. A hook
+        that returns a value replaces the output, keeps the autograd graph, and
+        leaves module paths and state_dict keys identical.
+        """
+        out_map = self._build_out_map()
+        if not out_map:
+            return 0
+
+        installed = set()
+        for full_name, module in list(model.named_modules()):
+            clean_name = (full_name[len("module."):]
+                          if full_name.startswith("module.") else full_name)
+            if clean_name not in out_map or hasattr(module, "_mx_out_quant"):
+                continue
+            cfg = out_map[clean_name]
+            if not cfg.get("enabled", True):
+                continue
+            module._mx_out_quant = {
+                "cfg": cfg, "name": clean_name,
+                "n": 0, "n_clipped": 0, "sum_sq": 0.0, "sum_sq_err": 0.0,
+                "n_calls": 0,
+            }
+            module._mx_out_quant_handle = module.register_forward_hook(
+                _out_quant_hook)
+            installed.add(clean_name)
+            if verbose >= 2:
+                print(f"[MXQuantizer] out_quant '{clean_name}' -> "
+                      f"{fxp_format_str(cfg)}")
+
+        missing = sorted(set(out_map) - installed)
+        if missing and verbose >= 1:
+            print(f"[MXQuantizer] WARNING: out_quant layers not found in model: "
+                  f"{missing}")
+        return len(installed)
+
+    @staticmethod
+    def out_quant_summary(module):
+        """Format the accumulated out-quant stats for a hooked module."""
+        state = getattr(module, "_mx_out_quant", None)
+        if state is None:
+            return None
+        fmt = fxp_format_str(state["cfg"])
+        if not state["n"]:
+            return f"{fmt} | no data yet"
+
+        # Counters are accumulated as device tensors to keep the forward
+        # sync-free; this is the only place they are read back to the host.
+        n_clipped = fxp_stats_value(state["n_clipped"])
+        sum_sq = fxp_stats_value(state["sum_sq"])
+        sum_sq_err = fxp_stats_value(state["sum_sq_err"])
+
+        clip_pct = 100.0 * n_clipped / state["n"]
+        if sum_sq_err > 0:
+            sqnr_s = f"{10.0 * math.log10(sum_sq / sum_sq_err):.1f} dB"
+        else:
+            sqnr_s = "inf"
+        return f"{fmt} | clip {clip_pct:.2f}% | SQNR {sqnr_s}"
+
     def _create_mx_module(self, orig_module, mx_specs):
         """
         Build an MXConv2d / MXConvTranspose2d / MXLinear from an existing
@@ -662,7 +820,8 @@ class MXQuantizer:
         if "layers" in self.config:
             return [l if isinstance(l, str) else l["name"]
                     for l in self.config["layers"]
-                    if isinstance(l, str) or l.get("kind") != "act_quant"]
+                    if isinstance(l, str)
+                    or l.get("kind") not in ("act_quant", "out_quant")]
         # auto-discover all Conv2d / ConvTranspose2d / Linear (excluding already-MX layers)
         return [n for n, m in model.named_modules()
                 if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear))
@@ -1201,9 +1360,14 @@ class MXQuantizer:
         num_mx_conv, num_mx_linear, num_mx_convT = 0, 0, 0
         num_fp_conv, num_fp_linear, num_fp_convT = 0, 0, 0
 
-        num_mx_act = 0
+        num_mx_act, num_out_quant = 0, 0
 
         for name, module in model.named_modules():
+            if hasattr(module, "_mx_out_quant"):
+                self._log(log, f"[OutQuant] {name or '<root>'}: "
+                               f"{self.out_quant_summary(module)}")
+                num_out_quant += 1
+
             if isinstance(module, MXActQuant):
                 self._log(log, f"[ActQuant->MX] {name}: {module.extra_repr()}")
                 num_mx_act += 1
@@ -1229,4 +1393,5 @@ class MXQuantizer:
         self._log(log, f"MX convs: {num_mx_conv}, regular convs: {num_fp_conv}, "
                        f"MX convTs: {num_mx_convT}, regular convTs: {num_fp_convT}, "
                        f"MX linears: {num_mx_linear}, regular linears: {num_fp_linear}, "
-                       f"MX act-quant wrappers: {num_mx_act}.")
+                       f"MX act-quant wrappers: {num_mx_act}, "
+                       f"fxp out-quant hooks: {num_out_quant}.")

@@ -57,7 +57,10 @@
 	   {"mx_specs": {"a_elem_format": "int8", "block_size": 32, "scale_bits": 8,
 	                 "shared_exp_method": "max", "custom_cuda": true},
 	    "axes": [-1]}
-	 ]}
+	 ]},
+	{"name": "model", "kind": "out_quant",
+	 "total_bits": 16, "frac_bits": 8, "signed": true,
+	 "round": "half_away", "saturate": true, "clip_grad": false}
   ],
   "ptq": false
 }
