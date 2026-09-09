@@ -25,6 +25,9 @@ from fixed_point.fxp_quant import (
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 from mx_layers_act import MXActQuant
 from mx_stats import collect_stats as _collect_stats_impl
+import mx_assign as _mxa
+import mx_sensitivity as _mxs
+from mx_sensitivity import clean_name as _clean_name
 
 
 def _out_quant_tensor(t, state):
@@ -225,7 +228,17 @@ class MXQuantizer:
         auto_mixed = self.config.get("auto_mixed")
         groups = self.config.get("groups", {})
 
-        if auto_mixed:
+        if auto_mixed and "ladder" in auto_mixed:
+            # New N-rung path: score, assign, write the plan, then install it.
+            plan = self.plan_mixed_precision(
+                fp32_model, data=data, forward_fn=forward_fn, log=log,
+                write=auto_mixed.get("write_artifacts", True))
+            all_groups = dict(plan["config"]["groups"])
+            layer_map = {name: self._build_mx_specs(all_groups[grp])
+                         for name, grp in plan["assignments"].items()}
+            self._replace_layers(model, layer_map=layer_map)
+        elif auto_mixed:
+            # Legacy two-rung path (base/upgrade), kept bit-for-bit as it was.
             candidates = self._get_candidate_layers(fp32_model)
             base_specs = self._build_mx_specs(groups[auto_mixed["base"]])
             if data is not None:
@@ -309,6 +322,497 @@ class MXQuantizer:
         return stats
 
     # =========================
+    # Automated mixed precision
+    # =========================
+    def plan_mixed_precision(self, model, data=None, forward_fn=None, log=None,
+                             output_fn=None, write=True):
+        """Score every candidate layer, assign it a precision, write the plan.
+
+        Deliberately separate from `quant()`. Scoring costs real forward passes,
+        and the result — which layer runs at which format — is a decision worth
+        reviewing before a training run depends on it. So this produces two
+        artifacts in `save_dir` and stops:
+
+          sensitivity.json        every score, why, and what it earned
+          mx_config_resolved.json a plain groups+layers config, no auto_mixed
+
+        The resolved config is what training points at: re-running it is a
+        deterministic replay with no scoring and nothing left to re-derive, and
+        it can be hand-edited where you disagree with an assignment.
+
+        Args:
+            model: FP32 model. Never mutated — everything runs on a deep copy.
+            data: calibration batches; a one-shot iterator is fine, the first
+                `auto_mixed.batches` of them are materialized once.
+            forward_fn: forward_fn(model, batch), as elsewhere in this class.
+            output_fn: reduces the model's return value to a list of float
+                tensors for comparison. Defaults to a recursive flatten, which
+                handles tuple / list / dict / dataclass returns.
+            write: set False to compute the plan without touching the filesystem.
+
+        Returns:
+            dict: {"scores", "assignments", "rows", "summary", "config", "meta"}.
+        """
+        cfg = (self.config or {}).get("auto_mixed")
+        if not cfg or "ladder" not in cfg:
+            raise ValueError(
+                "plan_mixed_precision needs an 'auto_mixed' config block with a "
+                "'ladder' (lowest precision first), e.g. "
+                '"ladder": ["int4", "int6", "int8"]')
+
+        groups = self.config.get("groups", {})
+        deploy_spec = self._deploy_spec(cfg, groups)
+        rungs = {g: self._rung_spec(g, groups, deploy_spec) for g in cfg["ladder"]}
+        _mxa.validate(cfg, rungs, quant_probe=self._trial_quantize)
+
+        ladder = list(cfg["ladder"])
+        top, bottom = ladder[-1], ladder[0]
+        probe_group = cfg.get("probe_group", bottom)
+        method = cfg.get("scorer", "oat_output")
+
+        base_model, was_dp = _mxs.unwrap_parallel(model)
+        candidates = self._get_candidate_layers(base_model)
+        if not candidates:
+            raise ValueError(
+                "auto_mixed found no candidate layers. An empty \"layers\": [] "
+                "list means 'quantize nothing' — remove the key to auto-discover "
+                "every Conv2d / ConvTranspose2d / Linear.")
+
+        batches = _mxs.materialize(data, int(cfg.get("batches", 8)))
+
+        # The reference network: every candidate at the top rung, built through
+        # the normal replacement path so xblock_accum, act_quant wrapping and
+        # out_quant hooks are all in place — the scorer must see the deployed
+        # arithmetic, not an approximation of it.
+        ref_model = copy.deepcopy(base_model)
+        ref_specs = self._build_mx_specs(rungs[top])
+        self._replace_layers(ref_model, layer_map={n: ref_specs for n in candidates},
+                             verbose=0)
+
+        types = (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)
+        entries = _mxs.resolve_bindings(ref_model, candidates, types)
+        costs = self._layer_costs(ref_model, entries, batches, forward_fn)
+
+        probe_specs = self._build_mx_specs(rungs[probe_group])
+
+        def build_probe(name, module):
+            return self._build_mx_module(module, probe_specs, name=name, verbose=0)
+
+        ctx = _mxs.ScoreContext(
+            ref_model=ref_model, entries=entries, batches=batches,
+            build_probe=build_probe, forward_fn=forward_fn, output_fn=output_fn,
+            options=self._scorer_options(cfg),
+            log=(lambda m: self._log(log, m)))
+
+        n_probes = len(entries)
+        self._log(log, f"auto_mixed | scorer={method} probe={probe_group} "
+                       f"reference={top} layers={n_probes} "
+                       f"batches={len(batches) if batches else 0}")
+        self._log_eta(ref_model, batches, forward_fn, n_probes, cfg, log)
+
+        scores = _mxs.get_scorer(method)(ctx)
+        meta = scores.pop("__meta__", {})
+
+        rows = self._sensitivity_rows(scores, entries, costs)
+
+        # Absolute reference: the same probe measured against plain FP32 instead
+        # of the quantized baseline. The marginal score answers "what does
+        # demoting this layer cost in the net we ship"; the absolute one answers
+        # "how much does this layer dislike low precision at all". They usually
+        # agree; where they do not, the rank delta says which layers are only
+        # sensitive because of what surrounds them.
+        want_abs = str(cfg.get("reference", "both")).lower() in ("both", "absolute")
+        if want_abs and batches and method == "oat_output":
+            self._absolute_scores(base_model, candidates, batches, forward_fn,
+                                  output_fn, probe_specs, rows, meta, log)
+
+        # w/a refinement: the joint probe ranks layers; solo probes over the most
+        # sensitive ones say WHICH operand is responsible. Two layers can share
+        # an output SQNR while one is weight-underflow driven and the other
+        # activation-underflow driven, and spending bits on the wrong one buys
+        # nothing.
+        # A per-rung curve, not just a ranking: what does this layer cost at
+        # int6, at int4? Required by cost_budget, which trades dB against bits
+        # and cannot do that from a rank alone.
+        if (str(cfg.get("probe", "bottom")) == "all_rungs"
+                and batches and method == "oat_output"):
+            self._per_rung_scores(ref_model, entries, batches, forward_fn,
+                                  output_fn, rungs, ladder, rows, log)
+
+        wa_cfg = cfg.get("separable_wa") or {}
+        if wa_cfg.get("enabled") and batches and method == "oat_output":
+            self._refine_wa(ref_model, entries, batches, forward_fn, output_fn,
+                            rungs, top, probe_group, rows, wa_cfg, log)
+        assignments, notes = _mxa.assign(rows, cfg, rungs, log=lambda m: self._log(log, m))
+        assignments = self._apply_wa_split(assignments, rows, ladder, wa_cfg, log)
+        flat, extra = _mxa.resolve_groups(assignments, rungs, deploy_group=None)
+        summary = _mxa.cost_summary(flat, rungs, extra, costs)
+
+        for row in rows:
+            row["assigned"] = flat.get(row["name"])
+            row["pinned"] = row["name"] in notes["pinned"]
+
+        meta.update({"scorer": method, "probe_group": probe_group,
+                     "reference_group": top, "ladder": ladder,
+                     "strategy": cfg.get("strategy", "quantile"),
+                     "dataparallel_unwrapped": was_dp,
+                     "n_candidates": len(candidates)})
+
+        # OAT scores every layer in the quietest possible context — everything
+        # else at the top rung. The mixed net is noisier than that, so scores are
+        # optimistic. One extra pass measures what was actually bought.
+        if batches and cfg.get("verify", True):
+            meta["assigned_vs_reference"] = self._verify_assignment(
+                base_model, candidates, flat, extra, rungs, top, batches,
+                forward_fn, output_fn, log)
+
+        resolved = _mxa.build_resolved_config(
+            self.config, flat, rungs, extra,
+            provenance={"generated_by": "MXQuantizer.plan_mixed_precision",
+                        "scorer": method, "probe_group": probe_group,
+                        "reference_group": top})
+
+        self._print_sensitivity_table(rows, summary, meta, log)
+
+        if write:
+            _mxa.write_sensitivity(os.path.join(self.save_dir, "sensitivity.json"),
+                                   meta, rows, summary)
+            _mxa.write_resolved_config(
+                os.path.join(self.save_dir, "mx_config_resolved.json"), resolved)
+            self._log(log, f"auto_mixed | wrote sensitivity.json and "
+                           f"mx_config_resolved.json to {self.save_dir}")
+
+        return {"scores": scores, "assignments": flat, "rows": rows,
+                "summary": summary, "config": resolved, "meta": meta,
+                "notes": notes}
+
+    def _per_rung_scores(self, ref_model, entries, batches, forward_fn, output_fn,
+                         rungs, ladder, rows, log=None):
+        """Score every layer at every rung below the top, not just the bottom.
+
+        Turns a ranking into a degradation curve, which is what a cost-aware
+        assignment needs: demoting a layer one rung has to be priced in dB
+        before it can be traded against the bits it saves.
+        """
+        by_name = {r["name"]: r for r in rows}
+        for rung in ladder[:-1]:
+            spec = self._build_mx_specs(rungs[rung])
+            self._log(log, f"auto_mixed | per-rung pass at {rung} ...")
+            res = _mxs.score_oat(
+                ref_model, entries, batches, verbose=False,
+                build_probe=lambda n, mod, _s=spec: self._build_mx_module(
+                    mod, _s, name=n, verbose=0),
+                forward_fn=forward_fn, output_fn=output_fn)
+            res.pop("__meta__", None)
+            for name, r in res.items():
+                by_name[name].setdefault("per_rung", {})[rung] = r.get("sensitivity")
+        for row in rows:
+            row.setdefault("per_rung", {})[ladder[-1]] = 0.0   # the reference itself
+
+    def _verify_assignment(self, base_model, candidates, assignments, extra,
+                           rungs, top, batches, forward_fn, output_fn, log=None):
+        """Measure the finished mixed network against the reference network.
+
+        The number that actually matters, and the one no per-layer score can
+        give you: every demotion is in place at once, so the interactions the
+        one-at-a-time scheme cannot see are included.
+        """
+        all_groups = dict(rungs)
+        all_groups.update(extra)
+        output_fn = output_fn or _mxs.flatten_outputs
+
+        ref = copy.deepcopy(base_model)
+        top_specs = self._build_mx_specs(rungs[top])
+        self._replace_layers(ref, layer_map={n: top_specs for n in candidates}, verbose=0)
+
+        mixed = copy.deepcopy(base_model)
+        self._replace_layers(mixed, layer_map={
+            n: self._build_mx_specs(all_groups[g]) for n, g in assignments.items()},
+            verbose=0)
+
+        ref.eval()
+        mixed.eval()
+        acc = _mxs.ErrAcc()
+        with torch.no_grad():
+            for batch in batches:
+                a = output_fn(_mxs.default_forward(ref, batch, forward_fn))
+                b = output_fn(_mxs.default_forward(mixed, batch, forward_fn))
+                for ta, tb in zip(a, b):
+                    acc.update(ta.detach().float().cpu(), tb.detach().float().cpu())
+        status, metrics = acc.summary()
+        sqnr = metrics.get("sqnr_db")
+        if sqnr is not None:
+            self._log(log, f"auto_mixed | assigned mix vs {top} reference: "
+                           f"{sqnr:.2f} dB SQNR")
+        return {"status": status, **metrics}
+
+    def _log_eta(self, ref_model, batches, forward_fn, n_probes, cfg, log=None):
+        """Time one batch and print what the scoring run will cost.
+
+        OAT is (1 + probes) x batches forward passes. Saying so up front, in
+        minutes, is the difference between an informed wait and a killed job.
+        """
+        if not batches:
+            return
+        import time
+        t0 = time.time()
+        with torch.no_grad():
+            _mxs.default_forward(ref_model, batches[0], forward_fn)
+        per_batch = time.time() - t0
+
+        n_ref = 2                                   # reference + determinism check
+        if str(cfg.get("reference", "both")).lower() in ("both", "absolute"):
+            n_probes *= 2
+            n_ref += 1
+        n_fwd = (n_probes + n_ref) * len(batches)
+        est = n_fwd * per_batch
+        self._log(log, f"auto_mixed | {n_fwd} forward passes "
+                       f"({per_batch:.2f}s/batch) -> est {est / 60:.1f} min")
+
+    def _absolute_scores(self, base_model, candidates, batches, forward_fn,
+                         output_fn, probe_specs, rows, meta, log=None):
+        """Score every candidate against an FP32 reference, and compare rankings."""
+        fp32_ref = copy.deepcopy(base_model)
+        types = (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)
+        entries = _mxs.resolve_bindings(fp32_ref, candidates, types)
+
+        def build_probe(name, module):
+            return self._build_mx_module(module, probe_specs, name=name, verbose=0)
+
+        self._log(log, "auto_mixed | absolute reference (vs FP32) ...")
+        abs_scores = _mxs.score_oat(fp32_ref, entries, batches,
+                                    build_probe=build_probe, forward_fn=forward_fn,
+                                    output_fn=output_fn, verbose=False)
+        abs_scores.pop("__meta__", None)
+
+        order_marginal = [r["name"] for r in rows]
+        by_abs = sorted((n for n in abs_scores),
+                        key=lambda n: -(abs_scores[n].get("sensitivity") or -math.inf))
+        abs_rank = {n: i for i, n in enumerate(by_abs)}
+        for i, row in enumerate(rows):
+            res = abs_scores.get(row["name"], {})
+            row["scores"]["marginal"] = row["sensitivity"]
+            row["scores"]["absolute"] = res.get("sensitivity")
+            row["rank_delta"] = abs_rank.get(row["name"], i) - i
+
+        meta["marginal_vs_absolute_spearman"] = _mxs.spearman(
+            [r["sensitivity"] for r in rows],
+            [r["scores"].get("absolute") for r in rows])
+        rho = meta["marginal_vs_absolute_spearman"]
+        if rho is not None:
+            self._log(log, f"auto_mixed | marginal vs absolute rank correlation: "
+                           f"{rho:.2f}")
+
+    def _refine_wa(self, ref_model, entries, batches, forward_fn, output_fn,
+                   rungs, top, probe_group, rows, wa_cfg, log=None):
+        """Probe weights alone and activations alone, on the top-M layers only.
+
+        Solo probes over every layer would triple an already expensive scheme,
+        and buy nothing for layers headed to the bottom rung on both axes
+        regardless. So refine only where the answer can change the assignment.
+        """
+        m = int(wa_cfg.get("refine_top", 16))
+        ranked = [r["name"] for r in rows if r["sensitivity"] is not None][:m]
+        if not ranked:
+            return
+        subset = {n: entries[n] for n in ranked if n in entries}
+        self._log(log, f"auto_mixed | refining w/a on the top {len(subset)} layers")
+
+        w_spec = self._build_mx_specs(
+            dict(rungs[top], w_elem_format=rungs[probe_group]["w_elem_format"]))
+        a_spec = self._build_mx_specs(
+            dict(rungs[top], a_elem_format=rungs[probe_group]["a_elem_format"]))
+
+        by_name = {r["name"]: r for r in rows}
+        for label, spec in (("w", w_spec), ("a", a_spec)):
+            res = _mxs.score_oat(
+                ref_model, subset, batches, verbose=False,
+                build_probe=lambda n, mod, _s=spec: self._build_mx_module(
+                    mod, _s, name=n, verbose=0),
+                forward_fn=forward_fn, output_fn=output_fn)
+            res.pop("__meta__", None)
+            for name, r in res.items():
+                by_name[name]["scores"][label] = r.get("sensitivity")
+
+        # Diagnostic only, never an assignment input: the operand errors are
+        # correlated through the same activations and the shared block exponent,
+        # so joint is measured, not inferred.
+        for name in subset:
+            row = by_name[name]
+            s_w, s_a = row["scores"].get("w"), row["scores"].get("a")
+            if s_w is not None and s_a is not None and row["sensitivity"] is not None:
+                row["scores"]["interaction"] = row["sensitivity"] - max(s_w, s_a)
+
+    @staticmethod
+    def _apply_wa_split(assignments, rows, ladder, wa_cfg, log=None):
+        """Demote the operand that is clearly not the problem, by one rung.
+
+        A heuristic, and deliberately a small one: when a layer's weight and
+        activation probes disagree by more than `margin_db`, the quiet operand
+        drops one rung while the loud one keeps the assigned format. Both scores
+        stay in the artifact, so a reviewer can overrule it in the resolved
+        config.
+        """
+        if not wa_cfg.get("enabled"):
+            return assignments
+        margin = float(wa_cfg.get("margin_db", 3.0))
+        by_name = {r["name"]: r for r in rows}
+        split = 0
+        for name, group in list(assignments.items()):
+            if not isinstance(group, str) or group not in ladder:
+                continue
+            idx = ladder.index(group)
+            if idx == 0:
+                continue                      # already at the bottom rung
+            scores = (by_name.get(name) or {}).get("scores") or {}
+            s_w, s_a = scores.get("w"), scores.get("a")
+            if s_w is None or s_a is None or abs(s_w - s_a) < margin:
+                continue
+            lower = ladder[idx - 1]
+            if s_w > s_a:
+                assignments[name] = {"w": group, "a": lower}
+            else:
+                assignments[name] = {"w": lower, "a": group}
+            split += 1
+        if split and log is not None:
+            print(f"[MXQuantizer] auto_mixed | {split} layer(s) got a split w/a format")
+        return assignments
+
+    def _deploy_spec(self, cfg, groups):
+        """The spec that carries block geometry and the accumulator model.
+
+        Ladder rungs say only which number format to use; everything structural
+        — block_size, block_axes, xblock_accum — comes from here, so demoting a
+        layer changes its precision and nothing else about how it runs.
+        """
+        name = cfg.get("deploy_group")
+        if name is not None:
+            if name not in groups:
+                raise ValueError(f"auto_mixed.deploy_group '{name}' is not in 'groups'")
+            return dict(groups[name])
+        return dict(self.config.get("mx_specs") or {})
+
+    @staticmethod
+    def _rung_spec(group, groups, deploy_spec):
+        """Deployment spec overridden by one rung's formats."""
+        if group not in groups:
+            raise ValueError(f"auto_mixed.ladder references undefined group '{group}'")
+        return dict(deploy_spec, **groups[group])
+
+    def _trial_quantize(self, spec_dict):
+        """Quantize a tiny tensor to prove a spec is actually usable.
+
+        Cheap insurance: an element format the library does not implement should
+        surface here, not deep inside the first probe after a long scoring run.
+        Run on CPU with custom_cuda off — this validates the *format*, and should
+        not fail on a machine that merely lacks a CUDA toolchain.
+        """
+        specs = self._build_mx_specs(dict(spec_dict, custom_cuda=False))
+        for key in ('w_elem_format', 'a_elem_format'):
+            quantize_mx_op(torch.zeros(1, 32), specs, elem_format=specs[key],
+                           axes=[-1], round=specs.get('round_mx_output', 'nearest'))
+
+    @staticmethod
+    def _scorer_options(cfg):
+        """Scorer-specific options, passed through to the registry entry."""
+        opts = dict(cfg.get("scorer_options") or {})
+        for key in ("path", "target", "capture_chunk"):
+            if key in cfg:
+                opts.setdefault(key, cfg[key])
+        return opts
+
+    def _layer_costs(self, ref_model, entries, batches, forward_fn):
+        """MACs and parameter counts per layer, from one shape-probe forward.
+
+        Written into the artifact so a later reassignment — a different ladder,
+        a different budget — is a pure offline recomputation with no model and
+        no forward passes.
+        """
+        costs = {n: {"macs": 0, "params": 0, "type": type(e["module"]).__name__}
+                 for n, e in entries.items()}
+        for name, entry in entries.items():
+            mod = entry["module"]
+            costs[name]["params"] = int(sum(p.numel() for p in mod.parameters()))
+
+        if not batches:
+            return costs
+
+        shapes = {}
+        handles = []
+        for name, entry in entries.items():
+            def make_hook(n):
+                def hook(mod, inp, out):
+                    if torch.is_tensor(out):
+                        shapes.setdefault(n, tuple(out.shape))
+                return hook
+            handles.append(entry["module"].register_forward_hook(make_hook(name)))
+        try:
+            with torch.no_grad():
+                _mxs.default_forward(ref_model, batches[0], forward_fn)
+        finally:
+            for h in handles:
+                h.remove()
+
+        for name, shape in shapes.items():
+            costs[name]["macs"] = _mxs.conv_macs(entries[name]["module"], shape)
+        return costs
+
+    @staticmethod
+    def _sensitivity_rows(scores, entries, costs):
+        """Flatten the scorer output into artifact rows, worst first."""
+        rows = []
+        for name, res in scores.items():
+            entry = entries.get(name, {})
+            rows.append({
+                "name": name,
+                "type": type(entry.get("module")).__name__ if entry else None,
+                "status": res.get("status", _mxs.STATUS_OK),
+                "sensitivity": res.get("sensitivity"),
+                "scores": res.get("scores", {}),
+                "per_rung": res.get("per_rung", {}),
+                "metrics": res.get("metrics", {}),
+                "why": res.get("why", {}),
+                "cost": costs.get(name, {}),
+                "n_calls": res.get("n_calls"),
+                "aliases": entry.get("aliases", []),
+                "shared_paths": entry.get("paths", []) if len(
+                    entry.get("paths", [])) > 1 else [],
+            })
+        rows.sort(key=lambda r: (r["sensitivity"] is None,
+                                 -(r["sensitivity"] or 0.0), r["name"]))
+        return rows
+
+    def _print_sensitivity_table(self, rows, summary, meta, log=None):
+        """Ranked table, in the same shape as the collect_stats report."""
+        self._log(log, f"Sensitivity ({meta.get('scorer')}, probe="
+                       f"{meta.get('probe_group')}, worst first; "
+                       f"Sens = -SQNR, higher = needs more bits):")
+        self._log(log, f"  {'#':>3} {'Layer':<45} {'Type':<20} {'MACs':>12} "
+                       f"{'SQNR(dB)':>9} {'Sens':>8} {'W':>8} {'A':>8} "
+                       f"{'Status':>10}  {'->group':<10}")
+        for i, row in enumerate(rows, 1):
+            def _f(v, width=8):
+                return f"{'N/A':>{width}}" if v is None else f"{v:>{width}.2f}"
+            sqnr = (row.get("metrics") or {}).get("sqnr_db")
+            scores = row.get("scores") or {}
+            macs = (row.get("cost") or {}).get("macs") or 0
+            self._log(log, f"  {i:>3} {row['name']:<45} {str(row['type']):<20} "
+                           f"{macs:>12,} {_f(sqnr, 9)} {_f(row['sensitivity'])} "
+                           f"{_f(scores.get('w'))} {_f(scores.get('a'))} "
+                           f"{row['status']:>10}  "
+                           f"{str(row.get('assigned') or ''):<10}")
+        counts = ", ".join(f"{g}: {n}" for g, n in summary["per_rung_counts"].items())
+        mw = summary.get("macs_weighted_avg_bits")
+        self._log(log, f"  Assigned: {counts}")
+        self._log(log, f"  Avg bits: {summary['avg_bits']:.2f} | "
+                       f"MAC-weighted: {mw:.2f}" if mw is not None
+                  else f"  Avg bits: {summary['avg_bits']:.2f}")
+        rho = meta.get("half_split_spearman")
+        if rho is not None:
+            note = "" if rho >= 0.9 else "  <-- low: increase auto_mixed.batches"
+            self._log(log, f"  Half-split rank correlation: {rho:.2f}{note}")
+
+    # =========================
     # Config
     # =========================
     def _load_config(self):
@@ -355,29 +859,207 @@ class MXQuantizer:
         return mx_specs
 
     # =========================
+    # MX module construction
+    # =========================
+    def _build_mx_module(self, module, mx_specs, name="", verbose=1, summary=None):
+        """
+        Build the MX replacement for one Conv2d / ConvTranspose2d / Linear.
+
+        Single source of truth for class selection — plain MX vs Blocked vs HW,
+        decided from `mx_specs.xblock_accum`. Every caller goes through here, so
+        a module built for measurement (sensitivity scoring) runs the same
+        arithmetic as the one `_replace_layers` installs for deployment. That
+        matters: on the NPE path the fixed-point accumulator is often the
+        dominant error term, so probing a plain MXConv2d for a layer that
+        deploys as MXConv2dHW measures the wrong noise.
+
+        Weight and bias are shared (not copied) with `module`, as in
+        `_replace_layers` — safe there because it operates on a deepcopy.
+
+        Args:
+            module: original nn.Conv2d / nn.ConvTranspose2d / nn.Linear.
+            mx_specs: MxSpecs for this layer (carries xblock_accum as a py attr).
+            name: layer name, used only in log messages.
+            verbose: 0 silent, 1 warnings, 2 per-layer detail.
+            summary: optional dict of lists to tally into; keys as built by
+                `_replace_layers` ('hw', 'blocked', 'mx_default_conv',
+                'mx_default_convT', 'mx_default_linear', 'fallback_conv',
+                'fallback_linear'). Fallback buckets get (name, reason) tuples.
+
+        Returns:
+            nn.Module: the new MX layer.
+
+        Raises:
+            TypeError: for any other module type.
+        """
+        is_convT = isinstance(module, nn.ConvTranspose2d)
+        # nn.ConvTranspose2d is NOT a subclass of nn.Conv2d — keep is_conv exclusive.
+        is_conv = isinstance(module, nn.Conv2d) and not is_convT
+        is_linear = isinstance(module, nn.Linear)
+        if not (is_conv or is_convT or is_linear):
+            raise TypeError(
+                f"_build_mx_module: cannot quantize '{name}' of type "
+                f"{type(module).__name__} — expected Conv2d, ConvTranspose2d or Linear.")
+
+        def _tally(bucket, value):
+            if summary is not None:
+                summary[bucket].append(value)
+
+        xblock_cfg = getattr(mx_specs, 'xblock_accum', None) or {}
+        want_blocked = bool(xblock_cfg.get('enabled', False))
+        mode = xblock_cfg.get('mode', 'fp32_partial')
+        want_hw = want_blocked and mode == 'hw_fixed_point'
+        bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
+
+        if is_convT:
+            # ConvTranspose2d: plain MX only (no HW / blocked variants).
+            if want_blocked and verbose >= 1:
+                print(f"[MXQuantizer] xblock_accum ignored for convT "
+                      f"'{name}'; ConvTranspose2d only supports plain MX.")
+            new = MXConvTranspose2d(
+                module.in_channels,
+                module.out_channels,
+                module.kernel_size,
+                stride=module.stride,
+                padding=module.padding,
+                output_padding=module.output_padding,
+                dilation=module.dilation,
+                groups=module.groups,
+                bias=module.bias is not None,
+                mx_specs=mx_specs,
+            )
+            _tally('mx_default_convT', name)
+        elif is_conv:
+            reason = None
+            hw_pad = want_hw and bool(xblock_cfg.get('pad_channels', True))
+            # NPE (weight flatten + act X-block) needs no channel divisibility:
+            # the weight flattens per filter and the activation blocks along W.
+            is_npe = (want_hw
+                      and xblock_cfg.get('weight_blockify') == 'flatten'
+                      and xblock_cfg.get('act_blockify') == 'xblock')
+            if want_blocked and module.groups != 1:
+                reason = f"groups={module.groups}"
+            elif (want_blocked and bs > 0 and module.in_channels % bs != 0
+                    and not hw_pad and not is_npe):
+                reason = f"in_channels={module.in_channels} not divisible by block_size={bs}"
+            use_blocked = want_blocked and reason is None
+            if want_blocked and not use_blocked:
+                if verbose >= 2:
+                    print(f"[MXQuantizer] xblock_accum blocked path skipped for "
+                          f"conv '{name}' ({reason}); using original MXConv2d.")
+                _tally('fallback_conv', (name, reason))
+            if use_blocked and want_hw:
+                conv_cls = MXConv2dHW
+                if verbose >= 2:
+                    print(f"[MXQuantizer] conv '{name}' -> MXConv2dHW "
+                          f"(hw_fixed_point; bits={xblock_cfg.get('bits')}, "
+                          f"sat_mode={xblock_cfg.get('sat_mode')}, "
+                          f"e_layer_min={xblock_cfg.get('e_layer_min')})")
+                _tally('hw', name)
+            elif use_blocked:
+                conv_cls = MXConv2dBlocked
+                _tally('blocked', name)
+            else:
+                conv_cls = MXConv2d
+                _tally('mx_default_conv', name)
+            _axes_keys = {k: mx_specs.get(k) for k in
+                          ('block_axes', 'block_axes_act', 'block_axes_wt',
+                           'block_shape', 'block_shape_act', 'block_shape_wt',
+                           'block_size_wt', 'flatten_wt')
+                          if mx_specs.get(k)}
+            if _axes_keys and conv_cls is not MXConv2d and verbose >= 1:
+                print(f"[MXQuantizer] WARNING: conv '{name}' uses "
+                      f"{conv_cls.__name__}; {_axes_keys} is ignored "
+                      f"(only MXConv2d fwd reads block_axes*/block_shape*).")
+            new = conv_cls(
+                module.in_channels,
+                module.out_channels,
+                module.kernel_size,
+                stride=module.stride,
+                padding=module.padding,
+                dilation=module.dilation,
+                groups=module.groups,
+                bias=module.bias is not None,
+                mx_specs=mx_specs
+            )
+        else:
+            reason = None
+            if want_blocked and bs > 0 and module.in_features % bs != 0:
+                reason = f"in_features={module.in_features} not divisible by block_size={bs}"
+            use_blocked = want_blocked and reason is None
+            if want_blocked and not use_blocked:
+                if verbose >= 2:
+                    print(f"[MXQuantizer] xblock_accum blocked path skipped for "
+                          f"linear '{name}' ({reason}); using original MXLinear.")
+                _tally('fallback_linear', (name, reason))
+            linear_cls = MXLinearBlocked if use_blocked else MXLinear
+            if use_blocked:
+                _tally('blocked', name)
+            else:
+                _tally('mx_default_linear', name)
+            new = linear_cls(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                mx_specs=mx_specs
+            )
+
+        # preserve weights/bias
+        new.weight = module.weight
+        new.bias = module.bias
+
+        # Propagate xblock_accum config onto the new layer; microxcaling
+        # re-builds its internal mx_specs and drops python attrs.
+        if hasattr(mx_specs, 'xblock_accum'):
+            setattr(new, 'xblock_accum', getattr(mx_specs, 'xblock_accum'))
+
+        if isinstance(new, MXConv2dHW):
+            new._mx_layer_name = name
+            cfg_e = getattr(mx_specs, 'xblock_accum', {}).get('e_layer_min')
+            if cfg_e is not None:
+                new.e_layer_min = int(cfg_e)
+
+        return new
+
+    # =========================
     # Replacement logic
     # =========================
-    def _replace_layers(self, model, layer_map=None):
+    def _replace_layers(self, model, layer_map=None, verbose=None):
         """
         Replace Conv2d and Linear layers based on config (or a pre-built layer_map).
+
+        `verbose` overrides the level derived from the specs — used by the
+        sensitivity planner, which builds several throwaway models and should
+        not print a replacement summary for each one.
         """
         if layer_map is None:
             layer_map = self._build_layer_map()
 
         # Determine verbose level once from the first xblock-enabled mx_specs.
-        verbose = 1
-        for spec in layer_map.values():
-            xc = getattr(spec, 'xblock_accum', None)
-            if xc and xc.get('enabled'):
-                verbose = int(xc.get('verbose', 1))
-                break
+        if verbose is None:
+            verbose = 1
+            for spec in layer_map.values():
+                xc = getattr(spec, 'xblock_accum', None)
+                if xc and xc.get('enabled'):
+                    verbose = int(xc.get('verbose', 1))
+                    break
 
         replace_summary = {
             'hw': [], 'blocked': [], 'mx_default_conv': [], 'mx_default_convT': [],
             'mx_default_linear': [], 'fallback_conv': [], 'fallback_linear': [],
         }
 
-        for full_name, module in model.named_modules():
+        # Snapshot the module list before mutating the tree, and keep duplicate
+        # bindings: a module reachable under two names is deduplicated by
+        # named_modules() by default, so only one of its parents would be
+        # rebound and the other call site would keep running FP32.
+        all_modules = list(model.named_modules(remove_duplicate=False))
+
+        built = {}          # id(original module) -> the MX module built for it
+        bindings = {}       # id(original module) -> [full_name, ...]
+        matched = set()     # layer_map keys that hit a real module
+
+        for full_name, module in all_modules:
             is_convT = (isinstance(module, nn.ConvTranspose2d)
                         and not isinstance(module, MXConvTranspose2d))
             # nn.ConvTranspose2d is NOT a subclass of nn.Conv2d — keep is_conv exclusive.
@@ -387,131 +1069,31 @@ class MXQuantizer:
             if not (is_conv or is_convT or is_linear):
                 continue
 
-            clean_name = full_name[len("module."):] if full_name.startswith("module.") else full_name
-            if clean_name not in layer_map:
+            name = _clean_name(full_name)
+            bindings.setdefault(id(module), []).append(name)
+            if name not in layer_map:
                 continue
+            matched.add(name)
 
-            mx_specs = layer_map[clean_name]
+            mx_specs = layer_map[name]
 
             parent, leaf = self._get_parent(model, full_name)
             if parent is None:
+                print(f"[MXQuantizer] WARNING: layer '{name}' is in the config but "
+                      f"its parent module could not be resolved — not quantized.")
                 continue
 
-            xblock_cfg = getattr(mx_specs, 'xblock_accum', None) or {}
-            want_blocked = bool(xblock_cfg.get('enabled', False))
-            mode = xblock_cfg.get('mode', 'fp32_partial')
-            want_hw = want_blocked and mode == 'hw_fixed_point'
-            bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
-
-            if is_convT:
-                # ConvTranspose2d: plain MX only (no HW / blocked variants).
-                if want_blocked and verbose >= 1:
-                    print(f"[MXQuantizer] xblock_accum ignored for convT "
-                          f"'{clean_name}'; ConvTranspose2d only supports plain MX.")
-                new = MXConvTranspose2d(
-                    module.in_channels,
-                    module.out_channels,
-                    module.kernel_size,
-                    stride=module.stride,
-                    padding=module.padding,
-                    output_padding=module.output_padding,
-                    dilation=module.dilation,
-                    groups=module.groups,
-                    bias=module.bias is not None,
-                    mx_specs=mx_specs,
-                )
-                replace_summary['mx_default_convT'].append(clean_name)
-            elif is_conv:
-                reason = None
-                hw_pad = want_hw and bool(xblock_cfg.get('pad_channels', True))
-                # NPE (weight flatten + act X-block) needs no channel divisibility:
-                # the weight flattens per filter and the activation blocks along W.
-                is_npe = (want_hw
-                          and xblock_cfg.get('weight_blockify') == 'flatten'
-                          and xblock_cfg.get('act_blockify') == 'xblock')
-                if want_blocked and module.groups != 1:
-                    reason = f"groups={module.groups}"
-                elif (want_blocked and bs > 0 and module.in_channels % bs != 0
-                        and not hw_pad and not is_npe):
-                    reason = f"in_channels={module.in_channels} not divisible by block_size={bs}"
-                use_blocked = want_blocked and reason is None
-                if want_blocked and not use_blocked:
-                    if verbose >= 2:
-                        print(f"[MXQuantizer] xblock_accum blocked path skipped for "
-                              f"conv '{clean_name}' ({reason}); using original MXConv2d.")
-                    replace_summary['fallback_conv'].append((clean_name, reason))
-                if use_blocked and want_hw:
-                    conv_cls = MXConv2dHW
-                    if verbose >= 2:
-                        print(f"[MXQuantizer] conv '{clean_name}' -> MXConv2dHW "
-                              f"(hw_fixed_point; bits={xblock_cfg.get('bits')}, "
-                              f"sat_mode={xblock_cfg.get('sat_mode')}, "
-                              f"e_layer_min={xblock_cfg.get('e_layer_min')})")
-                    replace_summary['hw'].append(clean_name)
-                elif use_blocked:
-                    conv_cls = MXConv2dBlocked
-                    replace_summary['blocked'].append(clean_name)
-                else:
-                    conv_cls = MXConv2d
-                    replace_summary['mx_default_conv'].append(clean_name)
-                _axes_keys = {k: mx_specs.get(k) for k in
-                              ('block_axes', 'block_axes_act', 'block_axes_wt',
-                               'block_shape', 'block_shape_act', 'block_shape_wt',
-                               'block_size_wt', 'flatten_wt')
-                              if mx_specs.get(k)}
-                if _axes_keys and conv_cls is not MXConv2d:
-                    print(f"[MXQuantizer] WARNING: conv '{clean_name}' uses "
-                          f"{conv_cls.__name__}; {_axes_keys} is ignored "
-                          f"(only MXConv2d fwd reads block_axes*/block_shape*).")
-                new = conv_cls(
-                    module.in_channels,
-                    module.out_channels,
-                    module.kernel_size,
-                    stride=module.stride,
-                    padding=module.padding,
-                    dilation=module.dilation,
-                    groups=module.groups,
-                    bias=module.bias is not None,
-                    mx_specs=mx_specs
-                )
+            # One MX module per original module, reused across every binding, so
+            # tied layers stay tied instead of becoming independent copies.
+            if id(module) in built:
+                new = built[id(module)]
             else:
-                reason = None
-                if want_blocked and bs > 0 and module.in_features % bs != 0:
-                    reason = f"in_features={module.in_features} not divisible by block_size={bs}"
-                use_blocked = want_blocked and reason is None
-                if want_blocked and not use_blocked:
-                    if verbose >= 2:
-                        print(f"[MXQuantizer] xblock_accum blocked path skipped for "
-                              f"linear '{clean_name}' ({reason}); using original MXLinear.")
-                    replace_summary['fallback_linear'].append((clean_name, reason))
-                linear_cls = MXLinearBlocked if use_blocked else MXLinear
-                if use_blocked:
-                    replace_summary['blocked'].append(clean_name)
-                else:
-                    replace_summary['mx_default_linear'].append(clean_name)
-                new = linear_cls(
-                    module.in_features,
-                    module.out_features,
-                    bias=module.bias is not None,
-                    mx_specs=mx_specs
-                )
-
-            # preserve weights/bias
-            new.weight = module.weight
-            new.bias = module.bias
-
-            # Propagate xblock_accum config onto the new layer; microxcaling
-            # re-builds its internal mx_specs and drops python attrs.
-            if hasattr(mx_specs, 'xblock_accum'):
-                setattr(new, 'xblock_accum', getattr(mx_specs, 'xblock_accum'))
-
-            if isinstance(new, MXConv2dHW):
-                new._mx_layer_name = clean_name
-                cfg_e = getattr(mx_specs, 'xblock_accum', {}).get('e_layer_min')
-                if cfg_e is not None:
-                    new.e_layer_min = int(cfg_e)
-
+                new = self._build_mx_module(module, mx_specs, name=name,
+                                            verbose=verbose, summary=replace_summary)
+                built[id(module)] = new
             setattr(parent, leaf, new)
+
+        self._warn_unreplaced(layer_map, matched, bindings, verbose)
 
         # Param-free ops (kind == 'act_quant') are wrapped after the conv/linear
         # pass: wrapping inserts an `.inner` level in the module path, which
@@ -544,6 +1126,38 @@ class MXQuantizer:
                     reasons[r] = reasons.get(r, 0) + 1
                 tally = ", ".join(f"{r}: {n}" for r, n in reasons.items())
                 print(f"[MXQuantizer] fallback reasons: {tally}")
+
+    @staticmethod
+    def _warn_unreplaced(layer_map, matched, bindings, verbose=1):
+        """Report config entries that quantized nothing, and partial tied layers.
+
+        Both cases used to pass silently: a typo'd or stale layer name simply
+        never matched a module, and a module bound under two names was only
+        half-listed. Either way the layer stays FP32 while the config claims
+        otherwise.
+        """
+        if verbose < 1:
+            return
+
+        missing = sorted(set(layer_map) - set(matched))
+        if missing:
+            print(f"[MXQuantizer] WARNING: {len(missing)} configured layer(s) matched no "
+                  f"Conv2d/ConvTranspose2d/Linear in the model — check for typos or a "
+                  f"stale config:")
+            for n in missing[:20]:
+                print(f"[MXQuantizer]   - {n}")
+            if len(missing) > 20:
+                print(f"[MXQuantizer]   ... and {len(missing) - 20} more")
+
+        for names in bindings.values():
+            if len(names) < 2:
+                continue
+            listed = [n for n in names if n in layer_map]
+            if listed and len(listed) != len(names):
+                skipped = [n for n in names if n not in layer_map]
+                print(f"[MXQuantizer] WARNING: shared module quantized via {listed} "
+                      f"but also reachable as {skipped}; all bindings now use the same "
+                      f"MX layer.")
 
     def _build_layer_map(self):
         """
@@ -769,45 +1383,13 @@ class MXQuantizer:
 
     def _create_mx_module(self, orig_module, mx_specs):
         """
-        Build an MXConv2d / MXConvTranspose2d / MXLinear from an existing
-        nn.Conv2d / nn.ConvTranspose2d / nn.Linear, sharing weight and bias.
-        Used for temporary isolated-sensitivity measurement and for _replace_layers.
+        Deprecated alias for `_build_mx_module`, kept for external callers.
+
+        Note the behaviour change: this used to build plain MXConv2d /
+        MXLinear only, ignoring `xblock_accum`. It now returns the same class
+        `_replace_layers` would install, so measurements match deployment.
         """
-        if isinstance(orig_module, nn.ConvTranspose2d):
-            new = MXConvTranspose2d(
-                orig_module.in_channels,
-                orig_module.out_channels,
-                orig_module.kernel_size,
-                stride=orig_module.stride,
-                padding=orig_module.padding,
-                output_padding=orig_module.output_padding,
-                dilation=orig_module.dilation,
-                groups=orig_module.groups,
-                bias=orig_module.bias is not None,
-                mx_specs=mx_specs,
-            )
-        elif isinstance(orig_module, nn.Conv2d):
-            new = MXConv2d(
-                orig_module.in_channels,
-                orig_module.out_channels,
-                orig_module.kernel_size,
-                stride=orig_module.stride,
-                padding=orig_module.padding,
-                dilation=orig_module.dilation,
-                groups=orig_module.groups,
-                bias=orig_module.bias is not None,
-                mx_specs=mx_specs,
-            )
-        else:
-            new = MXLinear(
-                orig_module.in_features,
-                orig_module.out_features,
-                bias=orig_module.bias is not None,
-                mx_specs=mx_specs,
-            )
-        new.weight = orig_module.weight
-        new.bias = orig_module.bias
-        return new
+        return self._build_mx_module(orig_module, mx_specs, verbose=0)
 
     def _get_candidate_layers(self, model):
         """
@@ -822,10 +1404,21 @@ class MXQuantizer:
                     for l in self.config["layers"]
                     if isinstance(l, str)
                     or l.get("kind") not in ("act_quant", "out_quant")]
-        # auto-discover all Conv2d / ConvTranspose2d / Linear (excluding already-MX layers)
-        return [n for n, m in model.named_modules()
-                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear))
-                and not isinstance(m, (MXConv2d, MXConvTranspose2d, MXLinear))]
+        # auto-discover all Conv2d / ConvTranspose2d / Linear (excluding already-MX
+        # layers). Names are stripped of the DataParallel `module.` prefix so they
+        # match what _replace_layers looks up — without this, auto-discovery on a
+        # DataParallel model produced keys that matched nothing and quantized none
+        # of the network.
+        seen = []
+        for n, m in model.named_modules(remove_duplicate=False):
+            if not isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+                continue
+            if isinstance(m, (MXConv2d, MXConvTranspose2d, MXLinear)):
+                continue
+            name = _clean_name(n)
+            if name not in seen:
+                seen.append(name)
+        return seen
 
     def _get_parent(self, model, full_name):
         parts = full_name.split(".")

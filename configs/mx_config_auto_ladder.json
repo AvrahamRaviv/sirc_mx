@@ -1,0 +1,25 @@
+{
+  "mx_specs": {
+    "block_size": 32,
+    "scale_bits": 8,
+    "shared_exp_method": "max",
+    "custom_cuda": true
+  },
+  "groups": {
+    "int4": {"w_elem_format": "int4", "a_elem_format": "int4"},
+    "int6": {"w_elem_format": "int6", "a_elem_format": "int6"},
+    "int8": {"w_elem_format": "int8", "a_elem_format": "int8"}
+  },
+  "auto_mixed": {
+    "ladder": ["int4", "int6", "int8"],
+    "scorer": "oat_output",
+    "probe": "bottom",
+    "reference": "both",
+    "batches": 8,
+    "strategy": "quantile",
+    "quantile": {"int4": 0.10, "int6": 0.20, "int8": 0.70},
+    "separable_wa": {"enabled": true, "refine_top": 16}
+  },
+  "ptq": false,
+  "measure_error": false
+}

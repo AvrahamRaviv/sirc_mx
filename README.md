@@ -162,35 +162,155 @@ Key absent: PTQ runs automatically if `data` is provided (128 batches default).
 
 ## Automated Mixed-Precision (`auto_mixed`)
 
-Measures each layer's isolated quantization sensitivity (SQNR of its own output with clean FP32 inputs, no upstream error propagation), then assigns each layer to a precision group automatically.
+Scores every candidate layer, then assigns each one a precision from a ladder —
+e.g. the least sensitive 10% to MXINT4, the next 20% to MXINT6, the rest to
+MXINT8. Training-free: no gradients, no labels, no fine-tuning.
+
+### Two-step workflow
+
+Scoring costs real forward passes and the result decides what a training run
+does, so it is worth reviewing before depending on it:
+
+```python
+quantizer = MXQuantizer(save_dir="/path/to/config_dir")
+plan = quantizer.plan_mixed_precision(model, data=cal_data, forward_fn=my_forward)
+```
+
+writes two files into `save_dir`:
+
+| File | What it is |
+|---|---|
+| `sensitivity.json` | every score, why, and what it earned — sorted worst first |
+| `mx_config_resolved.json` | a plain `groups` + `layers` config, no `auto_mixed` |
+
+The resolved config is what training points at. Re-running it is a deterministic
+replay: no scoring, nothing left to re-derive, and you can hand-edit any
+assignment you disagree with.
+
+`quant()` also runs the whole thing in one call when `auto_mixed` has a `ladder`.
+
+### Config
 
 ```json
 {
-  "groups": {
-    "int4": {"w_elem_format": "int4", "a_elem_format": "int4", "block_size": 32, "custom_cuda": true},
-    "int8": {"w_elem_format": "int8", "a_elem_format": "int8", "block_size": 32, "custom_cuda": true}
+  "mx_specs": {
+    "block_size": 32, "scale_bits": 8, "shared_exp_method": "max",
+    "custom_cuda": true,
+    "xblock_accum": {"enabled": true, "mode": "hw_fixed_point", "bits": 48}
   },
-  "layers": ["backbone.conv1", "backbone.conv2", "head.fc"],
+  "groups": {
+    "int4": {"w_elem_format": "int4", "a_elem_format": "int4"},
+    "int6": {"w_elem_format": "int6", "a_elem_format": "int6"},
+    "int8": {"w_elem_format": "int8", "a_elem_format": "int8"}
+  },
   "auto_mixed": {
-    "base":     "int4",
-    "upgrade":  "int8",
-    "strategy": "budget",
-    "upgrade_fraction": 0.8,
-    "batches":  32
+    "ladder": ["int4", "int6", "int8"],
+    "scorer": "oat_output",
+    "probe": "bottom",
+    "reference": "both",
+    "batches": 8,
+    "strategy": "quantile",
+    "quantile": {"int4": 0.10, "int6": 0.20, "int8": 0.70},
+    "separable_wa": {"enabled": true, "refine_top": 16},
+    "pins": {"model.head.cls": "int8"}
   }
 }
 ```
 
+`ladder` is ordered **lowest precision first**. Rungs set only the number format:
+block geometry and `xblock_accum` come from `mx_specs` (or `deploy_group`), so
+demoting a layer changes its precision and nothing else about how it runs — a
+probe measures the arithmetic that will actually be deployed, HW accumulator
+included.
+
+### Scorers
+
+| `scorer` | Cost | What it measures |
+|---|---|---|
+| `oat_output` *(default)* | `(1+N)×batches` forwards | demote one layer, measure the **network output**. Sees error propagation. |
+| `isolated_sqnr` | 1 pass + N replays | each layer on its own captured inputs. Cheap, ignores propagation. |
+| `weight_only` | ~0 | weight round-trip SQNR only. |
+| `from_stats` | **0** | reuses the out-SQNR `collect_stats` already wrote to `quant_stats.json`. |
+| `from_file` | 0 | any external JSON of per-layer scores. |
+| `callable` | — | `"package.module:function"` — plug in any algorithm. |
+
+Sensitivity is normalized so **higher always means "needs more bits"**, whatever
+the scorer. New algorithms register with `@mx_sensitivity.register("name")` and
+need not touch `MXQuantizer`.
+
+### References
+
+`reference` picks what the degradation is measured against:
+
+- `marginal` — the whole net at the top rung, one layer demoted. What it costs
+  to demote this layer *in the net you ship*. This drives the assignment.
+- `absolute` — plain FP32, one layer quantized. How much the layer dislikes low
+  precision at all.
+- `both` *(default)* — reports both plus a rank delta and their Spearman
+  correlation. Where they disagree, a layer is only sensitive because of what
+  surrounds it.
+
 ### Strategies
+
+| Strategy | Keys | Behaviour |
+|---|---|---|
+| `quantile` | `quantile: {group: fraction}` | fractions per rung, apportioned by largest remainder so the counts sum exactly |
+| `threshold` | `threshold: {group: max_sensitivity}` | absolute cutoffs, stable across models |
+| `cost_budget` | `cost_budget: {target_avg_bits}` | greedy by bits-saved-per-dB-lost; needs `probe: "all_rungs"` |
+
+Layers that could not be measured (`unreached`, `zero_output`, `no_change`) go to
+the top rung and are **excluded from the denominator** — they are not
+insensitive layers, they are layers we failed to measure, and counting them
+would quietly shift every requested fraction. Ties are broken by name and
+reported in the artifact.
+
+### Weight/activation split
+
+Two layers can post the same output SQNR while one is weight-underflow driven
+and the other activation-underflow driven; spending bits on the wrong operand
+buys nothing. With `separable_wa.enabled`, the most sensitive `refine_top`
+layers get solo weight-only and activation-only probes, and when the two
+disagree by more than `margin_db` (default 3 dB) the quiet operand drops one
+rung. That produces a merged group named for what it is — `w8a4` — written into
+the resolved config where you can overrule it.
+
+Only the format keys split. Block geometry is shared by both operands and the
+accumulator model belongs to the deployment spec, so both are taken whole; a
+rung that tries to carry `xblock_accum` is rejected at validation, because it
+would silently change the layer class.
+
+### Guards
+
+Everything checkable is checked before the first forward pass: group names,
+element formats the library actually implements (a trial quantization, not just
+a name lookup), fractions that sum to 1, shared keys that agree across rungs,
+and a non-empty candidate list. During scoring:
+
+- the forward pass must be **deterministic** — the reference runs twice and must
+  match bit for bit, otherwise every OAT difference is noise and scoring aborts;
+- a **half-split rank correlation** over the calibration batches is printed —
+  below ~0.9 means `batches` is too low. It costs no extra forwards;
+- an **ETA** is printed before probing starts;
+- after assignment, one extra pass measures the **finished mix** against the
+  reference — the number no per-layer score can give you.
+
+### Legacy two-rung config
+
+The older `base` / `upgrade` form still works unchanged and follows the original
+code path exactly:
+
+```json
+"auto_mixed": {"base": "int4", "upgrade": "int8",
+               "strategy": "budget", "upgrade_fraction": 0.8, "batches": 32}
+```
 
 | Strategy | Key | Behaviour |
 |----------|-----|-----------|
 | `threshold` | `sqnr_threshold_db` | Layers with SQNR below threshold → `upgrade` group |
 | `budget` | `upgrade_fraction` | Worst N% of layers by SQNR → `upgrade` group |
 
-`upgrade_fraction: 0.8` upgrades 80% of layers to `int8` (the worst 80% by sensitivity).
-
-Layers whose hooks never fire (no activation data) receive a **weight-only SQNR** estimate as fallback and are marked `(w)` in the sensitivity log.
+Layers whose hooks never fire receive a weight-only SQNR estimate and are marked
+`(w)` in the sensitivity log.
 
 ---
 
