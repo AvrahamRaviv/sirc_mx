@@ -469,26 +469,43 @@ def _run_reference(model, batches, forward_fn, output_fn):
 
 
 def check_determinism(model, batch, ref_out, forward_fn, output_fn):
-    """Re-run one batch and require bit-identical outputs.
+    """Re-run one batch and measure the run-to-run noise floor.
 
-    OAT is a difference of two forward passes. If the model is nondeterministic
-    (dropout left on, a stateful/recurrent buffer, nondeterministic kernels),
-    the differences are noise and the resulting ranking looks entirely
-    plausible while being meaningless. Better to refuse.
+    OAT is a difference of two forward passes, so anything that varies between
+    two identical runs — dropout left on, a stateful buffer, a nondeterministic
+    kernel — lands in the score. But bit-equality is the wrong test: cuDNN
+    picks convolution algorithms by autotuning and reduces in nondeterministic
+    order, so a plain FP32 network on a GPU is essentially never bit-identical
+    twice while still being reproducible to ~120 dB. Refusing that would refuse
+    the absolute-reference pass on every real model.
+
+    So measure it instead. The floor is the SQNR between two identical runs;
+    every score has to sit well above it to mean anything.
+
+    Returns:
+        (floor_db, why): `floor_db` is inf when the runs are bit-identical and
+        None when it could not be measured; `why` is a structural failure that
+        no threshold can excuse, or None.
     """
     with torch.no_grad():
         y = default_forward(model, batch, forward_fn)
     got = [t.detach().float().cpu() for t in output_fn(y)]
     if len(got) != len(ref_out):
-        return False, "output structure changed between two identical runs"
+        return None, "the output structure changed between two identical runs"
+
+    acc = ErrAcc()
     for a, b in zip(ref_out, got):
-        if a.shape != b.shape or not torch.equal(a, b):
-            return False, "outputs differ between two identical runs"
-    return True, None
+        if a.shape != b.shape:
+            return None, "the output shape changed between two identical runs"
+        acc.update(a, b)
+    status, metrics = acc.summary()
+    if status != STATUS_OK:
+        return None, None            # nothing to compare; scoring reports it
+    return metrics.get("sqnr_db"), None
 
 
 def score_oat(ref_model, entries, batches, *, build_probe, forward_fn=None,
-              output_fn=None, log=None, verbose=True):
+              output_fn=None, log=None, verbose=True, min_floor_db=60.0):
     """One-at-a-time scoring against the network output.
 
     For each candidate: swap in a lower-precision copy of that layer alone, run
@@ -504,6 +521,9 @@ def score_oat(ref_model, entries, batches, *, build_probe, forward_fn=None,
         build_probe: callable(name, orig_module) -> nn.Module, the demoted layer.
         forward_fn / output_fn: how to run a batch and reduce its return value.
         verbose: print progress and the half-split rank correlation.
+        min_floor_db: reject the model when two identical runs agree to less
+            than this SQNR. Scores below the floor are noise; the default
+            leaves ~30 dB of headroom over the range MX demotions produce.
 
     Returns:
         dict: name -> {"sensitivity", "status", "metrics", "n_calls"}, plus a
@@ -515,13 +535,24 @@ def score_oat(ref_model, entries, batches, *, build_probe, forward_fn=None,
 
     try:
         ref_out = _run_reference(ref_model, batches, forward_fn, output_fn)
-        ok, why = check_determinism(ref_model, batches[0], ref_out[0],
-                                    forward_fn, output_fn)
-        if not ok:
+        floor_db, why = check_determinism(ref_model, batches[0], ref_out[0],
+                                          forward_fn, output_fn)
+        if why is not None:
             raise RuntimeError(
-                f"OAT scoring needs a deterministic forward pass, but {why}. "
-                f"Check for dropout or BatchNorm in train mode, stateful buffers "
-                f"updated during forward, or nondeterministic kernels.")
+                f"OAT scoring needs a reproducible forward pass, but {why}. "
+                f"Check for dropout or BatchNorm in train mode, stateful "
+                f"buffers updated during forward, or a data-dependent output "
+                f"shape.")
+        if floor_db is not None and floor_db < float(min_floor_db):
+            raise RuntimeError(
+                f"OAT scoring needs a reproducible forward pass, but two "
+                f"identical runs agree to only {floor_db:.1f} dB SQNR "
+                f"(need {float(min_floor_db):.0f}). Every score would be "
+                f"measuring that noise. Check for dropout or BatchNorm in "
+                f"train mode, autocast/AMP left enabled, or stateful buffers "
+                f"updated during forward. If the model is genuinely this "
+                f"noisy, lower auto_mixed.min_noise_floor_db and treat any "
+                f"score near the floor as unranked.")
 
         results = {}
         halves = ([], [])       # (even-batch scores, odd-batch scores) per layer
@@ -573,7 +604,24 @@ def score_oat(ref_model, entries, batches, *, build_probe, forward_fn=None,
                 log(f"  scored {idx}/{len(names)} layers")
 
         half_rho = spearman(halves[0], halves[1]) if len(batches) > 1 else None
+
+        # A score is only meaningful as far above the floor as the floor is
+        # stable. Layers that land within 10 dB of it were not really ranked,
+        # they were sorted by noise — say so rather than let the table imply an
+        # order that a re-run would not reproduce.
+        near = 0
+        if floor_db is not None and math.isfinite(floor_db):
+            near = sum(1 for r in results.values()
+                       if r.get("sensitivity") is not None
+                       and -r["sensitivity"] >= floor_db - 10.0)
+            if near and verbose and log is not None:
+                log(f"  WARNING: {near} layer(s) score within 10 dB of the "
+                    f"{floor_db:.0f} dB run-to-run noise floor; their relative "
+                    f"order is not reproducible")
+
         results["__meta__"] = {"determinism_check": "pass",
+                               "noise_floor_db": floor_db,
+                               "layers_at_noise_floor": near,
                                "half_split_spearman": half_rho,
                                "n_batches": len(batches),
                                "n_probes": len(names)}
@@ -834,7 +882,8 @@ def _scorer_oat(ctx):
         raise ValueError("scorer 'oat_output' needs calibration data")
     return score_oat(ctx.ref_model, ctx.entries, ctx.batches,
                      build_probe=ctx.build_probe, forward_fn=ctx.forward_fn,
-                     output_fn=ctx.output_fn, log=ctx.log)
+                     output_fn=ctx.output_fn, log=ctx.log,
+                     min_floor_db=ctx.options.get("min_noise_floor_db", 60.0))
 
 
 @register("weight_only")

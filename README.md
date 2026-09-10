@@ -341,8 +341,13 @@ element formats the library actually implements (a trial quantization, not just
 a name lookup), fractions that sum to 1, shared keys that agree across rungs,
 and a non-empty candidate list. During scoring:
 
-- the forward pass must be **deterministic** — the reference runs twice and must
-  match bit for bit, otherwise every OAT difference is noise and scoring aborts;
+- the forward pass must be **reproducible** — the reference runs twice and the
+  SQNR between the two runs is the **noise floor**. Bit-equality is not the
+  test: cuDNN autotunes its convolution algorithm and reduces in
+  nondeterministic order, so a real GPU model is never bit-identical twice
+  while still reproducing to ~120 dB. Below `min_noise_floor_db` (default 60)
+  scoring aborts, and layers landing within 10 dB of the floor are reported as
+  unranked — their order is noise;
 - a **half-split rank correlation** over the calibration batches is printed —
   below ~0.9 means `batches` is too low. It costs no extra forwards;
 - an **ETA** is printed before probing starts;

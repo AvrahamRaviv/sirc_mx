@@ -537,7 +537,8 @@ class MXQuantizer:
                 ref_model, entries, batches, verbose=False,
                 build_probe=lambda n, mod, _s=spec: self._build_mx_module(
                     mod, _s, name=n, verbose=0),
-                forward_fn=forward_fn, output_fn=output_fn)
+                forward_fn=forward_fn, output_fn=output_fn,
+                min_floor_db=self._min_floor())
             res.pop("__meta__", None)
             for name, r in res.items():
                 by_name[name].setdefault("per_rung", {})[rung] = r.get("sensitivity")
@@ -617,7 +618,8 @@ class MXQuantizer:
         self._log(log, "auto_mixed | absolute reference (vs FP32) ...")
         abs_scores = _mxs.score_oat(fp32_ref, entries, batches,
                                     build_probe=build_probe, forward_fn=forward_fn,
-                                    output_fn=output_fn, verbose=False)
+                                    output_fn=output_fn, verbose=False,
+                                    min_floor_db=self._min_floor())
         abs_scores.pop("__meta__", None)
 
         order_marginal = [r["name"] for r in rows]
@@ -664,7 +666,8 @@ class MXQuantizer:
                 ref_model, subset, batches, verbose=False,
                 build_probe=lambda n, mod, _s=spec: self._build_mx_module(
                     mod, _s, name=n, verbose=0),
-                forward_fn=forward_fn, output_fn=output_fn)
+                forward_fn=forward_fn, output_fn=output_fn,
+                min_floor_db=self._min_floor())
             res.pop("__meta__", None)
             for name, r in res.items():
                 by_name[name]["scores"][label] = r.get("sensitivity")
@@ -815,11 +818,22 @@ class MXQuantizer:
             quantize_mx_op(torch.zeros(1, 32), specs, elem_format=specs[key],
                            axes=[-1], round=specs.get('round_mx_output', 'nearest'))
 
+    def _min_floor(self):
+        """Minimum acceptable run-to-run SQNR, in dB.
+
+        Every OAT score is a difference of two forward passes, so it is only
+        readable down to the level at which the model reproduces itself. Kept
+        in one place because the marginal, absolute, per-rung and w/a passes
+        all have to apply the same bar.
+        """
+        cfg = (self.config or {}).get("auto_mixed") or {}
+        return float(cfg.get("min_noise_floor_db", 60.0))
+
     @staticmethod
     def _scorer_options(cfg):
         """Scorer-specific options, passed through to the registry entry."""
         opts = dict(cfg.get("scorer_options") or {})
-        for key in ("path", "target", "capture_chunk"):
+        for key in ("path", "target", "capture_chunk", "min_noise_floor_db"):
             if key in cfg:
                 opts.setdefault(key, cfg[key])
         return opts
@@ -914,6 +928,12 @@ class MXQuantizer:
         if rho is not None:
             note = "" if rho >= 0.9 else "  <-- low: increase auto_mixed.batches"
             self._log(log, f"  Half-split rank correlation: {rho:.2f}{note}")
+        floor = meta.get("noise_floor_db")
+        if floor is not None and math.isfinite(floor):
+            near = meta.get("layers_at_noise_floor") or 0
+            note = (f"  <-- {near} layer(s) within 10 dB of it, order not "
+                    f"reproducible") if near else ""
+            self._log(log, f"  Run-to-run noise floor: {floor:.0f} dB{note}")
 
     # =========================
     # Config

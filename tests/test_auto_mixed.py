@@ -325,7 +325,7 @@ def test_oat_rejects_nondeterministic_model(tmp_path):
 
     model = _Stateful().eval()
     batches = [torch.randn(2, 3, 16, 16)]
-    with pytest.raises(RuntimeError, match="deterministic"):
+    with pytest.raises(RuntimeError, match="reproducible"):
         _oat(model, ["conv"], batches, dict(_INT8, w_elem_format="int4"), tmp_path)
 
 
@@ -929,3 +929,63 @@ def test_quant_without_a_plan_still_scores_inline(tmp_path):
     formats = {getattr(quantized, n).mx_specs["w_elem_format"]
                for n in ("conv1", "conv2", "conv3")}
     assert formats <= {"int4", "int6", "int8"}
+
+
+# =============================================================================
+# The run-to-run noise floor
+# =============================================================================
+
+class _JitterNet(nn.Module):
+    """Reproducible to ~140 dB, but never bit-identical — like cuDNN on a GPU."""
+
+    def __init__(self, scale=1e-7):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 8, 3, padding=1)
+        self.scale = scale
+
+    def forward(self, x):
+        y = self.conv2(self.conv1(x))
+        return y + self.scale * torch.randn_like(y)
+
+
+def test_noise_floor_accepts_a_model_that_is_not_bit_identical():
+    """cuDNN autotuning and reduction order make bit-equality the wrong test."""
+    import mx_sensitivity as mxs
+    torch.manual_seed(0)
+    model = _JitterNet().eval()
+    batch = torch.randn(2, 3, 16, 16)
+    with torch.no_grad():
+        ref = [t.detach().float().cpu()
+               for t in mxs.flatten_outputs(model(batch))]
+    floor, why = mxs.check_determinism(model, batch, ref, None, mxs.flatten_outputs)
+    assert why is None
+    assert floor > 60.0            # not bit-identical, but far above the bar
+
+
+def test_noise_floor_rejects_a_model_below_the_bar():
+    """A model whose runs disagree at the signal level is refused."""
+    import mx_sensitivity as mxs
+    torch.manual_seed(0)
+    entries = {}
+    model = _JitterNet(scale=1.0).eval()
+    with pytest.raises(RuntimeError, match="agree to only"):
+        mxs.score_oat(model, entries, [torch.randn(2, 3, 16, 16)],
+                      build_probe=lambda n, m: None)
+
+
+def test_noise_floor_bar_is_configurable(tmp_path):
+    """min_noise_floor_db lowers the bar for a genuinely noisy model."""
+    q = _quantizer(tmp_path, _auto_config(min_noise_floor_db=10.0))
+    assert q._min_floor() == 10.0
+    assert _quantizer(tmp_path, _auto_config())._min_floor() == 60.0
+
+
+def test_noise_floor_is_reported_in_meta(tmp_path):
+    """The floor and the layers sitting on it land in the artifact."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_CanaryNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert "noise_floor_db" in plan["meta"]
+    assert plan["meta"]["layers_at_noise_floor"] == 0
