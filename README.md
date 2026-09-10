@@ -357,8 +357,17 @@ and a non-empty candidate list. During scoring:
 - a **half-split rank correlation** over the calibration batches is printed —
   below ~0.9 means `batches` is too low. It costs no extra forwards;
 - an **ETA** is printed before probing starts;
-- after assignment, one extra pass measures the **finished mix** against the
-  reference — the number no per-layer score can give you.
+- after assignment, one extra pass measures the **finished networks**, every
+  demotion in place at once — the numbers no per-layer score can give you:
+
+  ```
+  auto_mixed | vs FP32: int8 baseline 44.10 dB -> assigned mix 30.53 dB (ladder cost 13.57 dB)
+  auto_mixed | assigned mix vs int8 reference: 30.53 dB SQNR
+  ```
+
+  `assigned_vs_reference` alone is not readable: "30 dB below the int8 net"
+  means something very different depending on whether that net was 31 dB or
+  45 dB below FP32. All three land in `sensitivity.json` under `meta`.
 
 ### Legacy two-rung config
 

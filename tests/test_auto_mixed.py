@@ -752,6 +752,28 @@ def test_verification_pass_reports_the_finished_mix(tmp_path):
     assert verified["sqnr_db"] is not None
 
 
+def test_verification_reports_both_networks_against_fp32(tmp_path):
+    """The ladder's cost is only readable next to the baseline's own error."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_CanaryNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    baseline = plan["meta"]["baseline_vs_fp32"]
+    assigned = plan["meta"]["assigned_vs_fp32"]
+    assert baseline["status"] == "ok" and assigned["status"] == "ok"
+    # Demoting layers can only move the network further from FP32.
+    assert assigned["sqnr_db"] <= baseline["sqnr_db"] + 1e-6
+
+
+def test_verification_restores_the_models_training_flag(tmp_path):
+    """Scoring runs in eval; a model handed over in train mode gets it back."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    model = _CanaryNet().train()
+    q.plan_mixed_precision(model, data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert model.training
+
+
 # =============================================================================
 # Hand-written layer entries survive the ladder
 # =============================================================================

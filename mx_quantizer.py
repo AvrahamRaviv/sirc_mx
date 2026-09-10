@@ -508,9 +508,12 @@ class MXQuantizer:
         # else at the top rung. The mixed net is noisier than that, so scores are
         # optimistic. One extra pass measures what was actually bought.
         if batches and cfg.get("verify", True):
-            meta["assigned_vs_reference"] = self._verify_assignment(
+            baseline, assigned, relative = self._verify_assignment(
                 base_model, ref_map, flat, extra, group_table, top, batches,
                 forward_fn, output_fn, log)
+            meta["baseline_vs_fp32"] = baseline
+            meta["assigned_vs_fp32"] = assigned
+            meta["assigned_vs_reference"] = relative
 
         resolved = _mxa.build_resolved_config(
             self.config, flat, group_table, extra,
@@ -560,11 +563,20 @@ class MXQuantizer:
     def _verify_assignment(self, base_model, ref_map, assignments, extra,
                            group_table, top, batches, forward_fn, output_fn,
                            log=None):
-        """Measure the finished mixed network against the reference network.
+        """Measure the finished networks against FP32 and against each other.
 
-        The number that actually matters, and the one no per-layer score can
-        give you: every demotion is in place at once, so the interactions the
-        one-at-a-time scheme cannot see are included.
+        Three numbers from one loop, because on their own each is misleading:
+
+          baseline_vs_fp32       the all-top-rung network vs FP32 — the budget
+          assigned_vs_fp32       the mixed network vs FP32 — what you ship
+          assigned_vs_reference  mixed vs baseline — what the ladder cost
+
+        The last one is what the OAT scores predict, but it cannot be read
+        alone: "the mix is 30 dB below the int8 net" means something very
+        different depending on whether the int8 net was 31 dB or 45 dB below
+        FP32. And unlike any per-layer score, these have every demotion in
+        place at once, so the interactions one-at-a-time probing cannot see are
+        included.
         """
         all_groups = dict(group_table)
         all_groups.update(extra)
@@ -578,21 +590,47 @@ class MXQuantizer:
             n: self._build_mx_specs(all_groups[g]) for n, g in assignments.items()},
             verbose=0)
 
+        fp32 = base_model
+        was_training = fp32.training
+        fp32.eval()
         ref.eval()
         mixed.eval()
-        acc = _mxs.ErrAcc()
-        with torch.no_grad():
-            for batch in batches:
-                a = output_fn(_mxs.default_forward(ref, batch, forward_fn))
-                b = output_fn(_mxs.default_forward(mixed, batch, forward_fn))
-                for ta, tb in zip(a, b):
-                    acc.update(ta.detach().float().cpu(), tb.detach().float().cpu())
-        status, metrics = acc.summary()
-        sqnr = metrics.get("sqnr_db")
-        if sqnr is not None:
+        base_acc, mix_acc, rel_acc = _mxs.ErrAcc(), _mxs.ErrAcc(), _mxs.ErrAcc()
+        try:
+            with torch.no_grad():
+                for batch in batches:
+                    f = [t.detach().float().cpu() for t in
+                         output_fn(_mxs.default_forward(fp32, batch, forward_fn))]
+                    a = [t.detach().float().cpu() for t in
+                         output_fn(_mxs.default_forward(ref, batch, forward_fn))]
+                    b = [t.detach().float().cpu() for t in
+                         output_fn(_mxs.default_forward(mixed, batch, forward_fn))]
+                    for tf, ta, tb in zip(f, a, b):
+                        base_acc.update(tf, ta)
+                        mix_acc.update(tf, tb)
+                        rel_acc.update(ta, tb)
+        finally:
+            if was_training:
+                fp32.train()
+
+        def _pack(acc):
+            status, metrics = acc.summary()
+            return {"status": status, **metrics}
+
+        baseline = _pack(base_acc)
+        assigned = _pack(mix_acc)
+        relative = _pack(rel_acc)
+
+        b_db, m_db, r_db = (baseline.get("sqnr_db"), assigned.get("sqnr_db"),
+                            relative.get("sqnr_db"))
+        if b_db is not None and m_db is not None:
+            self._log(log, f"auto_mixed | vs FP32: {top} baseline "
+                           f"{b_db:.2f} dB -> assigned mix {m_db:.2f} dB "
+                           f"(ladder cost {b_db - m_db:.2f} dB)")
+        if r_db is not None:
             self._log(log, f"auto_mixed | assigned mix vs {top} reference: "
-                           f"{sqnr:.2f} dB SQNR")
-        return {"status": status, **metrics}
+                           f"{r_db:.2f} dB SQNR")
+        return baseline, assigned, relative
 
     def _log_eta(self, ref_model, batches, forward_fn, n_probes, cfg, log=None):
         """Time one batch and print what the scoring run will cost.
