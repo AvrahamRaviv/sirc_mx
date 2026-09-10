@@ -475,11 +475,15 @@ def test_merge_wa_takes_each_format_from_its_own_rung():
 
 
 def test_merge_wa_keeps_deployment_accumulator():
-    """xblock_accum comes from the deployment group, never from a rung."""
+    """xblock_accum comes from the deployment group, never from a rung.
+
+    On the fp32_partial blocked path, which — unlike the HW one — can run a
+    different format per operand.
+    """
     groups = dict(_LADDER, deploy=dict(_INT8, xblock_accum={"enabled": True,
-                                                            "mode": "hw_fixed_point"}))
+                                                            "mode": "fp32_partial"}))
     _, spec = mxa.merge_wa(groups, "int4", "int8", deploy_group="deploy")
-    assert spec["xblock_accum"]["mode"] == "hw_fixed_point"
+    assert spec["xblock_accum"]["mode"] == "fp32_partial"
     assert spec["w_elem_format"] == "int4" and spec["a_elem_format"] == "int8"
 
 
@@ -582,7 +586,9 @@ def test_plan_uses_deployment_accumulator_for_probes(tmp_path):
     """Rungs set only the format; block geometry and xblock_accum come from
     mx_specs, so probes run the deployed arithmetic."""
     cfg = _auto_config()
-    cfg["mx_specs"] = _XBLOCK_HW
+    cfg["mx_specs"] = dict(_XBLOCK_HW,
+                           xblock_accum=dict(_XBLOCK_HW["xblock_accum"],
+                                             e_layer_min=-20))
     q = _quantizer(tmp_path, cfg)
     groups = cfg["groups"]
     spec = q._rung_spec("int4", groups, q._deploy_spec(cfg["auto_mixed"], groups))
@@ -989,3 +995,51 @@ def test_noise_floor_is_reported_in_meta(tmp_path):
                                   data=[torch.randn(2, 3, 16, 16)], write=False)
     assert "noise_floor_db" in plan["meta"]
     assert plan["meta"]["layers_at_noise_floor"] == 0
+
+
+# =============================================================================
+# w/a split is not deployable on every path
+# =============================================================================
+
+def test_split_wa_unsupported_on_the_hw_fixed_point_path():
+    """MXConv2dHW shifts both operands onto one accumulator grid."""
+    ok, why = mxa.split_wa_supported(_XBLOCK_HW)
+    assert not ok and "a_elem_format == w_elem_format" in why
+    assert mxa.split_wa_supported(_XBLOCK_FP)[0]     # blocked path is fine
+    assert mxa.split_wa_supported(_INT8)[0]
+
+
+def test_merge_wa_refuses_a_split_on_the_hw_path():
+    groups = dict(_LADDER, deploy=dict(_XBLOCK_HW))
+    with pytest.raises(mxa.AssignError, match="a_elem_format == w_elem_format"):
+        mxa.merge_wa(groups, "int4", "int8", deploy_group="deploy")
+
+
+def test_plan_disables_separable_wa_on_the_hw_path(tmp_path, capsys):
+    """Disabled up front, loudly — not discovered mid-probe."""
+    torch.manual_seed(0)
+    cfg = _auto_config(reference="marginal",
+                       separable_wa={"enabled": True, "refine_top": 4})
+    cfg["mx_specs"] = dict(_XBLOCK_HW,
+                           xblock_accum=dict(_XBLOCK_HW["xblock_accum"],
+                                             e_layer_min=-20))
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_CanaryNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert "separable_wa disabled" in str(plan["meta"]["separable_wa"])
+    assert "separable_wa disabled" in capsys.readouterr().out
+    # and every layer still deploys with matching formats
+    for row in plan["rows"]:
+        spec = plan["config"]["groups"][row["assigned"]]
+        assert spec["w_elem_format"] == spec["a_elem_format"]
+
+
+def test_separable_wa_still_runs_on_the_blocked_path(tmp_path):
+    torch.manual_seed(0)
+    cfg = _auto_config(reference="marginal",
+                       separable_wa={"enabled": True, "refine_top": 4})
+    cfg["mx_specs"] = _XBLOCK_FP
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_CanaryNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["separable_wa"] is True

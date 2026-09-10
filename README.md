@@ -334,6 +334,12 @@ accumulator model belongs to the deployment spec, so both are taken whole; a
 rung that tries to carry `xblock_accum` is rejected at validation, because it
 would silently change the layer class.
 
+**Not every path can split.** `MXConv2dHW` shifts both operands onto one shared
+fixed-point accumulator grid and requires `a_elem_format == w_elem_format`. With
+`xblock_accum.mode: "hw_fixed_point"`, `separable_wa` is therefore disabled
+before scoring starts, with a warning and a note in the artifact — the ladder
+still assigns, it just assigns one format per layer.
+
 ### Guards
 
 Everything checkable is checked before the first forward pass: group names,

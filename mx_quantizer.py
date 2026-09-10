@@ -390,6 +390,18 @@ class MXQuantizer:
         probe_group = cfg.get("probe_group", bottom)
         method = cfg.get("scorer", "oat_output")
 
+        # Not every deployment path can run a different format for weights and
+        # activations. Checked here, before any forward pass, because the probe
+        # that violates it does not fail until the middle of the refinement
+        # stage — with the whole scoring run already spent.
+        wa_cfg = dict(cfg.get("separable_wa") or {})
+        wa_ok, wa_why = _mxa.split_wa_supported(deploy_spec)
+        wa_note = None
+        if wa_cfg.get("enabled") and not wa_ok:
+            wa_cfg["enabled"] = False
+            wa_note = f"separable_wa disabled: {wa_why}"
+            self._log(log, f"auto_mixed | WARNING: {wa_note}")
+
         base_model, was_dp = _mxs.unwrap_parallel(model)
         candidates = self._get_candidate_layers(base_model)
         if not candidates:
@@ -471,7 +483,6 @@ class MXQuantizer:
             self._per_rung_scores(ref_model, entries, batches, forward_fn,
                                   output_fn, rungs, ladder, rows, log)
 
-        wa_cfg = cfg.get("separable_wa") or {}
         if wa_cfg.get("enabled") and batches and method == "oat_output":
             self._refine_wa(ref_model, entries, batches, forward_fn, output_fn,
                             rungs, top, probe_group, rows, wa_cfg, log)
@@ -490,7 +501,8 @@ class MXQuantizer:
                      "strategy": cfg.get("strategy", "quantile"),
                      "dataparallel_unwrapped": was_dp,
                      "n_candidates": len(candidates),
-                     "pinned": sorted(cfg.get("pins") or {})})
+                     "pinned": sorted(cfg.get("pins") or {}),
+                     "separable_wa": wa_note or bool(wa_cfg.get("enabled"))})
 
         # OAT scores every layer in the quietest possible context — everything
         # else at the top rung. The mixed net is noisier than that, so scores are

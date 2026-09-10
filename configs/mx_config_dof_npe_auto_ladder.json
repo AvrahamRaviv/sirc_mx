@@ -44,7 +44,7 @@
     "batches": 4,
     "strategy": "quantile",
     "quantile": {"int4": 0.10, "int6": 0.20, "int8": 0.70},
-    "separable_wa": {"enabled": true, "refine_top": 16},
+    "separable_wa": {"enabled": false, "_comment": "MXConv2dHW requires w and a to share a format; a split is not deployable on this path"},
     "verify": true,
     "write_artifacts": true
   },

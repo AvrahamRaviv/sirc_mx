@@ -307,6 +307,26 @@ def _cost_budget(pool, ladder, groups, auto_cfg, log=None):
 # w/a-separable merge
 # =============================================================================
 
+def split_wa_supported(deploy_spec):
+    """Can this deployment path run a different format for weights and acts?
+
+    Not everywhere. MXConv2dHW models one fixed-point datapath: both operands
+    are shifted onto a single shared accumulator grid, so it requires
+    `a_elem_format == w_elem_format` and raises at forward time otherwise. A
+    w/a-separable assignment is simply not deployable there, and finding that
+    out mid-probe wastes the whole scoring run.
+
+    Returns:
+        (ok, reason): `reason` is None when supported.
+    """
+    cfg = (deploy_spec or {}).get("xblock_accum") or {}
+    if cfg.get("enabled") and cfg.get("mode") == "hw_fixed_point":
+        return False, ("MXConv2dHW requires a_elem_format == w_elem_format — "
+                       "the fixed-point datapath shifts both operands onto one "
+                       "shared accumulator grid")
+    return True, None
+
+
 def merge_wa(groups, w_group, a_group, deploy_group=None):
     """Build one spec that takes its weight format from `w_group` and its
     activation format from `a_group`.
@@ -325,6 +345,11 @@ def merge_wa(groups, w_group, a_group, deploy_group=None):
 
     w, a = groups[w_group], groups[a_group]
     base = dict(groups[deploy_group] if deploy_group else a)
+
+    ok, why = split_wa_supported(base)
+    if not ok and w.get("w_elem_format") != a.get("a_elem_format"):
+        raise AssignError(
+            f"cannot merge '{w_group}' and '{a_group}': {why}.")
 
     for key in SHARED_KEYS:
         if key in w and key in a and w[key] != a[key]:
