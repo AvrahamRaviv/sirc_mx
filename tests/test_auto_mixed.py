@@ -744,3 +744,117 @@ def test_verification_pass_reports_the_finished_mix(tmp_path):
     verified = plan["meta"]["assigned_vs_reference"]
     assert verified["status"] == "ok"
     assert verified["sqnr_db"] is not None
+
+
+# =============================================================================
+# Hand-written layer entries survive the ladder
+# =============================================================================
+
+class _ConvTNet(nn.Module):
+    """Two convs and a ConvTranspose2d, as in the DOF decoder blocks."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.up = nn.ConvTranspose2d(32, 32, 2, stride=2)
+        self.conv2 = nn.Conv2d(32, 8, 3, padding=1)
+
+    def forward(self, x):
+        return self.conv2(self.up(self.conv1(x)))
+
+
+def _convT_config(**over):
+    """A ladder over an xblock_accum deployment spec, with the convT pinned.
+
+    The shape of configs/mx_config_dof_npe_auto_ladder.json: the accumulator
+    model lives on mx_specs, the rungs carry formats only, and the transpose
+    convolution is pinned to a group that has no accumulator model at all.
+    """
+    cfg = _auto_config(**over)
+    cfg["mx_specs"] = _XBLOCK_FP
+    cfg["groups"]["convT_plain"] = dict(_INT8)
+    cfg["layers"] = ["conv1", "conv2", {"name": "up", "group": "convT_plain"}]
+    return cfg
+
+
+def test_explicit_group_in_layers_pins_the_layer(tmp_path):
+    """A layer that already names a group is not re-assigned by the ladder."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _convT_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_ConvTNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["assignments"]["up"] == "convT_plain"
+    assert plan["assignments"]["conv1"] in ("int4", "int6", "int8")
+    assert "up" in plan["notes"]["pinned"]
+
+
+def test_pinned_group_keeps_its_own_spec(tmp_path):
+    """The pin is used raw — it does not inherit the deployment accumulator."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _convT_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_ConvTNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    groups = plan["config"]["groups"]
+    assert "xblock_accum" not in groups["convT_plain"]
+    for rung in ("int4", "int6", "int8"):
+        if rung in groups:
+            assert groups[rung]["xblock_accum"]["enabled"] is True
+
+
+def test_ladder_inherits_xblock_accum_from_mx_specs(tmp_path):
+    """Rungs may not *carry* xblock_accum, but they must inherit it.
+
+    The rejection is about what the user wrote on a rung; the merged rung spec
+    always has the deployment accumulator, and validating that would reject
+    every accumulator-model config.
+    """
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _convT_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_ConvTNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["n_candidates"] == 3
+
+
+def test_inline_layer_mx_specs_becomes_a_pinned_group(tmp_path):
+    """An inline per-layer spec is honoured, not silently dropped."""
+    torch.manual_seed(0)
+    cfg = _auto_config(reference="marginal")
+    cfg["layers"] = ["conv1", "conv3",
+                     {"name": "conv2", "mx_specs": dict(_INT8, w_elem_format="int2")}]
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_CanaryNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    group = plan["assignments"]["conv2"]
+    assert group == "fixed_conv2"
+    assert plan["config"]["groups"][group]["w_elem_format"] == "int2"
+
+
+def test_auto_mixed_pins_may_name_a_non_ladder_group(tmp_path):
+    """auto_mixed.pins is not restricted to the ladder either."""
+    torch.manual_seed(0)
+    cfg = _convT_config(reference="marginal",
+                        pins={"conv1": "convT_plain"})
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_ConvTNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["assignments"]["conv1"] == "convT_plain"
+
+
+def test_auto_mixed_pin_beats_the_layers_entry(tmp_path):
+    """The more specific statement of intent wins."""
+    torch.manual_seed(0)
+    cfg = _convT_config(reference="marginal", pins={"up": "int8"})
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_ConvTNet().eval(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["assignments"]["up"] == "int8"
+
+
+def test_unknown_group_in_layers_is_an_error(tmp_path):
+    """A typo'd group name fails before any scoring runs."""
+    cfg = _auto_config()
+    cfg["layers"] = ["conv1", {"name": "conv2", "group": "nope"}]
+    q = _quantizer(tmp_path, cfg)
+    with pytest.raises(ValueError, match="nope"):
+        q.plan_mixed_precision(_CanaryNet().eval(), data=[torch.randn(2, 3, 16, 16)],
+                               write=False)

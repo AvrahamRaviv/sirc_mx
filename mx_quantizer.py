@@ -1,3 +1,4 @@
+import re
 import math
 import os
 import json
@@ -363,7 +364,14 @@ class MXQuantizer:
         groups = self.config.get("groups", {})
         deploy_spec = self._deploy_spec(cfg, groups)
         rungs = {g: self._rung_spec(g, groups, deploy_spec) for g in cfg["ladder"]}
-        _mxa.validate(cfg, rungs, quant_probe=self._trial_quantize)
+
+        # A layer that already names a group (or its own mx_specs) in "layers"
+        # has had its decision made by hand; the ladder does not get to overrule
+        # it. Those specs are used raw, exactly as the explicit path uses them,
+        # so a group that deliberately omits xblock_accum keeps omitting it.
+        cfg, group_table = self._freeze_explicit_layers(cfg, groups, rungs)
+        _mxa.validate(cfg, rungs, quant_probe=self._trial_quantize,
+                      all_groups=group_table, raw_groups=groups)
 
         ladder = list(cfg["ladder"])
         top, bottom = ladder[-1], ladder[0]
@@ -385,9 +393,8 @@ class MXQuantizer:
         # out_quant hooks are all in place — the scorer must see the deployed
         # arithmetic, not an approximation of it.
         ref_model = copy.deepcopy(base_model)
-        ref_specs = self._build_mx_specs(rungs[top])
-        self._replace_layers(ref_model, layer_map={n: ref_specs for n in candidates},
-                             verbose=0)
+        ref_map = self._reference_map(candidates, cfg, group_table, top)
+        self._replace_layers(ref_model, layer_map=ref_map, verbose=0)
 
         types = (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)
         entries = _mxs.resolve_bindings(ref_model, candidates, types)
@@ -443,10 +450,11 @@ class MXQuantizer:
         if wa_cfg.get("enabled") and batches and method == "oat_output":
             self._refine_wa(ref_model, entries, batches, forward_fn, output_fn,
                             rungs, top, probe_group, rows, wa_cfg, log)
-        assignments, notes = _mxa.assign(rows, cfg, rungs, log=lambda m: self._log(log, m))
+        assignments, notes = _mxa.assign(rows, cfg, group_table,
+                                         log=lambda m: self._log(log, m))
         assignments = self._apply_wa_split(assignments, rows, ladder, wa_cfg, log)
-        flat, extra = _mxa.resolve_groups(assignments, rungs, deploy_group=None)
-        summary = _mxa.cost_summary(flat, rungs, extra, costs)
+        flat, extra = _mxa.resolve_groups(assignments, group_table, deploy_group=None)
+        summary = _mxa.cost_summary(flat, group_table, extra, costs)
 
         for row in rows:
             row["assigned"] = flat.get(row["name"])
@@ -456,18 +464,19 @@ class MXQuantizer:
                      "reference_group": top, "ladder": ladder,
                      "strategy": cfg.get("strategy", "quantile"),
                      "dataparallel_unwrapped": was_dp,
-                     "n_candidates": len(candidates)})
+                     "n_candidates": len(candidates),
+                     "pinned": sorted(cfg.get("pins") or {})})
 
         # OAT scores every layer in the quietest possible context — everything
         # else at the top rung. The mixed net is noisier than that, so scores are
         # optimistic. One extra pass measures what was actually bought.
         if batches and cfg.get("verify", True):
             meta["assigned_vs_reference"] = self._verify_assignment(
-                base_model, candidates, flat, extra, rungs, top, batches,
+                base_model, ref_map, flat, extra, group_table, top, batches,
                 forward_fn, output_fn, log)
 
         resolved = _mxa.build_resolved_config(
-            self.config, flat, rungs, extra,
+            self.config, flat, group_table, extra,
             provenance={"generated_by": "MXQuantizer.plan_mixed_precision",
                         "scorer": method, "probe_group": probe_group,
                         "reference_group": top})
@@ -509,21 +518,21 @@ class MXQuantizer:
         for row in rows:
             row.setdefault("per_rung", {})[ladder[-1]] = 0.0   # the reference itself
 
-    def _verify_assignment(self, base_model, candidates, assignments, extra,
-                           rungs, top, batches, forward_fn, output_fn, log=None):
+    def _verify_assignment(self, base_model, ref_map, assignments, extra,
+                           group_table, top, batches, forward_fn, output_fn,
+                           log=None):
         """Measure the finished mixed network against the reference network.
 
         The number that actually matters, and the one no per-layer score can
         give you: every demotion is in place at once, so the interactions the
         one-at-a-time scheme cannot see are included.
         """
-        all_groups = dict(rungs)
+        all_groups = dict(group_table)
         all_groups.update(extra)
         output_fn = output_fn or _mxs.flatten_outputs
 
         ref = copy.deepcopy(base_model)
-        top_specs = self._build_mx_specs(rungs[top])
-        self._replace_layers(ref, layer_map={n: top_specs for n in candidates}, verbose=0)
+        self._replace_layers(ref, layer_map=ref_map, verbose=0)
 
         mixed = copy.deepcopy(base_model)
         self._replace_layers(mixed, layer_map={
@@ -677,6 +686,74 @@ class MXQuantizer:
         if split and log is not None:
             print(f"[MXQuantizer] auto_mixed | {split} layer(s) got a split w/a format")
         return assignments
+
+    def _reference_map(self, candidates, cfg, group_table, top):
+        """The baseline every score is measured against.
+
+        Every candidate at the top rung, except the pinned ones, which sit at
+        the format they were pinned to. A pinned layer is not going to move, so
+        putting it anywhere else would measure the other layers against a
+        network that will never exist.
+        """
+        pins = cfg.get("pins") or {}
+        out = {}
+        for name in candidates:
+            pin = pins.get(name)
+            group = pin if isinstance(pin, str) else top
+            out[name] = self._build_mx_specs(group_table[group])
+        return out
+
+    def _freeze_explicit_layers(self, cfg, groups, rungs):
+        """Turn hand-written per-layer decisions into pins.
+
+        Under `auto_mixed` the ladder assigns a group to every candidate, which
+        would quietly overwrite a `{"name": ..., "group": ...}` entry the user
+        wrote on purpose. Those entries are the escape hatch for layers the
+        ladder cannot describe — a ConvTranspose2d that must stay plain MX while
+        the ladder inherits `xblock_accum`, say — so they become pins instead.
+
+        Pinned groups are taken **raw** from `groups`, not merged onto the
+        deployment spec: the point of pinning a layer to `convT_plain` is that
+        it does *not* get the accumulator model, and a merge would put it back.
+
+        An explicit `auto_mixed.pins` entry wins over the `layers` entry for the
+        same layer, since it is the more specific statement of intent.
+
+        Returns:
+            (cfg, group_table): `cfg` with the merged pins, and the group table
+            to assign from — the rungs plus every group a pin names.
+        """
+        frozen, table = {}, dict(rungs)
+        for entry in self.config.get("layers", []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("kind") in ("act_quant", "out_quant"):
+                continue
+            name = entry.get("name")
+            if not name:
+                continue
+            if "mx_specs" in entry:
+                # An inline spec has no name to pin to, so give it one. Without
+                # this the spec would be silently discarded by the ladder.
+                gname = "fixed_" + re.sub(r"[^0-9A-Za-z]+", "_", name).strip("_")
+                table[gname] = dict(entry["mx_specs"])
+                frozen[name] = gname
+            elif "group" in entry:
+                gname = entry["group"]
+                if gname not in groups:
+                    raise ValueError(
+                        f"layer '{name}' references group '{gname}', which is "
+                        f"not defined in 'groups'")
+                table.setdefault(gname, dict(groups[gname]))
+                frozen[name] = gname
+
+        if not frozen:
+            return cfg, table
+
+        pins = dict(frozen)
+        pins.update(cfg.get("pins") or {})
+        cfg = dict(cfg, pins=pins)
+        return cfg, table
 
     def _deploy_spec(self, cfg, groups):
         """The spec that carries block geometry and the accumulator model.

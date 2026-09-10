@@ -38,12 +38,27 @@ class AssignError(ValueError):
 # Validation — everything checkable before a single forward pass
 # =============================================================================
 
-def validate(auto_cfg, groups, quant_probe=None):
+def validate(auto_cfg, groups, quant_probe=None, all_groups=None, raw_groups=None):
     """Check an auto_mixed block against the available groups.
 
     Runs before scoring on purpose: a typo'd group name or an element format the
     library does not implement should cost a second, not a twenty-minute scoring
     run followed by a crash.
+
+    Args:
+        groups: the ladder rungs; every constraint about formats and shared keys
+            applies to these.
+        all_groups: every group a pin may name. A pin is allowed to point at a
+            group that is not on the ladder — that is how a layer opts out of
+            the ladder's block geometry or accumulator model entirely, e.g. a
+            ConvTranspose2d pinned to a plain-MX group while the ladder carries
+            xblock_accum. Defaults to `groups`.
+        raw_groups: the ladder groups as written in the config, before the
+            deployment spec was merged in. The structural checks below are about
+            what the *user* put on a rung, and `groups` has by then inherited
+            block geometry and xblock_accum from the deployment spec — checking
+            the merged specs would reject every accumulator-model config.
+            Defaults to `groups`.
     """
     ladder = auto_cfg.get("ladder") or []
     if not ladder:
@@ -56,7 +71,8 @@ def validate(auto_cfg, groups, quant_probe=None):
             f"auto_mixed.ladder references undefined group(s) {unknown}; "
             f"defined groups are {sorted(groups)}")
 
-    for name, spec in ((g, groups[g]) for g in ladder):
+    raw = raw_groups if raw_groups is not None else groups
+    for name, spec in ((g, raw[g]) for g in ladder if g in raw):
         if spec.get("xblock_accum") is not None:
             raise AssignError(
                 f"ladder group '{name}' carries xblock_accum. That selects the "
@@ -66,7 +82,7 @@ def validate(auto_cfg, groups, quant_probe=None):
                 f"instead.")
 
     for key in SHARED_KEYS:
-        seen = {groups[g][key] for g in ladder if key in groups[g]}
+        seen = {raw[g][key] for g in ladder if g in raw and key in raw[g]}
         if len(seen) > 1:
             raise AssignError(
                 f"ladder groups disagree on '{key}' ({sorted(map(str, seen))}). "
@@ -95,9 +111,10 @@ def validate(auto_cfg, groups, quant_probe=None):
             f"Unknown auto_mixed strategy {strategy!r}. "
             f"Use 'quantile', 'threshold' or 'cost_budget'.")
 
+    pin_groups = all_groups if all_groups is not None else groups
     for layer, pin in (auto_cfg.get("pins") or {}).items():
         for g in ([pin] if isinstance(pin, str) else list(pin.values())):
-            if g not in groups:
+            if g not in pin_groups:
                 raise AssignError(
                     f"pin for '{layer}' references undefined group '{g}'")
 

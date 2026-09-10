@@ -223,6 +223,44 @@ demoting a layer changes its precision and nothing else about how it runs — a
 probe measures the arithmetic that will actually be deployed, HW accumulator
 included.
 
+### Which layers the ladder covers
+
+No `layers` key: every `Conv2d` / `ConvTranspose2d` / `Linear` in the model is a
+candidate. With a `layers` list, only those names are — that is how a layer is
+kept in FP32 entirely. (`"layers": []` means "quantize nothing" and is an error
+under `auto_mixed`.)
+
+A layer entry that already names a `group` — or carries its own `mx_specs` — is
+a decision made by hand, so the ladder does not overrule it: it becomes a **pin**
+and keeps that spec **raw**, without inheriting the deployment `mx_specs`. That
+is the escape hatch for layers the ladder cannot describe. The usual case is a
+`ConvTranspose2d` on the NPE path: it has no HW/blocked variant, so it is pinned
+to a plain-MX group while the ladder rungs keep the accumulator model.
+
+```json
+"groups": {
+  "int4": {"w_elem_format": "int4", "a_elem_format": "int4"},
+  "convT_plain": {"w_elem_format": "int8", "a_elem_format": "int8",
+                  "block_size": 32, "scale_bits": 8,
+                  "shared_exp_method": "max", "custom_cuda": true}
+},
+"layers": [
+  "model.block2.conv0.0.0",
+  {"name": "model.block2.convtranspose_2", "group": "convT_plain"}
+]
+```
+
+`auto_mixed.pins` does the same thing and wins over the `layers` entry for the
+same layer. Pinned layers are still scored and still appear in the table — you
+see what the pin cost — they are just not re-assigned, and they sit at their
+pinned format in the reference network too, since that is the network that will
+exist. `act_quant` / `out_quant` entries are never candidates and are carried
+into the resolved config untouched.
+
+`configs/mx_config_dof_npe_auto_ladder.json` is a complete worked example: the
+DOF net on the NPE Triton path, 30 convs on an int4/int6/int8 ladder and 5
+transpose convs pinned to plain MX.
+
 ### Scorers
 
 | `scorer` | Cost | What it measures |

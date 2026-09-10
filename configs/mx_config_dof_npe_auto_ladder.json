@@ -1,0 +1,107 @@
+{
+  "_comment": "DOF on the NPE HW path, precision chosen automatically. mx_specs is the deployment spec: block geometry and the fixed-point accumulator model come from here and never change. The ladder groups say only which element format a layer runs at. Step 1: MXQuantizer(save_dir).plan_mixed_precision(model, data=..., forward_fn=...) -> sensitivity.json + mx_config_resolved.json. Step 2: train against mx_config_resolved.json.",
+
+  "mx_specs": {
+    "w_elem_format": "int8",
+    "a_elem_format": "int8",
+    "block_size": 32,
+    "scale_bits": 8,
+    "shared_exp_method": "max",
+    "custom_cuda": true,
+    "xblock_accum": {
+      "enabled": true,
+      "mode": "hw_fixed_point",
+      "bits": 48,
+      "sat_mode": "per_product",
+      "e_layer_min": -20,
+      "weight_blockify": "flatten",
+      "act_blockify": "xblock",
+      "backend": "triton",
+      "npe_triton_variant": "reuse"
+    }
+  },
+
+  "groups": {
+    "int4": {"w_elem_format": "int4", "a_elem_format": "int4"},
+    "int6": {"w_elem_format": "int6", "a_elem_format": "int6"},
+    "int8": {"w_elem_format": "int8", "a_elem_format": "int8"},
+
+    "convT_plain": {
+      "w_elem_format": "int8",
+      "a_elem_format": "int8",
+      "block_size": 32,
+      "scale_bits": 8,
+      "shared_exp_method": "max",
+      "custom_cuda": true
+    }
+  },
+
+  "auto_mixed": {
+    "ladder": ["int4", "int6", "int8"],
+    "scorer": "oat_output",
+    "probe": "bottom",
+    "reference": "both",
+    "batches": 4,
+    "strategy": "quantile",
+    "quantile": {"int4": 0.10, "int6": 0.20, "int8": 0.70},
+    "separable_wa": {"enabled": true, "refine_top": 16},
+    "verify": true,
+    "write_artifacts": true
+  },
+
+  "layers": [
+    "model.block2.conv0.0.0",
+    "model.block2.conv0.1.0",
+    "model.block2.convblock.0.0",
+    "model.block2.convblock.1.0",
+    "model.block2.convblock.2.0",
+    "model.block2.convblock.3.0",
+    "model.block2.convblock.4.0",
+    "model.block2.convblock.5.0",
+    "model.block3.conv0.0.0",
+    "model.block3.conv0.1.0",
+    "model.block3.convblock.0.0",
+    "model.block3.convblock.1.0",
+    "model.block3.convblock.2.0",
+    "model.block3.convblock.3.0",
+    "model.block3.convblock.4.0",
+    "model.block3.convblock.5.0",
+    "model.block4.conv0.0.0",
+    "model.block4.conv0.1.0",
+    "model.block4.convblock.0.0",
+    "model.block4.convblock.1.0",
+    "model.block4.convblock.2.0",
+    "model.block4.convblock.3.0",
+    "model.block4.convblock.4.0",
+    "model.block4.convblock.5.0",
+    "model.feature_pyramid_extractor.convs.0.0.0",
+    "model.feature_pyramid_extractor.convs.0.1.0",
+    "model.feature_pyramid_extractor.convs.1.0.0",
+    "model.feature_pyramid_extractor.convs.1.1.0",
+    "model.feature_pyramid_extractor.convs.2.0.0",
+    "model.feature_pyramid_extractor.convs.2.1.0",
+
+    {"name": "model.block2.conv1",           "group": "convT_plain"},
+    {"name": "model.block2.convtranspose_2", "group": "convT_plain"},
+    {"name": "model.block3.conv1",           "group": "convT_plain"},
+    {"name": "model.block3.convtranspose_2", "group": "convT_plain"},
+    {"name": "model.block4.conv1",           "group": "convT_plain"},
+
+    {"name": "model.warp", "kind": "act_quant",
+     "inputs": [
+       {"mx_specs": {"a_elem_format": "int8", "block_size": 32, "scale_bits": 8,
+                     "shared_exp_method": "max", "custom_cuda": true},
+        "axes": [-1]},
+       {"mx_specs": {"a_elem_format": "int8", "block_size": 32, "scale_bits": 8,
+                     "shared_exp_method": "max", "custom_cuda": true},
+        "axes": [-1]}
+     ]},
+
+    {"name": "model", "kind": "out_quant",
+     "total_bits": 16, "frac_bits": 8, "signed": true,
+     "round": "half_away", "saturate": true, "clip_grad": false}
+  ],
+
+  "ptq": false,
+  "measure_error": false
+}
