@@ -388,6 +388,19 @@ class MXQuantizer:
 
         batches = _mxs.materialize(data, int(cfg.get("batches", 8)))
 
+        # A DataLoader hands out CPU tensors and the training loop moves them to
+        # the GPU itself; nothing here would have. Mixed devices are not always
+        # a loud failure — the HW fixed-point conv selects its Triton kernel on
+        # `qi.is_cuda`, so CPU activations would quietly fall back to the torch
+        # reference and score arithmetic the deployment never runs.
+        if batches and cfg.get("move_batches", True):
+            device = _mxs.model_device(base_model)
+            if device is not None:
+                batches, n_moved = _mxs.to_device(batches, device)
+                if n_moved:
+                    self._log(log, f"auto_mixed | moved {n_moved} batch tensor(s) "
+                                   f"to {device}")
+
         # The reference network: every candidate at the top rung, built through
         # the normal replacement path so xblock_accum, act_quant wrapping and
         # out_quant hooks are all in place — the scorer must see the deployed

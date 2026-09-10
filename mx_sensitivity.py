@@ -98,6 +98,50 @@ def materialize(data, max_batches):
     return out
 
 
+def model_device(model):
+    """The device a model's parameters live on, or None if it has none."""
+    for p in model.parameters():
+        return p.device
+    for b in model.buffers():
+        return b.device
+    return None
+
+
+def to_device(obj, device):
+    """Recursively move every tensor in a batch to `device`.
+
+    A DataLoader yields CPU tensors; a training loop moves them to the GPU
+    itself, so a loader handed straight to the scorer would run CPU activations
+    against CUDA weights. Some of that fails loudly, but not all of it — the HW
+    fixed-point path silently drops to its torch reference because it tests
+    `qi_fp.is_cuda` — so normalize once, up front.
+
+    Returns:
+        (obj, n_moved): the converted batch and how many tensors actually moved.
+    """
+    moved = [0]
+
+    def walk(x):
+        if torch.is_tensor(x):
+            if x.device != device:
+                moved[0] += 1
+                return x.to(device)
+            return x
+        if isinstance(x, dict):
+            return type(x)((k, walk(v)) for k, v in x.items())
+        if isinstance(x, tuple):
+            # namedtuple keeps its fields; a plain tuple stays a tuple.
+            if hasattr(x, "_fields"):
+                return type(x)(*(walk(v) for v in x))
+            return tuple(walk(v) for v in x)
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        return x                      # str, int, None, anything else: as-is
+
+    out = walk(obj)
+    return out, moved[0]
+
+
 def default_forward(model, batch, forward_fn=None):
     """Run one calibration batch, matching MXQuantizer's dispatch rules."""
     if forward_fn is not None:

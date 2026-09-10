@@ -858,3 +858,33 @@ def test_unknown_group_in_layers_is_an_error(tmp_path):
     with pytest.raises(ValueError, match="nope"):
         q.plan_mixed_precision(_CanaryNet().eval(), data=[torch.randn(2, 3, 16, 16)],
                                write=False)
+
+
+# =============================================================================
+# Calibration batches meet the model's device
+# =============================================================================
+
+def test_to_device_walks_nested_batches():
+    """Dicts, lists, tuples and namedtuples all get their tensors moved."""
+    import mx_sensitivity as mxs
+    batch = {"img1": torch.zeros(2), "meta": ["a", torch.ones(2)],
+             "pair": (torch.ones(1), 3)}
+    out, n = mxs.to_device(batch, torch.device("cpu"))
+    assert n == 0                      # already there: nothing moved, no copies
+    assert out["meta"][0] == "a"
+    assert out["pair"][1] == 3
+    assert torch.is_tensor(out["img1"])
+
+
+def test_to_device_leaves_non_tensors_alone():
+    """Strings, ints and None survive the walk untouched."""
+    import mx_sensitivity as mxs
+    out, n = mxs.to_device({"name": "x", "k": None, "n": 7}, torch.device("cpu"))
+    assert out == {"name": "x", "k": None, "n": 7}
+    assert n == 0
+
+
+def test_model_device_reports_parameter_device():
+    import mx_sensitivity as mxs
+    assert mxs.model_device(_CanaryNet()).type == "cpu"
+    assert mxs.model_device(nn.Module()) is None
