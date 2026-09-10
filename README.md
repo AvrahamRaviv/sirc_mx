@@ -189,6 +189,23 @@ assignment you disagree with.
 
 `quant()` also runs the whole thing in one call when `auto_mixed` has a `ladder`.
 
+### plan() then quant()
+
+`quant()` reads the same `auto_mixed` block, so calling both would score twice.
+A plan already computed on that quantizer is reused:
+
+```python
+quantizer = MXQuantizer(save_dir=save_root, log=log)
+quantizer.plan_mixed_precision(model, data=train_loader, forward_fn=fwd)
+model = quantizer.quant(model, data=None, log=log)      # installs that plan
+```
+
+Set `auto_mixed.replan` to force a fresh scoring run. Skipping `plan()` entirely
+and calling `quant(model, data=train_loader, forward_fn=fwd)` also works — it
+plans inline — but then nothing is reviewed before training starts. The plan on
+disk is the point: `mx_config_resolved.json` has no `auto_mixed` key, so a
+quantizer pointed at it is a deterministic replay with nothing left to re-derive.
+
 ### Config
 
 ```json

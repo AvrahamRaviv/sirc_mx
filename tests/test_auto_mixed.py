@@ -888,3 +888,44 @@ def test_model_device_reports_parameter_device():
     import mx_sensitivity as mxs
     assert mxs.model_device(_CanaryNet()).type == "cpu"
     assert mxs.model_device(nn.Module()) is None
+
+
+# =============================================================================
+# plan_mixed_precision() then quant()
+# =============================================================================
+
+def test_quant_reuses_a_precomputed_plan(tmp_path):
+    """plan() then quant(data=None) installs the plan instead of re-scoring.
+
+    Re-scoring would need calibration data quant() was not given, and with a
+    shuffled loader would assign layers differently than the plan on disk.
+    """
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    model = _CanaryNet().eval()
+    plan = q.plan_mixed_precision(model, data=[torch.randn(2, 3, 16, 16)], write=False)
+
+    quantized = q.quant(model, data=None)
+    for name, group in plan["assignments"].items():
+        spec = getattr(quantized, name).mx_specs
+        assert spec["w_elem_format"] == plan["config"]["groups"][group]["w_elem_format"]
+
+
+def test_quant_replans_when_asked(tmp_path):
+    """auto_mixed.replan forces a fresh scoring run."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal", replan=True))
+    model = _CanaryNet().eval()
+    q.plan_mixed_precision(model, data=[torch.randn(2, 3, 16, 16)], write=False)
+    with pytest.raises(ValueError, match="needs calibration data"):
+        q.quant(model, data=None)
+
+
+def test_quant_without_a_plan_still_scores_inline(tmp_path):
+    """One-step use: quant() alone plans and installs."""
+    torch.manual_seed(0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    quantized = q.quant(_CanaryNet().eval(), data=[torch.randn(2, 3, 16, 16)])
+    formats = {getattr(quantized, n).mx_specs["w_elem_format"]
+               for n in ("conv1", "conv2", "conv3")}
+    assert formats <= {"int4", "int6", "int8"}

@@ -184,6 +184,7 @@ class MXQuantizer:
         self.save_dir = save_dir
         self.config_path = os.path.join(save_dir, "mx_config.json")
         self.config = self._load_config()
+        self._last_plan = None        # set by plan_mixed_precision, read by quant
         if log is not None:
             log.info(f"Load MX configuration from: {self.save_dir}")
 
@@ -230,10 +231,21 @@ class MXQuantizer:
         groups = self.config.get("groups", {})
 
         if auto_mixed and "ladder" in auto_mixed:
-            # New N-rung path: score, assign, write the plan, then install it.
-            plan = self.plan_mixed_precision(
-                fp32_model, data=data, forward_fn=forward_fn, log=log,
-                write=auto_mixed.get("write_artifacts", True))
+            # New N-rung path: score, assign, install.
+            # A plan already computed on this quantizer is reused rather than
+            # re-scored: scoring costs real forward passes, and with a shuffled
+            # loader a second pass would quietly produce a different assignment
+            # than the one written to disk and reviewed. `replan: true` forces
+            # a fresh one.
+            plan = self._last_plan
+            if plan is not None and not auto_mixed.get("replan", False):
+                self._log(log, "auto_mixed | reusing the plan from "
+                               "plan_mixed_precision() (set auto_mixed.replan "
+                               "to re-score)")
+            else:
+                plan = self.plan_mixed_precision(
+                    fp32_model, data=data, forward_fn=forward_fn, log=log,
+                    write=auto_mixed.get("write_artifacts", True))
             all_groups = dict(plan["config"]["groups"])
             layer_map = {name: self._build_mx_specs(all_groups[grp])
                          for name, grp in plan["assignments"].items()}
@@ -504,9 +516,10 @@ class MXQuantizer:
             self._log(log, f"auto_mixed | wrote sensitivity.json and "
                            f"mx_config_resolved.json to {self.save_dir}")
 
-        return {"scores": scores, "assignments": flat, "rows": rows,
-                "summary": summary, "config": resolved, "meta": meta,
-                "notes": notes}
+        self._last_plan = {"scores": scores, "assignments": flat, "rows": rows,
+                           "summary": summary, "config": resolved, "meta": meta,
+                           "notes": notes}
+        return self._last_plan
 
     def _per_rung_scores(self, ref_model, entries, batches, forward_fn, output_fn,
                          rungs, ladder, rows, log=None):
