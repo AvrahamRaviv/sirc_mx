@@ -451,6 +451,137 @@ def cost_summary(assignments, groups, extra_groups, costs):
 
 
 # =============================================================================
+# Reuse — replaying a saved score set instead of re-measuring it
+# =============================================================================
+
+SCHEMA_VERSION = 1
+
+# What a cached score set is allowed to be reused across. Anything not listed
+# here is free to change between runs, and changing it is the whole point of
+# reuse: ladder fractions, thresholds, budgets, pins and strategy are decided
+# at assignment time and cost nothing to redo.
+FINGERPRINT_KEYS = ("model", "layers", "probe_spec", "reference_spec")
+
+_FINGERPRINT_WHY = {
+    "model": "model weights changed",
+    "layers": "the candidate layer set changed",
+    "probe_spec": "the probe rung's spec changed",
+    "reference_spec": "the reference rung's spec changed",
+    "input_shape": "the calibration input shape changed",
+}
+
+
+def load_sensitivity(path):
+    """Read back a sensitivity.json written by `write_sensitivity`.
+
+    Returns (meta, rows, summary). Rows come back in the shape `assign()` takes,
+    which is the same shape they were written in — the artifact is a verbatim
+    dump of them, so a replay is a replay and not a reconstruction.
+    """
+    with open(path) as f:
+        blob = json.load(f)
+    if not isinstance(blob, dict) or not isinstance(blob.get("layers"), list):
+        raise AssignError(f"{path}: not a sensitivity artifact "
+                          f"(expected an object with a 'layers' list)")
+    version = blob.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise AssignError(f"{path}: schema_version {version!r}, this build "
+                          f"writes {SCHEMA_VERSION}. Delete it and re-score.")
+    rows = [dict(row) for row in blob["layers"]]
+    for row in rows:
+        if "name" not in row:
+            raise AssignError(f"{path}: a row has no 'name'")
+        row["name"] = clean_name(row["name"])
+    return dict(blob.get("meta") or {}), rows, dict(blob.get("summary") or {})
+
+
+def costs_from_rows(rows):
+    """Rebuild the {layer: {macs, params}} table `cost_summary` needs.
+
+    This is why `cost` is written per row: MACs come from shape hooks on a real
+    forward, and carrying them in the artifact is what makes a replay need no
+    model and no data.
+    """
+    return {row["name"]: dict(row.get("cost") or {}) for row in rows}
+
+
+def reuse_verdict(meta, expected, rows, candidates, auto_cfg):
+    """Decide whether a cached score set may be replayed.
+
+    Returns (ok, reasons). `reasons` is never empty when ok is False, and is
+    phrased for a log line a human reads six weeks later.
+
+    The check is deliberately conservative: a false reject costs one scoring
+    run, a false accept costs a wrong precision assignment that looks entirely
+    reasonable and is never questioned again.
+    """
+    reasons = []
+    cached = dict(meta.get("fingerprint") or {})
+    if not cached:
+        return False, ["artifact predates fingerprinting (no meta.fingerprint)"]
+
+    for key in FINGERPRINT_KEYS:
+        want = expected.get(key)
+        got = cached.get(key)
+        if want is None:
+            continue
+        if got is None:
+            reasons.append(f"cached artifact has no {key} fingerprint")
+        elif got != want:
+            reasons.append(_FINGERPRINT_WHY[key])
+
+    # Input shape is checked only when both sides know it. A replay with no
+    # calibration data cannot compute it, and refusing on that would make the
+    # data-free path — the cheapest and most useful one — impossible.
+    want_shape, got_shape = expected.get("input_shape"), cached.get("input_shape")
+    if want_shape is not None and got_shape is not None and want_shape != got_shape:
+        reasons.append(_FINGERPRINT_WHY["input_shape"])
+
+    scored = {row["name"] for row in rows}
+    missing = sorted(clean_name(n) for n in candidates
+                     if clean_name(n) not in scored)
+    if missing:
+        head = ", ".join(missing[:3])
+        more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
+        reasons.append(f"{len(missing)} candidate layer(s) are not in the "
+                       f"artifact: {head}{more}")
+
+    # cost_budget prices a demotion in dB per rung, so a rank alone will not do.
+    # A "bottom"-probed artifact has null per_rung and must be refused here
+    # rather than produce a budget built on missing data.
+    if auto_cfg.get("strategy") == "cost_budget":
+        ladder = list(auto_cfg["ladder"])
+        need = set(ladder[:-1])
+        for row in rows:
+            if row.get("status") in UNMEASURED or row.get("sensitivity") is None:
+                continue
+            have = {k for k, v in (row.get("per_rung") or {}).items()
+                    if v is not None}
+            if not need <= have:
+                reasons.append(
+                    f"strategy 'cost_budget' needs a per-rung curve for "
+                    f"{sorted(need)}, and the artifact has "
+                    f"{sorted(have) or 'none'} for '{row['name']}' "
+                    f"(re-score with probe: \"all_rungs\")")
+                break
+
+    return (not reasons), reasons
+
+
+def rows_have_wa(rows):
+    """True if the artifact carries the w-only / a-only scores a separable
+    assignment needs. A replay cannot produce them — they come from extra
+    probes — so a run that wants them and does not have them must be told."""
+    for row in rows:
+        if row.get("status") in UNMEASURED:
+            continue
+        scores = row.get("scores") or {}
+        if scores.get("w") is not None and scores.get("a") is not None:
+            return True
+    return False
+
+
+# =============================================================================
 # Artifacts
 # =============================================================================
 
@@ -458,7 +589,8 @@ def write_sensitivity(path, meta, rows, summary):
     """Write sensitivity.json — the reviewable record of why each layer got
     the format it got. Rows are pre-sorted worst-first so the file reads top
     down and diffs stay stable between runs."""
-    blob = {"schema_version": 1, "meta": meta, "layers": rows, "summary": summary}
+    blob = {"schema_version": SCHEMA_VERSION, "meta": meta, "layers": rows,
+            "summary": summary}
     with open(path, "w") as f:
         json.dump(_round_floats(blob), f, indent=2)
     return path

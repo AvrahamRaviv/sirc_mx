@@ -206,6 +206,58 @@ plans inline — but then nothing is reviewed before training starts. The plan o
 disk is the point: `mx_config_resolved.json` has no `auto_mixed` key, so a
 quantizer pointed at it is a deterministic replay with nothing left to re-derive.
 
+### Reusing a score set (`reuse`)
+
+Sensitivity is a property of the **weights, the candidate layer set, the probe
+rung and the reference rung** — and of nothing else. Ladder fractions,
+thresholds, budgets, pins and strategy are applied afterwards, in `assign()`,
+and cost nothing. So tuning a ladder does not need a second scoring run.
+
+`plan_mixed_precision` therefore replays `save_dir/sensitivity.json` when it
+finds one, and re-scores when it does not:
+
+```json
+"auto_mixed": {"reuse": "auto"}
+```
+
+| value | behaviour |
+|---|---|
+| `"auto"` *(default)* | replay when every fingerprint matches, otherwise re-score and overwrite |
+| `"force"` | replay whatever is on disk, stale or not |
+| `false` | always re-score |
+
+Nothing about this is silent. Every run logs which half happened, and a re-score
+logs why:
+
+```
+auto_mixed | REUSED sensitivity.json (30/35 layers measured, scorer=oat_output,
+             probed at int4, scored 2026-09-16T11:04:22) — no scoring passes this run
+auto_mixed | re-scoring, cached sensitivity is stale: model weights changed
+```
+
+**The guard is the feature.** A stale score set does not crash — it produces a
+confident, plausible, wrong precision assignment that nobody questions again. So
+`meta.fingerprint` records a hash of the parameter *values* of every candidate
+layer (a fine-tune keeps every shape identical), the candidate name set, and the
+resolved probe and reference specs (adding `block_size: 16` to the int4 rung
+leaves its *name* `int4` and changes the arithmetic every probe ran under). Any
+mismatch re-scores. The calibration input shape is checked too, when both sides
+know it — cached `cost.macs` comes from shape hooks on a real forward.
+
+Two further refusals, both because a replay cannot invent data it never measured:
+`strategy: "cost_budget"` against an artifact probed at `"bottom"` (a rank is not
+a price — re-score with `probe: "all_rungs"`), and `separable_wa` against an
+artifact with no w/a columns, which logs a warning and falls back to joint
+assignment rather than splitting blind.
+
+The `verify` pass still runs on a replay. It is two forward passes, not N, and it
+is the only thing that can catch a cache which passed every fingerprint and is
+still wrong.
+
+`reuse` and `replan` are different caches and compose: `replan` controls whether
+`quant()` re-calls `plan_mixed_precision` at all, `reuse` controls whether that
+call probes or replays.
+
 ### Config
 
 ```json
@@ -229,6 +281,7 @@ quantizer pointed at it is a deterministic replay with nothing left to re-derive
     "strategy": "quantile",
     "quantile": {"int4": 0.10, "int6": 0.20, "int8": 0.70},
     "separable_wa": {"enabled": true, "refine_top": 16},
+    "reuse": "auto",
     "pins": {"model.head.cls": "int8"}
   }
 }

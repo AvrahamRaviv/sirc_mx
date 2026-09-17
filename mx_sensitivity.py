@@ -17,6 +17,8 @@ what an assignment ladder wants. Layers with no usable measurement carry
 `sensitivity: None` and a `status` saying why; they are never silently ranked.
 """
 
+import hashlib
+import json
 import math
 import os
 import sys
@@ -72,6 +74,89 @@ def unwrap_parallel(model):
     if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
         return model.module, True
     return model, False
+
+
+# =============================================================================
+# Fingerprints — what makes a cached score set still valid
+# =============================================================================
+
+def _digest(*parts):
+    h = hashlib.sha1()
+    for part in parts:
+        h.update(part if isinstance(part, bytes) else str(part).encode())
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def model_fingerprint(model, names=None):
+    """Hash the weights a sensitivity run would have measured.
+
+    A cached score says "demoting this layer costs N dB". That sentence is only
+    true for the weights it was measured on, so reusing an artifact across a
+    retrained checkpoint would hand back a confident, wrong ranking — the one
+    failure mode in this pipeline that produces no error and no symptom. The
+    hash covers parameter *values*, not just shapes, because a fine-tune keeps
+    every shape identical.
+
+    `names` restricts the hash to the candidate layers (cleaned). A change in a
+    layer nobody scores cannot invalidate the scores.
+    """
+    wanted = None if names is None else {clean_name(n) for n in names}
+    h = hashlib.sha1()
+    for raw, mod in model.named_modules():
+        name = clean_name(raw)
+        if wanted is not None and name not in wanted:
+            continue
+        params = sorted(mod.named_parameters(recurse=False), key=lambda kv: kv[0])
+        if not params:
+            continue
+        h.update(name.encode())
+        h.update(type(mod).__name__.encode())
+        for pname, tensor in params:
+            h.update(pname.encode())
+            h.update(str(tuple(tensor.shape)).encode())
+            flat = tensor.detach().to("cpu", torch.float32).contiguous()
+            h.update(flat.numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def spec_fingerprint(spec):
+    """Hash a rung spec.
+
+    `meta` records rung *names*, which is not enough: adding `block_size: 16` to
+    the int4 rung changes the arithmetic every probe ran under while leaving the
+    name "int4" untouched. Hashing the resolved spec catches that.
+    """
+    return _digest(json.dumps(spec, sort_keys=True, default=str))
+
+
+def names_fingerprint(names):
+    """Hash the candidate set. Fractions are apportioned over its size, so a
+    layer added or removed changes every rung boundary."""
+    return _digest(*sorted(clean_name(n) for n in names))
+
+
+def batch_shape_sig(batch):
+    """Shape signature of one calibration batch, or None if it holds no tensors.
+
+    Cached MACs come from shape hooks on a real forward, so they are tied to the
+    input resolution. A different resolution leaves the ranking plausible but
+    silently mis-weights `macs_weighted_avg_bits` and any cost_budget decision.
+    """
+    shapes = []
+
+    def walk(obj):
+        if torch.is_tensor(obj):
+            shapes.append(tuple(obj.shape[1:]))
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                walk(item)
+        elif isinstance(obj, dict):
+            for key in sorted(obj):
+                walk(obj[key])
+
+    walk(batch)
+    return _digest(*shapes) if shapes else None
 
 
 # =============================================================================

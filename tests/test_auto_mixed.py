@@ -1065,3 +1065,284 @@ def test_separable_wa_still_runs_on_the_blocked_path(tmp_path):
     plan = q.plan_mixed_precision(_CanaryNet().eval(),
                                   data=[torch.randn(2, 3, 16, 16)], write=False)
     assert plan["meta"]["separable_wa"] is True
+
+
+# =============================================================================
+# Reuse — replaying a saved score set instead of re-measuring it
+# =============================================================================
+
+def _canary():
+    """The same weights every time — a reuse test that reseeds differently is
+    testing the fingerprint guard by accident."""
+    torch.manual_seed(0)
+    return _CanaryNet().eval()
+
+
+def _score_once(tmp_path, cfg=None, model=None, batches=2):
+    """Produce a real sensitivity.json in tmp_path and return (quantizer, plan)."""
+    q = _quantizer(tmp_path, cfg or _auto_config(reference="marginal"))
+    model = model if model is not None else _canary()
+    plan = q.plan_mixed_precision(model, data=[torch.randn(2, 3, 16, 16)] * batches)
+    return q, plan
+
+
+def _no_scoring(monkeypatch):
+    """Make any attempt to run a scorer a hard failure.
+
+    The point of reuse is that zero probes run. Asserting on a timer or a log
+    line would pass for the wrong reason; this cannot.
+    """
+    def boom(_name):
+        raise AssertionError("a scorer ran on the reuse path")
+    monkeypatch.setattr(mxs, "get_scorer", boom)
+
+
+def test_reuse_replays_the_same_assignment(tmp_path, monkeypatch):
+    """A replayed plan is the same plan, not a similar one."""
+    _, first = _score_once(tmp_path)
+    assert first["meta"]["reused"] is False
+    assert (tmp_path / "sensitivity.json").exists()
+
+    _no_scoring(monkeypatch)
+    q2 = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    second = q2.plan_mixed_precision(_canary(),
+                                     data=[torch.randn(2, 3, 16, 16)] * 2)
+
+    assert second["meta"]["reused"] is True
+    assert second["assignments"] == first["assignments"]
+    assert second["summary"]["avg_bits"] == first["summary"]["avg_bits"]
+    assert [r["name"] for r in second["rows"]] == [r["name"] for r in first["rows"]]
+
+
+def test_reuse_survives_a_ladder_ratio_change(tmp_path, monkeypatch):
+    """The whole point: fractions are an assignment input, not a scoring one."""
+    _score_once(tmp_path)
+    _no_scoring(monkeypatch)
+
+    cfg = _auto_config(reference="marginal",
+                       quantile={"int4": 0.0, "int6": 0.0, "int8": 1.0})
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is True
+    assert set(plan["assignments"].values()) == {"int8"}
+
+
+def test_reuse_survives_a_pin_change(tmp_path, monkeypatch):
+    _score_once(tmp_path)
+    _no_scoring(monkeypatch)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal",
+                                          pins={"conv1": "int8"}))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is True
+    assert plan["assignments"]["conv1"] == "int8"
+
+
+def test_reuse_rejects_changed_weights(tmp_path):
+    """A fine-tune keeps every shape identical, so shapes are not enough."""
+    _score_once(tmp_path)
+    model = _canary()
+    with torch.no_grad():
+        model.conv2.weight.mul_(3.0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(model, data=[torch.randn(2, 3, 16, 16)],
+                                  write=False)
+    assert plan["meta"]["reused"] is False
+
+
+def test_reuse_rejects_changed_probe_spec(tmp_path):
+    """Adding block_size to the int4 rung leaves its *name* int4 and changes
+    the arithmetic every probe ran under."""
+    _score_once(tmp_path)
+    cfg = _auto_config(reference="marginal")
+    cfg["groups"]["int4"]["block_size"] = 16
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is False
+
+
+def test_reuse_rejects_changed_candidate_set(tmp_path):
+    _score_once(tmp_path)
+    cfg = _auto_config(reference="marginal")
+    cfg["layers"] = [{"name": "conv1"}, {"name": "conv2"}]
+    q = _quantizer(tmp_path, cfg)
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is False
+
+
+def test_reuse_false_always_rescores(tmp_path):
+    _score_once(tmp_path)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal", reuse=False))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is False
+
+
+def test_reuse_force_overrides_a_stale_fingerprint(tmp_path, monkeypatch):
+    """Deliberate escape hatch: replay a score set across a changed model."""
+    _score_once(tmp_path)
+    _no_scoring(monkeypatch)
+    model = _canary()
+    with torch.no_grad():
+        model.conv2.weight.mul_(3.0)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal", reuse="force"))
+    plan = q.plan_mixed_precision(model, data=[torch.randn(2, 3, 16, 16)],
+                                  write=False)
+    assert plan["meta"]["reused"] is True
+
+
+def test_reuse_rejects_an_unknown_mode(tmp_path):
+    q = _quantizer(tmp_path, _auto_config(reuse="maybe"))
+    with pytest.raises(ValueError, match="auto_mixed.reuse"):
+        q.plan_mixed_precision(_canary(),
+                               data=[torch.randn(2, 3, 16, 16)], write=False)
+
+
+def test_reuse_refuses_cost_budget_without_a_per_rung_curve(tmp_path):
+    """A bottom-probed artifact is a rank, not a price.
+
+    Switching to cost_budget must re-score rather than replay: assign() would
+    otherwise be handed an artifact with no per-rung curve and refuse outright,
+    which is a crash where a re-score was the obvious thing to do.
+    """
+    _score_once(tmp_path)   # probe defaults to "bottom" -> per_rung is empty
+    q = _quantizer(tmp_path, _auto_config(
+        reference="marginal", probe="all_rungs", strategy="cost_budget",
+        cost_budget={"target_avg_bits": 6.0, "weight": "macs"}))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is False
+    assert plan["rows"][0]["per_rung"]
+
+
+def test_reuse_verdict_refuses_a_rank_only_artifact_for_cost_budget():
+    prints = {"model": "a", "layers": "b", "probe_spec": "c", "reference_spec": "d"}
+    rows = [{"name": "conv1", "sensitivity": 5.0, "status": "ok", "per_rung": {}}]
+    cfg = {"ladder": ["int4", "int6", "int8"], "strategy": "cost_budget"}
+    ok, reasons = mxa.reuse_verdict({"fingerprint": prints}, prints, rows,
+                                    ["conv1"], cfg)
+    assert ok is False
+    assert "cost_budget" in reasons[0] and "all_rungs" in reasons[0]
+
+
+def test_reuse_verdict_accepts_a_full_per_rung_artifact_for_cost_budget():
+    prints = {"model": "a", "layers": "b", "probe_spec": "c", "reference_spec": "d"}
+    rows = [{"name": "conv1", "sensitivity": 5.0, "status": "ok",
+             "per_rung": {"int4": 5.0, "int6": 2.0}}]
+    cfg = {"ladder": ["int4", "int6", "int8"], "strategy": "cost_budget"}
+    ok, reasons = mxa.reuse_verdict({"fingerprint": prints}, prints, rows,
+                                    ["conv1"], cfg)
+    assert (ok, reasons) == (True, [])
+
+
+def test_reuse_disables_wa_when_the_artifact_has_none(tmp_path, monkeypatch):
+    """A replay cannot invent w/a scores — it must say so, not split blind."""
+    _score_once(tmp_path)   # separable_wa off, so no w/a columns
+    _no_scoring(monkeypatch)
+    q = _quantizer(tmp_path, _auto_config(
+        reference="marginal", separable_wa={"enabled": True, "refine_top": 3}))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is True
+    assert "disabled" in str(plan["meta"]["separable_wa"])
+
+
+def test_reuse_keeps_the_original_scoring_timestamp(tmp_path, monkeypatch):
+    """`created` says when the numbers were measured, not when they were read."""
+    _, first = _score_once(tmp_path)
+    _no_scoring(monkeypatch)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["created"] == first["meta"]["created"]
+    assert plan["meta"]["reused_from"].endswith("sensitivity.json")
+
+
+def test_reuse_verify_pass_still_runs(tmp_path, monkeypatch):
+    """The one measurement a replay keeps: it is the only thing that can catch
+    a cache that passed every fingerprint and is still wrong."""
+    _score_once(tmp_path)
+    _no_scoring(monkeypatch)
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["assigned_vs_fp32"] is not None
+
+
+def test_missing_artifact_just_scores(tmp_path):
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is False
+
+
+def test_corrupt_artifact_falls_back_to_scoring(tmp_path):
+    (tmp_path / "sensitivity.json").write_text("{ not json")
+    q = _quantizer(tmp_path, _auto_config(reference="marginal"))
+    plan = q.plan_mixed_precision(_canary(),
+                                  data=[torch.randn(2, 3, 16, 16)], write=False)
+    assert plan["meta"]["reused"] is False
+
+
+def test_load_sensitivity_rejects_a_foreign_schema(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps({"schema_version": 99, "layers": [], "meta": {}}))
+    with pytest.raises(mxa.AssignError, match="schema_version"):
+        mxa.load_sensitivity(str(path))
+
+
+def test_load_sensitivity_rejects_a_non_artifact(tmp_path):
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps({"conv1": 3.0}))
+    with pytest.raises(mxa.AssignError, match="not a sensitivity artifact"):
+        mxa.load_sensitivity(str(path))
+
+
+def test_costs_from_rows_round_trips_macs():
+    rows = [{"name": "conv1", "cost": {"macs": 100, "params": 10}},
+            {"name": "conv2", "cost": {}}]
+    assert mxa.costs_from_rows(rows) == {"conv1": {"macs": 100, "params": 10},
+                                         "conv2": {}}
+
+
+def test_model_fingerprint_tracks_values_not_just_shapes():
+    torch.manual_seed(0)
+    a = _CanaryNet()
+    b = copy.deepcopy(a)
+    names = ["conv1", "conv2", "conv3"]
+    assert mxs.model_fingerprint(a, names) == mxs.model_fingerprint(b, names)
+    with torch.no_grad():
+        b.conv2.weight[0, 0, 0, 0] += 1e-3
+    assert mxs.model_fingerprint(a, names) != mxs.model_fingerprint(b, names)
+
+
+def test_model_fingerprint_ignores_layers_nobody_scores():
+    """A change outside the candidate set cannot invalidate the scores."""
+    torch.manual_seed(0)
+    a = _CanaryNet()
+    b = copy.deepcopy(a)
+    with torch.no_grad():
+        b.conv3.weight.mul_(5.0)
+    assert (mxs.model_fingerprint(a, ["conv1", "conv2"])
+            == mxs.model_fingerprint(b, ["conv1", "conv2"]))
+
+
+def test_reuse_verdict_names_what_went_stale():
+    prints = {"model": "aaa", "layers": "bbb",
+              "probe_spec": "ccc", "reference_spec": "ddd"}
+    meta = {"fingerprint": dict(prints, model="zzz")}
+    rows = [{"name": "conv1", "sensitivity": 1.0, "status": "ok"}]
+    ok, reasons = mxa.reuse_verdict(meta, prints, rows, ["conv1"],
+                                    {"ladder": ["int4", "int8"]})
+    assert ok is False
+    assert reasons == ["model weights changed"]
+
+
+def test_reuse_verdict_refuses_an_unfingerprinted_artifact():
+    ok, reasons = mxa.reuse_verdict({}, {"model": "a"}, [], [],
+                                    {"ladder": ["int4", "int8"]})
+    assert ok is False
+    assert "predates fingerprinting" in reasons[0]

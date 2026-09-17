@@ -4,6 +4,7 @@ import os
 import json
 import copy
 import sys
+import datetime
 
 sys.path.append('/Users/avrahamraviv/PycharmProjects')
 sys.path.append('/home/avrahamra/PycharmProjects')
@@ -425,12 +426,49 @@ class MXQuantizer:
                     self._log(log, f"auto_mixed | moved {n_moved} batch tensor(s) "
                                    f"to {device}")
 
+        # Everything the reference map needs is a spec lookup, so it is built
+        # before the branch below: the reuse path skips scoring, not verifying.
+        ref_map = self._reference_map(candidates, cfg, group_table, top)
+
+        # ---- reuse ----------------------------------------------------------
+        # Sensitivity is a property of (weights, candidate set, probe rung,
+        # reference rung). Ladder fractions, thresholds, pins and strategy are
+        # not inputs to it — they are applied afterwards, in assign(). So the
+        # expensive half of this function can be replayed from disk whenever
+        # only the cheap half changed, which is the usual case when tuning a
+        # ladder. The guard is what makes that safe; see _load_cached_sensitivity.
+        prints = self._plan_fingerprints(base_model, candidates, rungs,
+                                         probe_group, top, batches)
+        cached = self._load_cached_sensitivity(cfg, prints, candidates, log)
+        if cached is not None:
+            rows, cached_meta = cached
+            costs = _mxa.costs_from_rows(rows)
+            if wa_cfg.get("enabled") and not _mxa.rows_have_wa(rows):
+                wa_cfg["enabled"] = False
+                wa_note = ("separable_wa disabled: the reused artifact has no "
+                           "w/a scores (re-score with reuse: false to get them)")
+                self._log(log, f"auto_mixed | WARNING: {wa_note}")
+            meta = {k: v for k, v in cached_meta.items()
+                    if k not in ("baseline_vs_fp32", "assigned_vs_fp32",
+                                 "assigned_vs_reference")}
+            meta["fingerprint"] = prints
+            meta["reused"] = True
+            meta["reused_from"] = self._sensitivity_path(cfg)
+            return self._finish_plan(
+                rows=rows, costs=costs, cfg=cfg, group_table=group_table,
+                ladder=ladder, wa_cfg=wa_cfg, wa_note=wa_note, meta=meta,
+                base_model=base_model, ref_map=ref_map, candidates=candidates,
+                batches=batches, forward_fn=forward_fn, output_fn=output_fn,
+                method=cached_meta.get("scorer", method),
+                probe_group=probe_group, was_dp=was_dp,
+                scores={}, write=write, log=log)
+        # ---------------------------------------------------------------------
+
         # The reference network: every candidate at the top rung, built through
         # the normal replacement path so xblock_accum, act_quant wrapping and
         # out_quant hooks are all in place — the scorer must see the deployed
         # arithmetic, not an approximation of it.
         ref_model = copy.deepcopy(base_model)
-        ref_map = self._reference_map(candidates, cfg, group_table, top)
         self._replace_layers(ref_model, layer_map=ref_map, verbose=0)
 
         types = (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)
@@ -486,6 +524,29 @@ class MXQuantizer:
         if wa_cfg.get("enabled") and batches and method == "oat_output":
             self._refine_wa(ref_model, entries, batches, forward_fn, output_fn,
                             rungs, top, probe_group, rows, wa_cfg, log)
+
+        meta["fingerprint"] = prints
+        meta["created"] = datetime.datetime.now().isoformat(timespec="seconds")
+        meta["reused"] = False
+        return self._finish_plan(
+            rows=rows, costs=costs, cfg=cfg, group_table=group_table,
+            ladder=ladder, wa_cfg=wa_cfg, wa_note=wa_note, meta=meta,
+            base_model=base_model, ref_map=ref_map, candidates=candidates,
+            batches=batches, forward_fn=forward_fn, output_fn=output_fn,
+            method=method, probe_group=probe_group, was_dp=was_dp,
+            scores=scores, write=write, log=log)
+
+    def _finish_plan(self, *, rows, costs, cfg, group_table, ladder, wa_cfg,
+                     wa_note, meta, base_model, ref_map, candidates, batches,
+                     forward_fn, output_fn, method, probe_group, was_dp,
+                     scores, write, log):
+        """Assign, verify, report, write — everything after the scores exist.
+
+        Shared verbatim by the scoring path and the reuse path, which is the
+        point: a replayed plan must be the same plan, not a similar one. The
+        only thing the two paths disagree about is where `rows` came from.
+        """
+        top = ladder[-1]
         assignments, notes = _mxa.assign(rows, cfg, group_table,
                                          log=lambda m: self._log(log, m))
         assignments = self._apply_wa_split(assignments, rows, ladder, wa_cfg, log)
@@ -507,6 +568,10 @@ class MXQuantizer:
         # OAT scores every layer in the quietest possible context — everything
         # else at the top rung. The mixed net is noisier than that, so scores are
         # optimistic. One extra pass measures what was actually bought.
+        #
+        # On a reused artifact this is the only measurement in the run, and the
+        # only thing that can catch a cache which passed every fingerprint and is
+        # still wrong. Two forward passes, not N — worth keeping on.
         if batches and cfg.get("verify", True):
             baseline, assigned, relative = self._verify_assignment(
                 base_model, ref_map, flat, extra, group_table, top, batches,
@@ -519,7 +584,8 @@ class MXQuantizer:
             self.config, flat, group_table, extra,
             provenance={"generated_by": "MXQuantizer.plan_mixed_precision",
                         "scorer": method, "probe_group": probe_group,
-                        "reference_group": top})
+                        "reference_group": top,
+                        "reused_sensitivity": bool(meta.get("reused"))})
 
         self._print_sensitivity_table(rows, summary, meta, log)
 
@@ -765,6 +831,88 @@ class MXQuantizer:
         if split and log is not None:
             print(f"[MXQuantizer] auto_mixed | {split} layer(s) got a split w/a format")
         return assignments
+
+    def _sensitivity_path(self, cfg):
+        """Where the score set lives. Same file plan_mixed_precision writes, so
+        a run that scores leaves the cache behind for the next one with no
+        extra bookkeeping."""
+        return os.path.join(self.save_dir,
+                            cfg.get("reuse_path", "sensitivity.json"))
+
+    def _plan_fingerprints(self, base_model, candidates, rungs, probe_group,
+                           top, batches):
+        """Everything a cached score set is only valid under.
+
+        Kept small on purpose. Each entry is something that, if it changed,
+        makes the cached dB numbers describe a network we are no longer about to
+        quantize — and would do so without raising anything.
+        """
+        prints = {
+            "model": _mxs.model_fingerprint(base_model, candidates),
+            "layers": _mxs.names_fingerprint(candidates),
+            "probe_spec": _mxs.spec_fingerprint(rungs[probe_group]),
+            "reference_spec": _mxs.spec_fingerprint(rungs[top]),
+        }
+        if batches:
+            shape = _mxs.batch_shape_sig(batches[0])
+            if shape is not None:
+                prints["input_shape"] = shape
+        return prints
+
+    def _load_cached_sensitivity(self, cfg, prints, candidates, log=None):
+        """Return (rows, meta) if a saved score set may be replayed, else None.
+
+        `reuse` is one of:
+            "auto" (default) reuse when every fingerprint matches, otherwise
+                   re-score and overwrite. The safe setting.
+            "force"          reuse whatever is on disk, fingerprints be damned.
+                             For deliberately replaying a score set across a
+                             changed model; it will happily be wrong.
+            false / "off"    never reuse.
+
+        Every outcome is logged. A silent reuse is the failure this whole guard
+        exists to prevent, so the run log always says which half happened and,
+        when it re-scores, why.
+        """
+        mode = cfg.get("reuse", "auto")
+        if mode in (False, "off", "never"):
+            return None
+        if mode not in (True, "auto", "force"):
+            raise ValueError(
+                f"auto_mixed.reuse must be one of \"auto\", \"force\", false — "
+                f"got {mode!r}")
+
+        path = self._sensitivity_path(cfg)
+        if not os.path.exists(path):
+            self._log(log, f"auto_mixed | no cached sensitivity at {path}, scoring")
+            return None
+
+        try:
+            meta, rows, _ = _mxa.load_sensitivity(path)
+        except (_mxa.AssignError, ValueError, OSError) as exc:
+            self._log(log, f"auto_mixed | ignoring {path}: {exc}")
+            return None
+
+        ok, reasons = _mxa.reuse_verdict(meta, prints, rows, candidates, cfg)
+        if not ok and mode != "force":
+            self._log(log, f"auto_mixed | re-scoring, cached sensitivity is "
+                           f"stale: {'; '.join(reasons)}")
+            return None
+        if not ok:
+            self._log(log, f"auto_mixed | WARNING: reuse=\"force\" overriding "
+                           f"{len(reasons)} stale fingerprint(s): "
+                           f"{'; '.join(reasons)}")
+
+        measured = sum(1 for r in rows
+                       if r.get("status") not in _mxs.UNMEASURED
+                       and r.get("sensitivity") is not None)
+        self._log(log, f"auto_mixed | REUSED {os.path.basename(path)} "
+                       f"({measured}/{len(rows)} layers measured, scorer="
+                       f"{meta.get('scorer')}, probed at "
+                       f"{meta.get('probe_group')}, scored "
+                       f"{meta.get('created', 'at an unknown time')}) "
+                       f"— no scoring passes this run")
+        return rows, meta
 
     def _reference_map(self, candidates, cfg, group_table, top):
         """The baseline every score is measured against.
