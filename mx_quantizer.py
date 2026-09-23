@@ -2267,6 +2267,22 @@ class MXQuantizer:
     # =========================
     # Debug printing
     # =========================
+    @staticmethod
+    def _format_tag(module):
+        """The element formats a replaced module actually runs at.
+
+        The module repr says which *class* was installed (MXConv2dHW), which is
+        the accumulator model, not the precision. Under a mixed-precision
+        assignment every layer prints the same class, so without this there is
+        no way to see from the log which layer got int4 and which got int8.
+        """
+        specs = getattr(module, "mx_specs", None)
+        if not specs:
+            return "?"
+        w = specs.get("w_elem_format") or specs.get("a_elem_format") or "?"
+        a = specs.get("a_elem_format") or "?"
+        return str(w) if w == a else f"w:{w}/a:{a}"
+
     def _print_stat(self, model, log=None):
         """
         Prints replaced and missed Conv2d / ConvTranspose2d / Linear layers.
@@ -2275,6 +2291,7 @@ class MXQuantizer:
         num_fp_conv, num_fp_linear, num_fp_convT = 0, 0, 0
 
         num_mx_act, num_out_quant = 0, 0
+        fmt_counts = {}
 
         for name, module in model.named_modules():
             if hasattr(module, "_mx_out_quant"):
@@ -2286,13 +2303,19 @@ class MXQuantizer:
                 self._log(log, f"[ActQuant->MX] {name}: {module.extra_repr()}")
                 num_mx_act += 1
             elif isinstance(module, MXConvTranspose2d):
-                self._log(log, f"[ConvTranspose2d->MX] {name}: {module}")
+                tag = self._format_tag(module)
+                fmt_counts[tag] = fmt_counts.get(tag, 0) + 1
+                self._log(log, f"[ConvTranspose2d->MX] [{tag}] {name}: {module}")
                 num_mx_convT += 1
             elif isinstance(module, MXConv2d):
-                self._log(log, f"[Conv2d->MX] {name}: {module}")
+                tag = self._format_tag(module)
+                fmt_counts[tag] = fmt_counts.get(tag, 0) + 1
+                self._log(log, f"[Conv2d->MX] [{tag}] {name}: {module}")
                 num_mx_conv += 1
             elif isinstance(module, MXLinear):
-                self._log(log, f"[Linear->MX] {name}: {module}")
+                tag = self._format_tag(module)
+                fmt_counts[tag] = fmt_counts.get(tag, 0) + 1
+                self._log(log, f"[Linear->MX] [{tag}] {name}: {module}")
                 num_mx_linear += 1
             elif isinstance(module, nn.ConvTranspose2d):
                 self._log(log, f"[MISSED] {name}: still nn.ConvTranspose2d!")
@@ -2309,3 +2332,7 @@ class MXQuantizer:
                        f"MX linears: {num_mx_linear}, regular linears: {num_fp_linear}, "
                        f"MX act-quant wrappers: {num_mx_act}, "
                        f"fxp out-quant hooks: {num_out_quant}.")
+        if fmt_counts:
+            tally = ", ".join(f"{fmt}: {n}" for fmt, n
+                              in sorted(fmt_counts.items()))
+            self._log(log, f"Element formats: {tally}")

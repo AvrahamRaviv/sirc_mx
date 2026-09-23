@@ -1346,3 +1346,37 @@ def test_reuse_verdict_refuses_an_unfingerprinted_artifact():
                                     {"ladder": ["int4", "int8"]})
     assert ok is False
     assert "predates fingerprinting" in reasons[0]
+
+
+# =============================================================================
+# Replace log — which layer got which format
+# =============================================================================
+
+def test_replace_log_labels_each_layer_with_its_element_format(tmp_path, capsys):
+    """Under a mixed assignment every layer installs the same class, so the
+    module repr alone cannot say which layer got int4 and which got int8."""
+    base = {"block_size": 32, "scale_bits": 8, "shared_exp_method": "max",
+            "custom_cuda": False}
+    cfg = {"groups": {g: dict(base, w_elem_format=g, a_elem_format=g)
+                      for g in ("int4", "int6", "int8")},
+           "layers": [{"name": "conv1", "group": "int4"},
+                      {"name": "conv2", "group": "int6"},
+                      {"name": "conv3", "group": "int8"}],
+           "ptq": False, "measure_error": False}
+    _quantizer(tmp_path, cfg).quant(_canary())
+    out = capsys.readouterr().out
+    assert "[Conv2d->MX] [int4] conv1" in out
+    assert "[Conv2d->MX] [int6] conv2" in out
+    assert "[Conv2d->MX] [int8] conv3" in out
+    assert "Element formats: int4: 1, int6: 1, int8: 1" in out
+
+
+def test_replace_log_marks_a_split_wa_layer(tmp_path, capsys):
+    base = {"block_size": 32, "scale_bits": 8, "shared_exp_method": "max",
+            "custom_cuda": False}
+    cfg = {"groups": {"w4a8": dict(base, w_elem_format="int4",
+                                   a_elem_format="int8")},
+           "layers": [{"name": "conv1", "group": "w4a8"}],
+           "ptq": False, "measure_error": False}
+    _quantizer(tmp_path, cfg).quant(_canary())
+    assert "[w:int4/a:int8] conv1" in capsys.readouterr().out
