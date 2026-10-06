@@ -1,0 +1,5 @@
+# shape=[1, 1, 2, 2] dtype=int16 order=C (last axis fastest) count=4
+5
+5
+5
+5

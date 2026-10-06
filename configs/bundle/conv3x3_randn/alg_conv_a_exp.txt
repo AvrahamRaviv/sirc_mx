@@ -1,0 +1,26 @@
+# shape=[1, 1, 5, 5] dtype=int16 order=C (last axis fastest) count=25
+0
+1
+1
+1
+1
+1
+1
+1
+1
+0
+1
+1
+1
+1
+1
+0
+1
+1
+0
+1
+0
+0
+1
+1
+1

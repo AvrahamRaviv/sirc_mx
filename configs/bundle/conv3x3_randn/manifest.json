@@ -1,0 +1,176 @@
+{
+  "case": "conv3x3_randn",
+  "note": "Plain 3x3, aligned channels, random data. The reference point.",
+  "layer": {
+    "name": "conv",
+    "type": "Conv2d",
+    "in_channels": 32,
+    "out_channels": 32,
+    "kernel_size": [
+      3,
+      3
+    ],
+    "stride": [
+      1,
+      1
+    ],
+    "padding": [
+      0,
+      0
+    ],
+    "dilation": [
+      1,
+      1
+    ],
+    "groups": 1,
+    "bias": false
+  },
+  "block_size": 32,
+  "seed": 0,
+  "patterns": {
+    "weight": "randn",
+    "input": "randn"
+  },
+  "out_quant": null,
+  "mx_config": {
+    "mx_specs": {
+      "w_elem_format": "int8",
+      "a_elem_format": "int8",
+      "block_size": 32,
+      "scale_bits": 8,
+      "shared_exp_method": "max",
+      "custom_cuda": false
+    },
+    "layers": [
+      "conv"
+    ],
+    "ptq": false,
+    "measure_error": false
+  },
+  "files": {
+    "weight": {
+      "npy": "weight.npy",
+      "txt": "weight.txt",
+      "shape": [
+        32,
+        32,
+        3,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "input": {
+      "npy": "input.npy",
+      "txt": "input.txt",
+      "shape": [
+        1,
+        32,
+        5,
+        5
+      ],
+      "dtype": "float32"
+    },
+    "ref_fp32": {
+      "npy": "ref_fp32.npy",
+      "txt": "ref_fp32.txt",
+      "shape": [
+        1,
+        32,
+        3,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "alg_out": {
+      "npy": "alg_out.npy",
+      "txt": "alg_out.txt",
+      "shape": [
+        1,
+        32,
+        3,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "alg_conv_a_exp": {
+      "npy": "alg_conv_a_exp.npy",
+      "txt": "alg_conv_a_exp.txt",
+      "shape": [
+        1,
+        1,
+        5,
+        5
+      ],
+      "dtype": "int16"
+    },
+    "alg_conv_a_int": {
+      "npy": "alg_conv_a_int.npy",
+      "txt": "alg_conv_a_int.txt",
+      "shape": [
+        1,
+        32,
+        5,
+        5
+      ],
+      "dtype": "int8"
+    },
+    "alg_conv_out": {
+      "npy": "alg_conv_out.npy",
+      "txt": "alg_conv_out.txt",
+      "shape": [
+        1,
+        32,
+        3,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "alg_conv_w_exp": {
+      "npy": "alg_conv_w_exp.npy",
+      "txt": "alg_conv_w_exp.txt",
+      "shape": [
+        32,
+        1,
+        3,
+        3
+      ],
+      "dtype": "int16"
+    },
+    "alg_conv_w_int": {
+      "npy": "alg_conv_w_int.npy",
+      "txt": "alg_conv_w_int.txt",
+      "shape": [
+        32,
+        32,
+        3,
+        3
+      ],
+      "dtype": "int8"
+    }
+  },
+  "mx_format": {
+    "elem_format": "int8",
+    "mantissa_bits": 8,
+    "mant_bias": 6,
+    "mantissa_range": [
+      -127,
+      127
+    ],
+    "shared_exp_method": "max",
+    "value": "value = mantissa * 2**(shared_exp - mant_bias)",
+    "shared_exp": "shared_exp = floor(log2(max(|x|) over the block))",
+    "blockify": "activations and weights block along dim 1 (channels), block_size elements per block; a tail shorter than block_size is zero-padded, which does not move a max-abs shared exponent"
+  },
+  "how_to_compare": {
+    "bit_exact": [
+      "alg_a_int",
+      "alg_a_exp",
+      "alg_w_int",
+      "alg_w_exp"
+    ],
+    "float": [
+      "alg_out"
+    ],
+    "note": "The int taps are the contract. Match those first; alg_out follows from them. ref_fp32 is the unquantised output, for context only - neither side should match it."
+  }
+}
