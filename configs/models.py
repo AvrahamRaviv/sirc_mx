@@ -473,8 +473,12 @@ CASES: Dict[str, Case] = {
         build=lambda bs: SingleConv(bs, bs, k=1),
         input_shape=lambda bs: (1, bs, 2, 2),
         x_pattern="tiny",
-        note="Everything under e_layer_min. The whole layer should flush to "
-             "zero - on both sides, at the same threshold.",
+        note="Every product underflows the accumulator grid (acts at exp -30, "
+             "e_layer_min -20). Does NOT reach zero: an arithmetic right shift "
+             "rounds toward -inf, so each negative product deposits -1 LSB and "
+             "each positive 0, leaving a systematic negative bias. HW that "
+             "truncates toward zero instead gives exactly 0 - this case is the "
+             "vector that tells the two apart.",
         tags=("stress", "corner"),
     ),
     "accum_saturate": Case(

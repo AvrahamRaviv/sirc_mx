@@ -103,6 +103,18 @@ import models as M
 #   - do conv pad zeros join a block (shifting its alignment) or are they
 #     skipped?
 #   - is the bias added into the fixed-point accumulator, or after the requant?
+#   - when a product underflows the accumulator grid (shift < 0), does the
+#     right shift round toward -inf or truncate toward zero? MXConv2dHW uses an
+#     arithmetic shift, so -8064 >> 20 == -1, not 0: a block of underflowing
+#     products leaves -1 LSB per negative product and 0 per positive one, i.e.
+#     a systematic negative bias rather than a clean flush to zero. Truncating
+#     toward zero gives exactly 0 instead. The `flush_to_zero` case separates
+#     the two - it lands on [-2.1e-05 .. -1.0e-05] under arithmetic shift and
+#     on 0 under truncation.
+#   - groups != 1 has no HW path at all (MXConv2dHW asserts groups == 1) and
+#     there is no HW Linear, so `depthwise`, `grouped4`, `linear` and half of
+#     `dw_pw` fall back to the FP32 path on the ALG side. Does the real HW run
+#     depthwise convs on this datapath, and if so with what blockify?
 #
 # The static fixed-point output stage is configured per case rather than in
 # mx_specs, because it is a different quantizer (see `out_quant_fxp` below):
