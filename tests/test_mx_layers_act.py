@@ -236,3 +236,165 @@ def test_collect_stats_reports_per_input_sections():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# =============================================================================
+# Static fixed-point operands and the output stage
+#
+# NPE's warp carries the reference as int8 but the grid as a 16-bit fixed-point
+# word (6 integer + 6 fractional bits), and emits int8. Fixed point is a
+# different lattice from MX, not another width of it: one static scale of
+# 2^-frac_bits for the whole tensor instead of a shared exponent per block.
+# =============================================================================
+
+_GRID_FXP = {"total_bits": 16, "frac_bits": 6, "signed": True,
+             "round": "half_away", "saturate": True}
+
+
+def _fxp_cfg(**kw):
+    from fixed_point.fxp_quant import normalize_out_quant
+    return normalize_out_quant({**_GRID_FXP, **kw})
+
+
+def test_fxp_input_lands_on_the_static_lattice():
+    """An fxp operand snaps to 2^-frac_bits everywhere, not to a per-block step."""
+    flow = (torch.rand(1, 2, 4, 64) * 64 - 32)       # +-32 px
+    wrapped = MXActQuant(Warp(), [_specs(), None],
+                         axes_per_input=[[-1], [1]],
+                         fxp_per_input=[None, _fxp_cfg()])
+    q = wrapped.quant_input(flow, 1)
+
+    step = 2.0 ** -6
+    codes = q / step
+    assert torch.allclose(codes, codes.round()), "not on the 1/64 lattice"
+    assert (q - flow).abs().max() <= step / 2 + 1e-6
+
+
+def test_fxp_grid_is_far_finer_than_mx_int8():
+    """The point of the change: MX int8 on a +-32 px grid is ~31x coarser."""
+    flow = (torch.rand(1, 2, 4, 64) * 64 - 32)
+    mx_err = (MXActQuant(Warp(), [_specs()], axes_per_input=[[-1]])
+              .quant_input(flow, 0) - flow).abs().max()
+    fxp_err = (MXActQuant(Warp(), [None], fxp_per_input=[_fxp_cfg()])
+               .quant_input(flow, 0) - flow).abs().max()
+    assert fxp_err < mx_err / 10, f"mx {mx_err:.6f} vs fxp {fxp_err:.6f}"
+    assert fxp_err <= 2.0 ** -7 + 1e-6
+
+
+def test_fxp_saturates_outside_the_representable_range():
+    """A static scale can overflow where MX cannot. 6 frac bits of 13 -> +-64 px."""
+    flow = torch.tensor([[-500.0, -64.0, 0.0, 63.9, 500.0]])
+    wrapped = MXActQuant(Warp(), [None],
+                         fxp_per_input=[_fxp_cfg(total_bits=13)])
+    q = wrapped.quant_input(flow, 0)
+    assert q.min() >= -64.0 and q.max() <= 64.0
+    assert q[0, 0] == -64.0 and q[0, -1] > 63.0
+
+
+def test_output_stage_quantizes_the_result():
+    """Without an output spec the result is FP32; with one it is on the lattice."""
+    x = torch.randn(1, 8, 4, 4)
+    # Fractional flow: grid_sample interpolates, so the result lands off the MX
+    # lattice. A zero flow would pass the already-quantized input straight
+    # through and the output stage would be a legitimate no-op.
+    flow = torch.full((1, 2, 4, 4), 0.5)
+
+    plain = MXActQuant(Warp(), [_specs(), _specs()])
+    out_q = MXActQuant(Warp(), [_specs(), _specs()],
+                       out_spec=_specs(), out_axes=[1])
+
+    y_plain = plain(x, flow)
+    y_quant = out_q(x, flow)
+    assert not torch.allclose(y_plain, y_quant), "output stage did nothing"
+    assert torch.allclose(y_quant, _ref_quant(y_plain, _specs(), [1]))
+
+
+def test_output_stage_handles_a_tuple_return():
+    class TwoOut(nn.Module):
+        def forward(self, a):
+            return a * 2, a * 4
+
+    mod = MXActQuant(TwoOut(), [None], out_fxp=_fxp_cfg())
+    lo, hi = mod(torch.rand(1, 32) * 10)
+    step = 2.0 ** -6
+    for t in (lo, hi):
+        assert torch.allclose(t / step, (t / step).round())
+
+
+def test_fxp_and_mx_are_mutually_exclusive_in_config():
+    import pytest
+    cfg = {"mx_specs": {"a_elem_format": "int8", "block_size": 32},
+           "layers": [{"name": "warp", "kind": "act_quant", "inputs": [
+               {"fxp": _GRID_FXP, "mx_specs": {"a_elem_format": "int8"}}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "mx_config.json"), "w") as f:
+            json.dump(cfg, f)
+        with pytest.raises(ValueError, match="alternative quantizers"):
+            MXQuantizer(save_dir=d).quant(Net())
+
+
+def test_quantizer_builds_the_npe_warp_shape_from_config():
+    """End-to-end: reference MX int8, grid fxp 16/6, output MX int8."""
+    cfg = {
+        "mx_specs": {"a_elem_format": "int8", "block_size": 32,
+                     "scale_bits": 8, "shared_exp_method": "max",
+                     "custom_cuda": False},
+        "layers": [
+            {"name": "warp", "kind": "act_quant",
+             "inputs": [
+                 {"mx_specs": {"a_elem_format": "int8", "block_size": 32,
+                               "scale_bits": 8, "shared_exp_method": "max",
+                               "custom_cuda": False}, "axes": [-1]},
+                 {"fxp": _GRID_FXP},
+             ],
+             "output": {"mx_specs": {"a_elem_format": "int8", "block_size": 32,
+                                     "scale_bits": 8,
+                                     "shared_exp_method": "max",
+                                     "custom_cuda": False}, "axes": [-1]}},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "mx_config.json"), "w") as f:
+            json.dump(cfg, f)
+        model = MXQuantizer(save_dir=d).quant(Net())
+
+    w = model.warp
+    assert isinstance(w, MXActQuant)
+    assert w.fxp_per_input[0] is None and w.fxp_per_input[1] is not None
+    assert w.fxp_per_input[1]["frac_bits"] == 6
+    assert w.out_spec is not None and w.out_spec["a_elem_format"] == "int8"
+    assert "fxp16.6s" in w.extra_repr() and "out=" in w.extra_repr()
+
+    y = model(torch.randn(1, 8, 6, 6), torch.rand(1, 2, 6, 6) * 4 - 2)
+    assert y.shape == (1, 8, 6, 6) and torch.isfinite(y).all()
+
+
+def test_collect_stats_reports_an_fxp_input_section():
+    """An fxp operand must not vanish from the stats report."""
+    cfg = {
+        "mx_specs": {"a_elem_format": "int8", "block_size": 32,
+                     "scale_bits": 8, "shared_exp_method": "max",
+                     "custom_cuda": False},
+        "layers": [{"name": "warp", "kind": "act_quant", "inputs": [
+            {"mx_specs": {"a_elem_format": "int8", "block_size": 32,
+                          "scale_bits": 8, "shared_exp_method": "max",
+                          "custom_cuda": False}, "axes": [-1]},
+            {"fxp": {**_GRID_FXP, "total_bits": 13}},
+        ]}],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "mx_config.json"), "w") as f:
+            json.dump(cfg, f)
+        model = MXQuantizer(save_dir=d).quant(Net())
+
+    # flow well past +-64 px, so the fxp input must report clipping
+    data = [(torch.randn(1, 8, 6, 6), torch.full((1, 2, 6, 6), 300.0))]
+    stats = mx_stats.collect_stats(
+        model, data=data, forward_fn=lambda m, b: m(b[0], b[1]), max_batches=1)
+
+    secs = stats["layers"]["warp"]["inputs"]
+    assert secs[0]["quantizer"] == "mx"
+    assert secs[0]["a_elem_format"] == "int8"
+    assert secs[1]["quantizer"] == "fxp"
+    assert secs[1]["format"].startswith("Q7.6")
+    assert secs[1]["clipped_frac"] == 1.0, secs[1]

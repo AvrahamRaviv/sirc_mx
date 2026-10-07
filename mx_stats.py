@@ -48,7 +48,8 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from fixed_point.mx_fixed_point import _get_xblock_cfg
-from fixed_point.fxp_quant import fxp_format_str, fxp_stats_value
+from fixed_point.fxp_quant import (fxp_format_str, fxp_stats_value,
+                                   fake_quant_fxp, fxp_clip_stats)
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 from mx_layers_act import MXActQuant
 from mx_debug import _ascii_hist
@@ -395,6 +396,28 @@ def _make_stats_hook(name, state, output_error=True):
     return hook
 
 
+def _act_input_entry(m, st, i, isp, sink, histograms):
+    """One MXActQuant input's stats section: MX block stats or fxp clip stats."""
+    fxp = m.fxp_per_input[i]
+    if fxp is not None and fxp.get("enabled", True):
+        acc = st["inputs_fxp"][i]
+        n, ssq, sse = acc["n"], acc["sum_sq"], acc["sum_sq_err"]
+        return {"format": fxp_format_str(fxp),
+                "quantizer": "fxp",
+                "n": fxp_stats_value(n),
+                "n_clipped": fxp_stats_value(acc["n_clipped"]),
+                "clipped_frac": (acc["n_clipped"] / n) if n else None,
+                "sqnr_db": (10.0 * math.log10(ssq / sse)
+                            if ssq > 0 and sse > 0 else None)}
+    if isp is None:
+        return None
+    return dict(sink.finalize(histograms=histograms),
+                quantizer="mx",
+                a_elem_format=isp["a_elem_format"],
+                block_size=isp["block_size"],
+                axes=list(m.axes_per_input[i]))
+
+
 def _make_act_stats_hook(name, state):
     """Hook for MXActQuant: per-input operand stats, no weights, no output error.
 
@@ -407,10 +430,27 @@ def _make_act_stats_hook(name, state):
             for i, x in enumerate(inp):
                 if i >= len(mod.specs_per_input):
                     break
+                if not torch.is_tensor(x) or not x.is_floating_point():
+                    continue
+                fxp = mod.fxp_per_input[i]
+                if fxp is not None and fxp.get("enabled", True):
+                    xd = x.detach().float()
+                    q = fake_quant_fxp(
+                        xd, frac_bits=fxp["frac_bits"],
+                        total_bits=fxp["total_bits"], signed=fxp["signed"],
+                        round_mode=fxp["round"], saturate=fxp["saturate"])
+                    n, n_clip, ssq, sse = fxp_clip_stats(
+                        xd, q, frac_bits=fxp["frac_bits"],
+                        total_bits=fxp["total_bits"], signed=fxp["signed"],
+                        round_mode=fxp["round"])
+                    acc = st["inputs_fxp"][i]
+                    acc["n"] += n
+                    acc["n_clipped"] += n_clip
+                    acc["sum_sq"] += ssq
+                    acc["sum_sq_err"] += sse
+                    continue
                 sp = mod.specs_per_input[i]
                 if sp is None or sp["a_elem_format"] is None:
-                    continue
-                if not torch.is_tensor(x) or not x.is_floating_point():
                     continue
                 axes = mod.axes_per_input[i]
                 bf, q = _quant_operand(x.detach().float(), sp,
@@ -641,7 +681,15 @@ def collect_stats(model, data=None, forward_fn=None, *,
             # One sink per quantized input; "act" aliases input 0 so the
             # network-level aggregation below stays uniform.
             sinks = [_TensorStats() for _ in m.specs_per_input]
+            # A fixed-point input has no MX spec, so it gets no block sink; its
+            # error is a clip/round count instead. Without this the operand is
+            # simply absent from the report, which is how a format mismatch
+            # stays invisible.
             state[name] = {"weight": None, "inputs": sinks, "act": sinks[0],
+                           "inputs_fxp": [
+                               {"n": 0, "n_clipped": 0, "sum_sq": 0.0,
+                                "sum_sq_err": 0.0} if f is not None else None
+                               for f in m.fxp_per_input],
                            "out_err": _ErrAccum(), "n_calls": 0}
         else:
             state[name] = {"weight": _weight_stats(m, detail=detail),
@@ -703,11 +751,7 @@ def collect_stats(model, data=None, forward_fn=None, *,
                                              int(m.weight[0].numel())]
         if is_act_only:
             entry["inputs"] = [
-                None if isp is None else
-                dict(sink.finalize(histograms=histograms),
-                     a_elem_format=isp["a_elem_format"],
-                     block_size=isp["block_size"],
-                     axes=list(m.axes_per_input[i]))
+                _act_input_entry(m, st, i, isp, sink, histograms)
                 for i, (isp, sink) in enumerate(zip(m.specs_per_input, st["inputs"]))
             ]
         if st["weight"] is not None:
