@@ -111,6 +111,12 @@ import models as M
 #     toward zero gives exactly 0 instead. The `flush_to_zero` case separates
 #     the two - it lands on [-2.1e-05 .. -1.0e-05] under arithmetic shift and
 #     on 0 under truncation.
+#   - per_product or per_block saturation? `accum_sat_transient` settles it:
+#     each block's partial sum leaves the accumulator range and comes back, so
+#     per_product clamps at the peak, loses the excess and ends pinned at the
+#     negative bound (-1.342e+08), while per_block sums first and returns
+#     exactly 0. No other case distinguishes them - accum_saturate pins the
+#     clamp bound but both modes agree there.
 #   - groups != 1 has no HW path at all (MXConv2dHW asserts groups == 1) and
 #     there is no HW Linear, so `depthwise`, `grouped4`, `linear` and half of
 #     `dw_pw` fall back to the FP32 path on the ALG side. Does the real HW run

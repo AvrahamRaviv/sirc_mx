@@ -231,6 +231,27 @@ def _saturate(shape, axis, bs, gen, scale=1.0):
     return torch.full(shape, float(scale))
 
 
+def _half_split(shape, axis, bs, gen, scale=1.0):
+    """First half of every block +max, second half -max.
+
+    Unlike `signs`, which alternates element by element and so cancels after
+    every pair, this front-loads one sign: a running accumulator climbs for
+    half a block before coming back down. That is the only way to make a
+    partial sum exceed the accumulator bound while the final sum stays inside
+    it, which is what separates sat_mode 'per_product' (clamps the running
+    value and loses the excess) from 'per_block' (sums first, clamps once).
+    """
+    t = torch.empty(shape, dtype=torch.float32)
+    for blk in _blocks(t, axis, bs):
+        n = blk.shape[axis]
+        sign = torch.ones(n)
+        sign[n // 2:] = -1.0
+        view = [1] * blk.dim()
+        view[axis] = n
+        blk.copy_(sign.reshape(view).expand_as(blk) * scale)
+    return t
+
+
 def _signs(shape, axis, bs, gen, scale=1.0):
     """Alternating signs over a magnitude ramp. Catches two's-complement and
     round-half asymmetries, which cancel out on all-positive data."""
@@ -251,6 +272,7 @@ PATTERNS: Dict[str, Callable] = {
     "tiny": _tiny,
     "saturate": _saturate,
     "signs": _signs,
+    "half_split": _half_split,
 }
 
 
@@ -263,7 +285,8 @@ def make_tensor(shape, pattern="randn", axis=1, bs=BLOCK_SIZE, seed=0, **kw):
     return PATTERNS[pattern](tuple(shape), axis % len(shape), bs, gen, **kw)
 
 
-def fill_params(model, pattern="randn", bs=BLOCK_SIZE, seed=0, bias_pattern=None):
+def fill_params(model, pattern="randn", bs=BLOCK_SIZE, seed=0, bias_pattern=None,
+                **kw):
     """Overwrite every weight / bias in `model` with a pattern, in a fixed
     module order so the same seed gives the same checkpoint on both sides.
 
@@ -277,7 +300,8 @@ def fill_params(model, pattern="randn", bs=BLOCK_SIZE, seed=0, bias_pattern=None
                 pat = bias_pattern or "ramp"
                 p.copy_(make_tensor(p.shape, pat, axis=0, bs=bs, seed=seed + i))
             else:
-                p.copy_(make_tensor(p.shape, pattern, axis=1, bs=bs, seed=seed + i))
+                p.copy_(make_tensor(p.shape, pattern, axis=1, bs=bs,
+                                    seed=seed + i, **kw))
     return model
 
 
@@ -300,6 +324,10 @@ class Case:
     input_shape: Callable[[int], Sequence]  # bs -> shape
     w_pattern: str = "randn"
     x_pattern: str = "randn"
+    # Extra kwargs for the pattern builders, e.g. {"scale": 2**12} to push the
+    # shared exponents high enough that the narrow accumulator actually clamps.
+    w_kw: dict = None
+    x_kw: dict = None
     note: str = ""
     tags: Tuple[str, ...] = ()
     out_quant: dict = None
@@ -485,9 +513,32 @@ CASES: Dict[str, Case] = {
         build=lambda bs: SingleConv(4 * bs, bs, k=3, padding=0),
         input_shape=lambda bs: (1, 4 * bs, 5, 5),
         w_pattern="saturate", x_pattern="saturate",
-        note="Long reduction (k*k*4*bs) at full magnitude, all one sign: the "
-             "narrow accumulator saturates. Per-product vs per-block "
-             "saturation only differ here.",
+        # shift = Ew + Ea - 2*mant_bias - e_layer_min, so what fills the
+        # accumulator is the shared EXPONENTS, not the mantissas: products are
+        # capped at 127*127 whatever the scale. At e_layer_min=-20 and a 1152-
+        # term reduction the clamp needs Ew = Ea = 12, i.e. operands around
+        # 2^12. Measured: 2^8 still does not clamp, 2^12 clamps every output.
+        w_kw={"scale": 2.0 ** 12}, x_kw={"scale": 2.0 ** 12},
+        note="Long reduction (k*k*4*bs) at full magnitude and high exponent, "
+             "all one sign: the narrow accumulator saturates on every output. "
+             "Pins the clamp bound itself: out == (2^(bits-1) - 1) * "
+             "2^e_layer_min. Both sat_modes agree here - see "
+             "accum_sat_transient for the vector that splits them.",
+        tags=("stress", "corner"),
+    ),
+
+    "accum_sat_transient": Case(
+        build=lambda bs: SingleConv(4 * bs, bs, k=3, padding=0),
+        input_shape=lambda bs: (1, 4 * bs, 5, 5),
+        w_pattern="half_split", x_pattern="saturate",
+        w_kw={"scale": 2.0 ** 12}, x_kw={"scale": 2.0 ** 12},
+        note="The partial sum leaves the accumulator range but the final sum "
+             "does not: each block climbs for 16 products, then the sign flips "
+             "and it comes back to zero. 'per_product' clamps at the peak, "
+             "loses the excess and ends pinned at the negative bound; "
+             "'per_block' sums first and returns exactly 0. Measured: "
+             "-1.342e+08 vs 0. The only vector that tells the two apart, so "
+             "it is how the sat_mode line of the spec gets settled.",
         tags=("stress", "corner"),
     ),
     # --- static fixed-point output stage (not MX: fixed scale, can overflow) --
@@ -562,13 +613,14 @@ def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None):
     case = CASES[name]
 
     model = case.build(bs).eval()
-    fill_params(model, case.w_pattern, bs=bs, seed=seed)
+    fill_params(model, case.w_pattern, bs=bs, seed=seed, **(case.w_kw or {}))
 
     shape = list(case.input_shape(bs))
     if batch is not None:
         shape[0] = batch
     axis = 1 if len(shape) > 2 else 1  # channels for 4D, features for 2D
-    x = make_tensor(shape, case.x_pattern, axis=axis, bs=bs, seed=seed + 1000)
+    x = make_tensor(shape, case.x_pattern, axis=axis, bs=bs, seed=seed + 1000,
+                    **(case.x_kw or {}))
 
     with torch.no_grad():
         y = model(x)
@@ -583,6 +635,8 @@ def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None):
         "output_shape": list(y.shape),
         "w_pattern": case.w_pattern,
         "x_pattern": case.x_pattern,
+        "w_kw": case.w_kw or {},
+        "x_kw": case.x_kw or {},
         "params": {n: list(p.shape) for n, p in model.named_parameters()},
         "note": case.note,
         "tags": list(case.tags),
