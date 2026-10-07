@@ -71,16 +71,16 @@ DEFAULT_CONFIG = {
             "mode": "hw_fixed_point",
             "bits": 48,
             "sat_mode": "per_product",
-            # Per-product shift is `Ew + Ea - 2*mant_bias - e_layer_min`, so
-            # e_layer_min is the exponent of the accumulator's LSB. A product
-            # whose `Ew + Ea - 2*mant_bias` falls below it is right-shifted and
-            # loses that many low bits, so the value must sit at or under
-            # `min(Ew + Ea) - 2*mant_bias` to be lossless - i.e. it is normally
-            # NEGATIVE, around -12 for int8 operands with small exponents.
-            # null = calibrate it per layer from the case's own tensors (what
-            # `calibrate_e_layer_min` does on a real network). Override with
-            # --e-layer-min to study truncation deliberately.
-            "e_layer_min": None,
+            # Exponent of the accumulator's LSB. Low enough that no product
+            # gets right-shifted, so it costs nothing on 27 of the 29 cases and
+            # the accumulator datapath is what gets compared, not a truncation
+            # artefact. -20 is also what mx_config_npe_*.json ships, so the sim
+            # and the production configs agree. The two cases it does change:
+            # `with_bias` becomes exact (finer bias grid than a calibrated -2),
+            # and `flush_to_zero` flushes, which is that case's whole point.
+            # null = calibrate per layer instead; --e-layer-min pins any value
+            # (0 right-shifts every product by 9-12 bits - see the README).
+            "e_layer_min": -20,
             # Block both operands along Cin. Matches `fill_params`, which blocks
             # weights on dim 1. NPE's flatten/xblock pair lives in
             # mx_config_npe_*.json - pass it with --config to test that geometry.
