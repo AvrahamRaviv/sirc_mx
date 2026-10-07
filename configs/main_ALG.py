@@ -88,7 +88,11 @@ DEFAULT_CONFIG = {
             "act_blockify": "channel",
             "pad_channels": True,
             "backend": "python",
-            "verbose": 0,
+            # NOT 0. MXQuantizer._replace_layers derives its own verbosity from
+            # this key (mx_quantizer.py:1360), so 0 here also suppresses the
+            # "replace summary" and "fallback reasons" lines - the ones that say
+            # a layer never reached the HW path. --verbose raises it to 2.
+            "verbose": 1,
         },
     },
     "layers": [],          # filled in per model by `_layer_names`
@@ -279,7 +283,7 @@ def run(case, config=None, verbose=False):
     # testing the accumulator at all - so record it rather than let it pass
     # unnoticed.
     case["meta"]["datapath"] = {
-        name: type(mod).__name__
+        name: _datapath_name(mod)
         for name, mod in qmodel.named_modules()
         if isinstance(mod, (MXConv2d, MXLinear))
     }
@@ -336,6 +340,20 @@ def run(case, config=None, verbose=False):
             taps["model/out_clip"] = ((pre < lo) | (pre > hi)).to(torch.uint8)
 
     return taps
+
+
+def _datapath_name(mod):
+    """Readable class label for the `datapath:` line.
+
+    microxcaling names its MX conv/linear classes plain `Conv2d` / `Linear`, so
+    printing __name__ makes a fallback look like an unquantized torch layer. It
+    is not: the operands are still MX-quantized, only the reduction runs in FP32
+    instead of the fixed-point accumulator. Say that.
+    """
+    cls = type(mod)
+    if cls.__module__.startswith("microxcaling"):
+        return f"MX{cls.__name__}(fp32-accum)"
+    return cls.__name__
 
 
 def _get_xblock_cfg_dict(config):
@@ -404,6 +422,8 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config, bs=args.bs)
+    if args.verbose:
+        _get_xblock_cfg_dict(config)["verbose"] = 2
     if args.e_layer_min is not None:
         _get_xblock_cfg_dict(config)["e_layer_min"] = args.e_layer_min
     all_taps = {}
