@@ -45,7 +45,7 @@ import main_ALG as ALG
 import main_HW as HW
 
 _INT_SUFFIXES = ("a_int", "a_exp", "w_int", "w_exp", "out_int", "out_exp",
-                 "acc_raw", "acc_shf", "acc_sat", "sat_cnt",
+                 "acc_raw", "acc_shf", "acc_sat", "sat_cnt", "sat_total",
                  # static fixed-point output stage: the word itself is an
                  # integer, so it is the bit-exact comparable there too.
                  "out_code", "out_clip")

@@ -36,6 +36,7 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
 
 from microxcaling.mx.convolution import Conv2d as MXConv2d
 from microxcaling.mx.linear import Linear as MXLinear
+from mx_layers_blocked import MXConv2dHW
 from mx_quantizer import MXQuantizer
 from mx_stats import _layer_quant_axes, _quant_operand
 from fixed_point.mx_fixed_point_hw import (
@@ -60,6 +61,35 @@ DEFAULT_CONFIG = {
         "scale_bits": 8,
         "shared_exp_method": "max",
         "custom_cuda": False,
+        # The thing under test. `mode: hw_fixed_point` makes MXQuantizer install
+        # MXConv2dHW instead of MXConv2d, so the conv runs the per-product
+        # int8 x int8 multiply -> signed shift -> narrow saturating accumulator
+        # that the HW datapath implements, rather than an FP32 block dot-product.
+        # This is what main_HW has to reproduce; plain MXConv2d is not the target.
+        "xblock_accum": {
+            "enabled": True,
+            "mode": "hw_fixed_point",
+            "bits": 48,
+            "sat_mode": "per_product",
+            # Per-product shift is `Ew + Ea - 2*mant_bias - e_layer_min`, so
+            # e_layer_min is the exponent of the accumulator's LSB. A product
+            # whose `Ew + Ea - 2*mant_bias` falls below it is right-shifted and
+            # loses that many low bits, so the value must sit at or under
+            # `min(Ew + Ea) - 2*mant_bias` to be lossless - i.e. it is normally
+            # NEGATIVE, around -12 for int8 operands with small exponents.
+            # null = calibrate it per layer from the case's own tensors (what
+            # `calibrate_e_layer_min` does on a real network). Override with
+            # --e-layer-min to study truncation deliberately.
+            "e_layer_min": None,
+            # Block both operands along Cin. Matches `fill_params`, which blocks
+            # weights on dim 1. NPE's flatten/xblock pair lives in
+            # mx_config_npe_*.json - pass it with --config to test that geometry.
+            "weight_blockify": "channel",
+            "act_blockify": "channel",
+            "pad_channels": True,
+            "backend": "python",
+            "verbose": 0,
+        },
     },
     "layers": [],          # filled in per model by `_layer_names`
     "ptq": False,
@@ -208,6 +238,15 @@ def _make_hook(name, taps, bs):
             taps[f"{name}/w_exp"] = w_exp.cpu()
         taps[f"{name}/out"] = output.detach().cpu()
 
+        # MXConv2dHW counts how many outputs its narrow accumulator clamped.
+        # The counters are bumped inside forward(), so they are already current
+        # by the time a forward hook runs. HW must report the same two numbers.
+        if isinstance(module, MXConv2dHW):
+            taps[f"{name}/sat_cnt"] = torch.tensor(module._sat_seen_life,
+                                                   dtype=torch.int64)
+            taps[f"{name}/sat_total"] = torch.tensor(module._sat_total_life,
+                                                     dtype=torch.int64)
+
     return hook
 
 
@@ -233,6 +272,32 @@ def run(case, config=None, verbose=False):
     out_quant = case.get("out_quant")
 
     qmodel = quantize(case["model"], config, out_quant=out_quant, verbose=verbose)
+
+    # Which datapath each layer actually got. MXConv2dHW is the one under test;
+    # the quantizer silently falls back to MXConv2d when a layer cannot take the
+    # HW path (groups != 1 is the common one), and a case that falls back is not
+    # testing the accumulator at all - so record it rather than let it pass
+    # unnoticed.
+    case["meta"]["datapath"] = {
+        name: type(mod).__name__
+        for name, mod in qmodel.named_modules()
+        if isinstance(mod, (MXConv2d, MXLinear))
+    }
+
+    # e_layer_min unset -> calibrate from this case's own input. One batch is
+    # exact here: the case is deterministic and single-input, so the running min
+    # over blocks is the true min, not a sample of it.
+    xb = _get_xblock_cfg_dict(config)
+    if xb.get("enabled") and xb.get("mode") == "hw_fixed_point" \
+            and xb.get("e_layer_min") is None:
+        from fixed_point.mx_fixed_point_hw import calibrate_e_layer_min
+        with torch.no_grad():
+            calibrate_e_layer_min(qmodel, [case["x"]], num_batches=1)
+    case["meta"]["e_layer_min"] = {
+        name: mod.e_layer_min
+        for name, mod in qmodel.named_modules()
+        if isinstance(mod, MXConv2dHW)
+    }
 
     taps, handles = {}, []
     for name, mod in qmodel.named_modules():
@@ -273,6 +338,11 @@ def run(case, config=None, verbose=False):
     return taps
 
 
+def _get_xblock_cfg_dict(config):
+    """The xblock_accum sub-dict of a config, or {} when absent."""
+    return (config.get("mx_specs") or {}).get("xblock_accum") or {}
+
+
 def _fxp_range(oq):
     """Representable float range of a normalized out_quant config.
 
@@ -303,6 +373,16 @@ def _print_taps(name, taps, case):
         print(f"  {k:<28} {str(tuple(t.shape)):<20} {str(t.dtype).replace('torch.',''):<9} {rng}")
     print(f"  out vs FP32: SQNR {sqnr.item():7.2f} dB   "
           f"max|err| {err.abs().max().item():.6g}")
+    dp = case["meta"].get("datapath") or {}
+    if dp:
+        hw = [n for n, c in dp.items() if c == "MXConv2dHW"]
+        soft = {n: c for n, c in dp.items() if c != "MXConv2dHW"}
+        em = case["meta"].get("e_layer_min") or {}
+        print(f"  datapath: {len(hw)}/{len(dp)} layers on MXConv2dHW" +
+              (f"   NOT on HW path: " +
+               ", ".join(f"{n}={c}" for n, c in soft.items()) if soft else "") +
+              (f"   e_layer_min " +
+               ", ".join(f"{n or '.'}={v}" for n, v in em.items()) if em else ""))
     oq = case["meta"].get("out_quant")
     if oq:
         n = taps["model/out_clip"].numel()
@@ -316,9 +396,16 @@ def main():
     parser.add_argument("--config", default=None, help="config JSON (default: built-in)")
     parser.add_argument("--dump", default=None, help="save all taps to a .pt file")
     parser.add_argument("--verbose", action="store_true", help="MXQuantizer logs")
+    parser.add_argument("--e-layer-min", type=int, default=None, metavar="N",
+                        help="pin the accumulator LSB exponent instead of "
+                             "calibrating it (negative; -12 is lossless for "
+                             "int8 operands at small exponents, 0 throws away "
+                             "12 bits)")
     args = parser.parse_args()
 
     config = load_config(args.config, bs=args.bs)
+    if args.e_layer_min is not None:
+        _get_xblock_cfg_dict(config)["e_layer_min"] = args.e_layer_min
     all_taps = {}
     for case in M.cases_from_args(args):
         name = case["meta"]["case"]
