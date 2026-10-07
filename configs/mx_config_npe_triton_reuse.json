@@ -1,0 +1,23 @@
+{
+  "mx_specs": {
+    "w_elem_format": "int8",
+    "a_elem_format": "int8",
+    "block_size": 32,
+    "scale_bits": 8,
+    "shared_exp_method": "max",
+    "custom_cuda": true,
+    "xblock_accum": {
+      "enabled": true,
+      "mode": "hw_fixed_point",
+      "bits": 48,
+      "sat_mode": "per_product",
+      "e_layer_min": -20,
+      "weight_blockify": "flatten",
+      "act_blockify": "xblock",
+      "backend": "triton",
+      "npe_triton_variant": "reuse"
+    }
+  },
+  "layers": [],
+  "ptq": false
+}
