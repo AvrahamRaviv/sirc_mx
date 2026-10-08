@@ -99,7 +99,7 @@
         {
           "fxp": {
             "total_bits": 16,
-            "frac_bits": 6,
+            "frac_bits": 8,
             "signed": true,
             "round": "half_away",
             "saturate": true
