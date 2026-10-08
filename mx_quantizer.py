@@ -43,10 +43,12 @@ def _out_quant_tensor(t, state):
         frac_bits=cfg["frac_bits"], total_bits=cfg["total_bits"],
         signed=cfg["signed"], round_mode=cfg["round"],
         saturate=cfg["saturate"], clip_grad=cfg["clip_grad"],
+        scale=cfg.get("scale"),
     )
     n, n_clip, ssq, sse = fxp_clip_stats(
         t, q, frac_bits=cfg["frac_bits"], total_bits=cfg["total_bits"],
         signed=cfg["signed"], round_mode=cfg["round"],
+        scale=cfg.get("scale"),
     )
     state["n"] += n
     state["n_clipped"] += n_clip
@@ -1525,12 +1527,12 @@ class MXQuantizer:
         Returns:
             dict: layer_name -> (specs_per_input, axes_per_input)
 
-        Returns a 3-tuple per layer: (specs_per_input, axes_per_input,
-        fxp_per_input, output), where `output` is None or
+        Returns a 5-tuple per layer: (specs_per_input, axes_per_input,
+        fxp_per_input, output, call_sites), where `output` is None or
         (spec, axes, fxp).
 
         Entry format (one per parameter-free module to wrap):
-            {"name": "warp", "kind": "act_quant",
+            {"name": "warp", "kind": "act_quant", "call_sites": 3,
              "inputs": [
                {"mx_specs": {...}, "axes": [1]},     # input 0: MX
                {"group": "low_precision", "axes": [-1]},  # input 1: MX by group
@@ -1543,6 +1545,13 @@ class MXQuantizer:
         global. `axes` defaults to [1] (channel axis for NCHW activations) and
         is not used by an "fxp" operand, which has a single static scale and no
         blocks. `output` is optional and takes the same shape as one input.
+
+        `call_sites` (default 1) is how many times the wrapped instance is
+        called per forward pass. It only affects static operands: an `fxp`
+        entry can be a *list* of `call_sites` configs to set a different scale
+        per call, and an entry with `calibrate: true` gets an independent scale
+        per call site. MX operands derive their scale per block, so they are
+        unaffected. See `mx_layers_act` for why the DOF warp needs this.
         """
         if not self.config or "layers" not in self.config:
             return {}
@@ -1560,6 +1569,13 @@ class MXQuantizer:
                 raise ValueError(
                     f"act_quant layer '{name}' must define a non-empty 'inputs' list")
 
+            call_sites = layer.get("call_sites", 1)
+            if not isinstance(call_sites, int) or isinstance(call_sites, bool) \
+                    or call_sites < 1:
+                raise ValueError(
+                    f"act_quant layer '{name}': call_sites must be an int >= 1, "
+                    f"got {call_sites!r}")
+
             specs_per_input, axes_per_input, fxp_per_input = [], [], []
             for i, ent in enumerate(inputs):
                 if ent is None:
@@ -1568,7 +1584,8 @@ class MXQuantizer:
                     fxp_per_input.append(None)
                     continue
                 spec, axes, fxp = self._parse_act_operand(
-                    ent, groups, global_specs, f"act_quant '{name}' input {i}")
+                    ent, groups, global_specs, f"act_quant '{name}' input {i}",
+                    call_sites)
                 specs_per_input.append(spec)
                 axes_per_input.append(axes)
                 fxp_per_input.append(fxp)
@@ -1577,14 +1594,16 @@ class MXQuantizer:
             output = None
             if out_ent is not None:
                 output = self._parse_act_operand(
-                    out_ent, groups, global_specs, f"act_quant '{name}' output")
+                    out_ent, groups, global_specs, f"act_quant '{name}' output",
+                    call_sites)
 
             act_map[name] = (specs_per_input, axes_per_input, fxp_per_input,
-                             output)
+                             output, call_sites)
 
         return act_map
 
-    def _parse_act_operand(self, ent, groups, global_specs, where):
+    def _parse_act_operand(self, ent, groups, global_specs, where,
+                           call_sites=1):
         """Parse one act_quant operand entry -> (mx_spec, axes, fxp_cfg).
 
         Exactly one of the two quantizers is configured: an "fxp" entry returns
@@ -1592,6 +1611,9 @@ class MXQuantizer:
         alternatives — a static fixed-point word has no shared exponent, so
         running it through MX as well would snap it onto a second, different
         lattice.
+
+        An "fxp" value may be a list of `call_sites` configs, one per call of a
+        shared module instance; the returned `fxp_cfg` is then a list.
         """
         axes = ent.get("axes", [1])
         if len(axes) != 1:
@@ -1604,7 +1626,14 @@ class MXQuantizer:
                     raise ValueError(
                         f"{where}: 'fxp' and '{k}' are alternative quantizers; "
                         f"set only one")
-            return None, axes, normalize_out_quant(ent["fxp"])
+            fxp = ent["fxp"]
+            if isinstance(fxp, (list, tuple)):
+                if len(fxp) != call_sites:
+                    raise ValueError(
+                        f"{where}: {len(fxp)} per-call-site fxp configs but "
+                        f"call_sites={call_sites}")
+                return None, axes, [normalize_out_quant(c) for c in fxp]
+            return None, axes, normalize_out_quant(fxp)
 
         if "mx_specs" in ent:
             spec_dict = ent["mx_specs"]
@@ -1634,12 +1663,13 @@ class MXQuantizer:
             parent, leaf = self._get_parent(model, full_name)
             if parent is None:
                 continue
-            specs_per_input, axes_per_input, fxp_per_input, output = \
+            specs_per_input, axes_per_input, fxp_per_input, output, call_sites = \
                 act_map[clean_name]
             out_spec, out_axes, out_fxp = output if output else (None, None, None)
             new = MXActQuant(module, specs_per_input, axes_per_input,
                              fxp_per_input=fxp_per_input, out_spec=out_spec,
-                             out_axes=out_axes, out_fxp=out_fxp)
+                             out_axes=out_axes, out_fxp=out_fxp,
+                             call_sites=call_sites)
             new._mx_layer_name = clean_name
             setattr(parent, leaf, new)
             wrapped.add(clean_name)

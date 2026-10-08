@@ -329,7 +329,8 @@ def run(case, config=None, verbose=False):
         # That integer is what HW emits and what can be compared bit-exactly -
         # the float tap is just the same number scaled.
         oq = normalize_out_quant(out_quant)
-        step = 2.0 ** -oq["frac_bits"]
+        from fixed_point.fxp_quant import fxp_step
+        step = fxp_step(oq)
         code = (taps["model/out"].double() / step).round().to(torch.int64)
         taps["model/out_code"] = code
         # Clip mask: a static scale can overflow where MX cannot, so flag which
@@ -369,7 +370,8 @@ def _fxp_range(oq):
     """
     from fixed_point.fxp_quant import fxp_range
     lo, hi, step = fxp_range(total_bits=oq["total_bits"],
-                             frac_bits=oq["frac_bits"], signed=oq["signed"])
+                             frac_bits=oq["frac_bits"], signed=oq["signed"],
+                             scale=oq.get("scale"))
     return lo * step, hi * step
 
 

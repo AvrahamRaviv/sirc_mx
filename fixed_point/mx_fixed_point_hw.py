@@ -614,3 +614,98 @@ def calibrate_e_layer_min(model, data_iter, num_batches=8, forward_fn=None):
             if hasattr(m, "_calibration_state"):
                 delattr(m, "_calibration_state")
     return result
+
+
+def calibrate_act_scales(model, data_iter, num_batches=8, forward_fn=None,
+                         verbose=1):
+    """Freeze the static scales of every `calibrate: true` fxp act operand.
+
+    MX needs no calibration - its shared exponent comes from each block's max
+    at run time. A static fixed-point operand is the opposite: the scale is
+    fixed before inference, which is what makes it able to clip, and what makes
+    it need data. This is the post-training pass that picks it.
+
+    Per `MXActQuant` instance, per operand, per call site, the observed max|x|
+    over the sampled batches sets `step = max|x| / code_max`, so nothing seen
+    here clips. Call sites are kept apart on purpose: one shared module called
+    at several pyramid levels sees tensors of quite different magnitude, and a
+    single scale is then wrong at most of them.
+
+    Parameters
+    ----------
+    model       : nn.Module holding one or more `MXActQuant` instances.
+    data_iter   : iterable yielding input tensors or tuples; first element is
+                  fed to `forward_fn(model, batch)`.
+    num_batches : number of batches to sample.
+    forward_fn  : callable `(model, batch) -> any`. Defaults to `model(batch)`.
+    verbose     : 1 prints the frozen scales, 0 is silent.
+
+    Returns
+    -------
+    dict: layer name -> {"in<i>@<site>" | "out@<site>": scale}
+    """
+    from mx_layers_act import MXActQuant  # local import to avoid a cycle
+
+    layers = [m for m in model.modules() if isinstance(m, MXActQuant)]
+    pending = [m for m in layers
+               if any(c.get("calibrate") and c.get("scale") is None
+                      for grp in list(m.fxp_per_input) + [m.out_fxp]
+                      if grp is not None for c in grp)]
+    if not pending:
+        return {}
+
+    for m in pending:
+        m.start_calibration()
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for i, batch in enumerate(data_iter):
+                if i >= num_batches:
+                    break
+                for m in pending:
+                    # Call sites are identified by call order, so the counter
+                    # has to restart with every forward pass.
+                    m.reset_calls()
+                if forward_fn is not None:
+                    forward_fn(model, batch)
+                elif isinstance(batch, (tuple, list)):
+                    model(batch[0])
+                else:
+                    model(batch)
+                # `call_sites` is a claim about the model, and getting it wrong
+                # silently mixes two levels' tensors into one scale. Check it
+                # against reality instead, on the first pass.
+                for m in pending:
+                    if m.n_calls != m.call_sites:
+                        name = getattr(m, "_mx_layer_name",
+                                       type(m.inner).__name__)
+                        raise ValueError(
+                            f"calibrate_act_scales: '{name}' is configured "
+                            f"call_sites={m.call_sites} but was called "
+                            f"{m.n_calls} times in one forward pass. Set "
+                            f"call_sites={m.n_calls} in the config.")
+        result = {}
+        for m in pending:
+            name = getattr(m, "_mx_layer_name", type(m.inner).__name__)
+            result[name] = m.finish_calibration()
+    finally:
+        # On the error path nothing is frozen: a scale from a half-finished
+        # sweep is worse than none, since the "run calibration first" error is
+        # at least visible.
+        for m in pending:
+            m.calibrating = False
+            m.reset_calls()
+        if was_training:
+            model.train()
+
+    if verbose:
+        for name, scales in result.items():
+            if not scales:
+                print(f"[calibrate_act_scales] {name}: nothing observed - the "
+                      f"layer was never called")
+                continue
+            pretty = ", ".join(f"{k}={v:.6g}" for k, v in scales.items())
+            print(f"[calibrate_act_scales] {name}: {pretty}")
+    return result

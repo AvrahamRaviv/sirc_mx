@@ -398,11 +398,14 @@ def _make_stats_hook(name, state, output_error=True):
 
 def _act_input_entry(m, st, i, isp, sink, histograms):
     """One MXActQuant input's stats section: MX block stats or fxp clip stats."""
-    fxp = m.fxp_per_input[i]
+    fxp = m.fxp_cfg(i)
     if fxp is not None and fxp.get("enabled", True):
         acc = st["inputs_fxp"][i]
         n, ssq, sse = acc["n"], acc["sum_sq"], acc["sum_sq_err"]
-        return {"format": fxp_format_str(fxp),
+        # Counts are pooled over call sites; the format line names each site
+        # separately when their static scales differ (see MXActQuant docstring).
+        fmts = [fxp_format_str(c) for c in m.fxp_per_input[i]]
+        return {"format": fmts[0] if len(set(fmts)) == 1 else " | ".join(fmts),
                 "quantizer": "fxp",
                 "n": fxp_stats_value(n),
                 "n_clipped": fxp_stats_value(acc["n_clipped"]),
@@ -432,17 +435,18 @@ def _make_act_stats_hook(name, state):
                     break
                 if not torch.is_tensor(x) or not x.is_floating_point():
                     continue
-                fxp = mod.fxp_per_input[i]
+                fxp = mod.fxp_cfg(i)
                 if fxp is not None and fxp.get("enabled", True):
                     xd = x.detach().float()
                     q = fake_quant_fxp(
                         xd, frac_bits=fxp["frac_bits"],
                         total_bits=fxp["total_bits"], signed=fxp["signed"],
-                        round_mode=fxp["round"], saturate=fxp["saturate"])
+                        round_mode=fxp["round"], saturate=fxp["saturate"],
+                        scale=fxp.get("scale"))
                     n, n_clip, ssq, sse = fxp_clip_stats(
                         xd, q, frac_bits=fxp["frac_bits"],
                         total_bits=fxp["total_bits"], signed=fxp["signed"],
-                        round_mode=fxp["round"])
+                        round_mode=fxp["round"], scale=fxp.get("scale"))
                     acc = st["inputs_fxp"][i]
                     acc["n"] += n
                     acc["n_clipped"] += n_clip

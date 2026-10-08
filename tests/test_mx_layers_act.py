@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -361,7 +362,7 @@ def test_quantizer_builds_the_npe_warp_shape_from_config():
     w = model.warp
     assert isinstance(w, MXActQuant)
     assert w.fxp_per_input[0] is None and w.fxp_per_input[1] is not None
-    assert w.fxp_per_input[1]["frac_bits"] == 6
+    assert w.fxp_cfg(1)["frac_bits"] == 6
     assert w.out_spec is not None and w.out_spec["a_elem_format"] == "int8"
     assert "fxp16.6s" in w.extra_repr() and "out=" in w.extra_repr()
 
@@ -398,3 +399,157 @@ def test_collect_stats_reports_an_fxp_input_section():
     assert secs[1]["quantizer"] == "fxp"
     assert secs[1]["format"].startswith("Q7.6")
     assert secs[1]["clipped_frac"] == 1.0, secs[1]
+
+
+# =============================================================================
+# Per-call-site static scales
+#
+# Arch confirmed two things about NPE's int8 warp operands: the static scale is
+# an arbitrary positive real (not restricted to a power-of-two shift), and each
+# pyramid level carries its own. `model.warp` is one instance called once per
+# level, so one spec per module cannot express that - MX hid the problem because
+# its shared exponent adapts per block, a static scale does not.
+# =============================================================================
+
+_CAL8 = {"total_bits": 8, "signed": True, "calibrate": True,
+         "round": "half_away", "saturate": True}
+
+
+class ScaledNet(nn.Module):
+    """warp called three times, each on a 4x larger feature map."""
+
+    def __init__(self):
+        super().__init__()
+        self.warp = Warp()
+
+    def forward(self, x, flow):
+        a = self.warp(x, flow)
+        b = self.warp(a * 4.0, flow)
+        return self.warp(b * 4.0, flow)
+
+
+def test_arbitrary_scale_uses_the_whole_code_range():
+    """A real-valued step beats a power-of-two one when the range is awkward."""
+    from fixed_point.fxp_quant import fake_quant_fxp, fxp_scale_for_max_abs
+
+    x = torch.rand(4096) * 9.0                       # [0, 9): pow2 must use 16
+    pow2 = fxp_scale_for_max_abs(9.0, total_bits=8, pow2=True)
+    real = fxp_scale_for_max_abs(9.0, total_bits=8, pow2=False)
+    assert pow2 == 2.0 ** -3 and real == pytest.approx(9.0 / 127)
+
+    def sqnr(step):
+        q = fake_quant_fxp(x, total_bits=8, signed=True, scale=step)
+        return 10 * torch.log10((x ** 2).sum() / ((x - q) ** 2).sum()).item()
+
+    assert sqnr(real) > sqnr(pow2) + 2.0, (sqnr(real), sqnr(pow2))
+
+
+def test_pow2_scale_is_a_plain_shift():
+    """pow2=True must land on the same lattice frac_bits gives, exactly."""
+    from fixed_point.fxp_quant import fake_quant_fxp, fxp_scale_for_max_abs
+
+    x = torch.rand(256) * 1.4
+    step = fxp_scale_for_max_abs(1.4, total_bits=8, pow2=True)
+    assert step == 2.0 ** -6
+    a = fake_quant_fxp(x, total_bits=8, signed=True, scale=step)
+    b = fake_quant_fxp(x, total_bits=8, signed=True, frac_bits=6)
+    assert torch.equal(a, b)
+
+
+def test_a_calibrated_operand_refuses_to_run_before_calibration():
+    """Silently quantizing with no scale would be the one unrecoverable bug."""
+    w = MXActQuant(Warp(), [None], fxp_per_input=[_fxp_cfg(**_CAL8)])
+    with pytest.raises(RuntimeError, match="calibrate"):
+        w.quant_input(torch.rand(1, 2, 4, 4), 0)
+
+
+def test_calibration_freezes_one_scale_per_call_site():
+    """Three calls on 4x-growing data must give three scales, 4x apart."""
+    from fixed_point.mx_fixed_point_hw import calibrate_act_scales
+
+    net = ScaledNet()
+    net.warp = MXActQuant(net.warp, [None, None],
+                          fxp_per_input=[_fxp_cfg(**_CAL8), None],
+                          out_fxp=_fxp_cfg(**_CAL8), call_sites=3)
+    net.warp._mx_layer_name = "warp"
+
+    x = torch.rand(1, 8, 4, 4)
+    flow = torch.zeros(1, 2, 4, 4)
+    scales = calibrate_act_scales(
+        net, [(x, flow)], num_batches=1,
+        forward_fn=lambda m, b: m(b[0], b[1]), verbose=0)["warp"]
+
+    assert set(scales) == {"in0@0", "in0@1", "in0@2",
+                           "out@0", "out@1", "out@2"}
+    assert scales["in0@1"] == pytest.approx(scales["in0@0"] * 4)
+    assert scales["in0@2"] == pytest.approx(scales["in0@1"] * 4)
+    # And the frozen scales are independent objects, not one shared dict.
+    assert len({id(c) for c in net.warp.fxp_per_input[0]}) == 3
+
+    net.warp.reset_calls()
+    y = net(x, flow)
+    assert torch.isfinite(y).all()
+
+
+def test_an_explicit_scale_is_shared_across_call_sites():
+    """A scale that was given, not learned, is one spec for the whole module."""
+    cfg = _fxp_cfg(total_bits=8, scale=0.05)
+    w = MXActQuant(Warp(), [None], fxp_per_input=[cfg], call_sites=3)
+    assert len({id(c) for c in w.fxp_per_input[0]}) == 1
+    assert all(c["scale"] == 0.05 for c in w.fxp_per_input[0])
+
+
+def test_calibration_rejects_a_wrong_call_sites_count():
+    """call_sites is a claim about the model; a wrong one must not pass quietly."""
+    from fixed_point.mx_fixed_point_hw import calibrate_act_scales
+
+    net = ScaledNet()                                  # calls warp 3 times
+    net.warp = MXActQuant(net.warp, [None, None],
+                          fxp_per_input=[_fxp_cfg(**_CAL8), None],
+                          call_sites=2)
+    net.warp._mx_layer_name = "warp"
+    with pytest.raises(ValueError, match="called 3 times"):
+        calibrate_act_scales(net, [(torch.rand(1, 8, 4, 4),
+                                    torch.zeros(1, 2, 4, 4))],
+                             num_batches=1,
+                             forward_fn=lambda m, b: m(b[0], b[1]), verbose=0)
+    assert net.warp.fxp_per_input[0][0]["scale"] is None
+
+
+def test_quantizer_builds_per_call_site_scales_from_config():
+    """call_sites + a per-site fxp list come through the config path."""
+    cfg = {
+        "mx_specs": {"a_elem_format": "int8", "block_size": 32,
+                     "scale_bits": 8, "shared_exp_method": "max",
+                     "custom_cuda": False},
+        "layers": [
+            {"name": "warp", "kind": "act_quant", "call_sites": 2,
+             "inputs": [
+                 {"fxp": [{**_CAL8, "scale": 0.01}, {**_CAL8, "scale": 0.04}]},
+                 {"fxp": _GRID_FXP},
+             ]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "mx_config.json"), "w") as f:
+            json.dump(cfg, f)
+        model = MXQuantizer(save_dir=d).quant(Net())
+
+    w = model.warp
+    assert w.call_sites == 2
+    assert [c["scale"] for c in w.fxp_per_input[0]] == [0.01, 0.04]
+    assert "step0.01|" in w.extra_repr() and "call_sites=2" in w.extra_repr()
+
+
+def test_config_rejects_a_per_site_list_of_the_wrong_length():
+    cfg = {
+        "layers": [
+            {"name": "warp", "kind": "act_quant", "call_sites": 3,
+             "inputs": [{"fxp": [{**_CAL8, "scale": 0.01}]}]},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "mx_config.json"), "w") as f:
+            json.dump(cfg, f)
+        with pytest.raises(ValueError, match="call_sites=3"):
+            MXQuantizer(save_dir=d).quant(Net())
