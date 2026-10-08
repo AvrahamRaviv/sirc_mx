@@ -64,11 +64,14 @@
 	{"name": "model.block3.conv1",           "group": "convT_plain"},
 	{"name": "model.block3.convtranspose_2", "group": "convT_plain"},
 	{"name": "model.block4.conv1",           "group": "convT_plain"},
-	{"name": "model.warp", "kind": "act_quant",
+	{"name": "model.warp", "kind": "act_quant", "call_sites": 3,
 	 "inputs": [
-	   {"mx_specs": {"a_elem_format": "int8", "block_size": 32, "scale_bits": 8,
-	                 "shared_exp_method": "max", "custom_cuda": true},
-	    "axes": [-1]},
+	   {"fxp": [{"total_bits": 8, "signed": true, "scale": 0.188976,
+	             "round": "half_away", "saturate": true},
+	            {"total_bits": 8, "signed": true, "scale": 0.047244,
+	             "round": "half_away", "saturate": true},
+	            {"total_bits": 8, "signed": true, "scale": 0.011811,
+	             "round": "half_away", "saturate": true}]},
 	   {"fxp": {"total_bits": 16, "frac_bits": 8, "signed": true,
 	           "round": "half_away", "saturate": true}}
 	 ]},
