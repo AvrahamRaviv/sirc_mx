@@ -1084,7 +1084,7 @@ CASES: Dict[str, Case] = {
         tags=("fxp", "corner"),
     ),
 
-    # --- DOF element formats: the ladder runs int4 / int6 / int8 ------------
+    # --- narrow element formats: int4 / int6 ----------------------------------
     "fmt_int4": Case(
         build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
         input_shape=lambda bs: (1, bs, 4, bs + 8),
@@ -1092,14 +1092,14 @@ CASES: Dict[str, Case] = {
         note="MXINT4 (DOF ladder rung): mant_bias 2, mantissa +-7, so most "
              "elements of a block round to a handful of codes and ties are "
              "everywhere. Partial X-block tail on top.",
-        tags=("fmt", "dof"),
+        tags=("fmt",),
     ),
     "fmt_int6": Case(
         build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
         input_shape=lambda bs: (1, bs, 4, bs + 8),
         mx={"w_elem_format": "int6", "a_elem_format": "int6"},
         note="MXINT6 (DOF ladder rung): mant_bias 4, mantissa +-31.",
-        tags=("fmt", "dof"),
+        tags=("fmt",),
     ),
     "fmt_int4_ties": Case(
         build=lambda bs: SingleConv(bs, bs, k=1),
@@ -1111,7 +1111,7 @@ CASES: Dict[str, Case] = {
              "tie of the 3-bit mantissa grid (k + 0.5 steps, |k + 0.5| < 7). "
              "int4 is where a tie rule costs most - one step is 1/8 of the "
              "block max.",
-        tags=("fmt", "dof", "mxq"),
+        tags=("fmt", "mxq"),
     ),
 
     # --- warp (DOF): int8 ref, Q8.8 grid, int8 out -------------------------
@@ -1226,108 +1226,6 @@ CASES: Dict[str, Case] = {
         tags=("warp", "dof", "topology"),
     ),
 }
-
-
-# =============================================================================
-# DOF-shaped convs, from a shape dump of the real network
-# =============================================================================
-#
-# `dump_layer_shapes.py` run on DOF writes every conv's geometry and input
-# shape; each distinct Conv2d geometry becomes one `dof_<layer>` case with the
-# real Cin / Cout / kernel / stride / padding / dilation / bias and the real
-# input W - which is what sets the X-block tail under NPE. H is cropped to the
-# few rows that give two output rows: under NPE no block spans H, so more rows
-# only repeat the same blocking.
-
-import json as _json
-import os as _os
-
-DOF_SHAPES = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
-                           "dof_shapes.json")
-DOF_CONFIG = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
-                           "mx_config_dof_npe_auto_ladder.json")
-DOF_SKIPPED: Dict[str, str] = {}
-
-
-def _dof_plain_layers(path=DOF_CONFIG):
-    """DOF layers the production config pins to a plain-MX group (off the HW
-    accumulator path)."""
-    try:
-        with open(path) as f:
-            cfg = _json.load(f)
-    except OSError:
-        return set()
-    return {l["name"] for l in cfg.get("layers", [])
-            if isinstance(l, dict) and l.get("group") == "convT_plain"}
-
-
-def _short(name):
-    return (name[len("model."):] if name.startswith("model.") else name) \
-        .replace(".", "_")
-
-
-def register_dof_cases(path=DOF_SHAPES, cases=None):
-    """Add one case per distinct DOF Conv2d geometry. Returns the new names.
-
-    ConvTranspose2d (no HW path yet) and groups != 1 (falls back to FP32) are
-    not registered; they are listed in `DOF_SKIPPED` with the reason.
-    """
-    cases = CASES if cases is None else cases
-    if not _os.path.exists(path):
-        return []
-    with open(path) as f:
-        rec = _json.load(f)
-    plain = _dof_plain_layers()
-    seen, added = {}, []
-    for row in rec.get("convs", []):
-        name = row["name"]
-        if row["type"] != "Conv2d":
-            DOF_SKIPPED[name] = f"{row['type']}: no HW path in the lib yet"
-            continue
-        if row["groups"] != 1:
-            DOF_SKIPPED[name] = f"groups={row['groups']}: FP32 fallback"
-            continue
-        kH, kW = row["kernel_size"]
-        sH, sW = row["stride"]
-        pH, pW = row["padding"]
-        dH, dW = row["dilation"]
-        B, cin, H, W = row["input_shape"]
-        key = (cin, row["out_channels"], kH, kW, sH, sW, pH, pW, dH, dW,
-               row["bias"], W)
-        if key in seen:
-            seen[key].append(name)
-            continue
-        seen[key] = [name]
-        Hc = max(sH + dH * (kH - 1) + 1 - 2 * pH, 2)
-        cname = "dof_" + _short(name)
-        cout, bias = row["out_channels"], row["bias"]
-        cases[cname] = Case(
-            build=lambda bs, a=(cin, cout, (kH, kW), (sH, sW), (pH, pW),
-                                (dH, dW), bias):
-                SingleConv(a[0], a[1], k=a[2], stride=a[3], padding=a[4],
-                           dilation=a[5], bias=a[6]),
-            input_shape=lambda bs, s=(1, cin, Hc, W): s,
-            note="",            # filled below, once every sharer is known
-            tags=("dof", "dof_conv"),
-        )
-        cases[cname]._dof = (key, name, H, W, name in plain)
-        added.append(cname)
-    for cname in added:
-        key, name, H, W, is_plain = cases[cname]._dof
-        sharers = seen[key]
-        cin, cout, kH, kW, sH, sW, pH, pW = key[:8]
-        cases[cname].note = (
-            f"DOF {name}: {cin}->{cout} {kH}x{kW} s{sH}x{sW} p{pH}x{pW}, real "
-            f"input H x W = {H} x {W} (H cropped). W = {W} is "
-            f"{W // BLOCK_SIZE} full X-block(s) + a {W % BLOCK_SIZE}-wide tail."
-            + (f" Same geometry: {', '.join(sharers[1:])}." if len(sharers) > 1
-               else "")
-            + (" DOF pins this layer to plain MX (convT_plain), so the real "
-               "net does not run it on the HW accumulator." if is_plain else ""))
-    return added
-
-
-DOF_CASES = register_dof_cases()
 
 
 # =============================================================================
@@ -1450,8 +1348,8 @@ def add_model_args(parser):
                         metavar="NAME",
                         help="case name from the registry, or 'all' / a tag "
                              "(baseline, align, geometry, topology, stress, "
-                             "corner, fxp, mxq, xblock, accum, fmt, dof, warp, "
-                             "dof_conv) to select a group. --list prints "
+                             "corner, fxp, mxq, xblock, accum, fmt, dof, warp) "
+                             "to select a group. --list prints "
                              "them.")
     parser.add_argument("--bs", type=int, default=BLOCK_SIZE,
                         help=f"MX block size (default {BLOCK_SIZE})")

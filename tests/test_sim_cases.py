@@ -233,7 +233,7 @@ def test_acc_wider_than_fp32_is_flagged():
 
 
 # =============================================================================
-# DOF formats
+# Narrow formats
 # =============================================================================
 
 def test_int4_ties_separate_rounding_rules():
@@ -352,49 +352,3 @@ def test_conv_warp_handoff():
     v = taps["conv/out"].double() / step
     want = (torch.sign(v) * torch.floor(v.abs() + 0.5)).clamp(-128, 127)
     assert torch.equal(taps["warp/ref_code"].double(), want)
-
-
-# =============================================================================
-# DOF-shaped convs from a shape dump
-# =============================================================================
-
-def test_register_dof_cases_from_dump(tmp_path):
-    import json
-    import torch.nn as nn
-    from dump_layer_shapes import dump_layer_shapes
-
-    class Toy(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.a = nn.Conv2d(3, 16, 3, stride=2, padding=1)
-            self.b = nn.Conv2d(16, 16, 3, padding=1)
-            self.c = nn.Conv2d(16, 16, 3, padding=1)        # same as b
-            self.d = nn.Conv2d(16, 16, 3, padding=1, groups=16)
-            self.up = nn.ConvTranspose2d(16, 4, 4, stride=2, padding=1)
-
-        def forward(self, x):
-            x = self.b(self.a(x))
-            return self.up(self.d(self.c(x)))
-
-    path = tmp_path / "shapes.json"
-    dump_layer_shapes(Toy(), torch.randn(1, 3, 10, 90), str(path))
-    rec = json.loads(path.read_text())
-    assert [r["name"] for r in rec["convs"]] == ["a", "b", "c", "d", "up"]
-
-    cases = {}
-    names = M.register_dof_cases(str(path), cases=cases)
-    assert names == ["dof_a", "dof_b"]
-    assert "c" in cases["dof_b"].note
-    assert set(M.DOF_SKIPPED) >= {"d", "up"}
-
-    saved = dict(M.CASES)
-    try:
-        M.CASES.update(cases)
-        case = M.build_case("dof_b")
-        assert case["x"].shape[-1] == 45                  # real W kept
-        taps = ALG.run(case, ALG.load_config())
-        assert case["meta"]["datapath"] == {"conv": "MXConv2dHW"}
-        assert taps["conv/a_exp"].shape[-1] == 2          # 32 + 13-wide tail
-    finally:
-        M.CASES.clear()
-        M.CASES.update(saved)

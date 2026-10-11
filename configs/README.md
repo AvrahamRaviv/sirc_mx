@@ -32,23 +32,18 @@ intermediate value printable.
 - `export_vectors.py` — freezes cases into `bundle/` (`.npy` + `.txt` + manifest) for a
   side that has neither torch nor the MX lib.
 
-## DOF first (tag `dof`)
+## DOF warp (tags `dof`, `warp`)
 
-DOF is conv + ConvTranspose + warp. Covered here:
+DOF scope is the warp layer (its convs are plain MX convs, covered by the
+generic cases). Covered here:
 
-- **warp** (tag `warp`, 11 cases) - `models.Warp` is the spec: int8 ref, Q8.8
+- **warp** (12 cases) - `models.Warp` is the spec: int8 ref, Q8.8
   grid (a displacement in px, channel 0 = x), bilinear with 8-bit weights,
   zero padding, int8 out; static arbitrary-real scales per call site.
   `tap_check.ref_warp` rebuilds every `out_code` from the integer taps. One
   case per open convention (grid meaning, coordinate split, out of bounds,
   three tie rules, both saturations), plus `warp_subpix` (DOF as configured),
   `warp_levels` (3 call sites) and `conv_warp` (MX conv -> warp handoff).
-- **DOF formats** - `fmt_int4`, `fmt_int6`, `fmt_int4_ties` (the ladder rungs).
-- **DOF-shaped convs** (tag `dof_conv`) - generated from `dof_shapes.json`,
-  one case per distinct Conv2d geometry, real W. The file comes from the real
-  net: run `dump_layer_shapes.dump_layer_shapes(model, inputs, path)` where
-  DOF lives and drop the JSON here. Until then the tag is empty.
-- ConvTranspose2d - not yet (no integer path in the lib).
 
 ## Geometry
 
