@@ -38,13 +38,11 @@ from microxcaling.mx.convolution import Conv2d as MXConv2d
 from microxcaling.mx.linear import Linear as MXLinear
 from mx_layers_blocked import MXConv2dHW
 from mx_quantizer import MXQuantizer
-from mx_stats import _layer_quant_axes, _quant_operand
-from fixed_point.mx_fixed_point_hw import (
-    extract_mxint, extract_mxint_flatten, extract_mxint_xblock,
-)
+from mx_stats import _is_npe, _layer_quant_axes, _quant_operand
 from fixed_point.fxp_quant import normalize_out_quant, fxp_format_str
 
 import models as M
+import tap_check as TC
 
 
 # =============================================================================
@@ -81,11 +79,11 @@ DEFAULT_CONFIG = {
             # null = calibrate per layer instead; --e-layer-min pins any value
             # (0 right-shifts every product by 9-12 bits - see the README).
             "e_layer_min": -20,
-            # Block both operands along Cin. Matches `fill_params`, which blocks
-            # weights on dim 1. NPE's flatten/xblock pair lives in
-            # mx_config_npe_*.json - pass it with --config to test that geometry.
-            "weight_blockify": "channel",
-            "act_blockify": "channel",
+            # NPE geometry, confirmed by arch: activations block along W, each
+            # weight filter is flattened [Cin*kH*kW] and blocked along that
+            # stream. --blockify channel switches both operands to Cin.
+            "weight_blockify": "flatten",
+            "act_blockify": "xblock",
             "pad_channels": True,
             "backend": "python",
             # NOT 0. MXQuantizer._replace_layers derives its own verbosity from
@@ -101,15 +99,66 @@ DEFAULT_CONFIG = {
 }
 
 
-def load_config(path=None, bs=None):
-    """Read a config JSON, or return the default. `bs` overrides block_size so
-    `--bs` stays the single knob for both the model shapes and the quantizer."""
+BLOCKIFY_KEYS = {"npe": ("xblock", "flatten"), "channel": ("channel", "channel")}
+
+
+def _deep_merge(base, over):
+    """`over` into a copy of `base`, recursing into dicts - so a config file
+    that sets one xblock_accum key does not wipe the other defaults."""
+    out = json.loads(json.dumps(base))
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path=None, bs=None, blockify=None):
+    """Read a config JSON over the default, or return the default.
+
+    The file is deep-merged, so it only has to name what it changes. `bs`
+    overrides block_size so `--bs` stays the single knob for both the model
+    shapes and the quantizer; `blockify` ('npe' | 'channel') sets both
+    operands' blocking, and must match the one the cases were built with.
+    """
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))     # deep copy
     if path:
         with open(path) as f:
-            cfg.update(json.load(f))
+            cfg = _deep_merge(cfg, json.load(f))
     if bs is not None:
         cfg.setdefault("mx_specs", {})["block_size"] = bs
+    if blockify is not None:
+        act_b, wt_b = BLOCKIFY_KEYS[blockify]
+        xb = _get_xblock_cfg_dict(cfg)
+        xb["act_blockify"], xb["weight_blockify"] = act_b, wt_b
+    return cfg
+
+
+def config_blockify(config):
+    """'npe' or 'channel', from the xblock_accum keys."""
+    xb = _get_xblock_cfg_dict(config)
+    pair = (xb.get("act_blockify", "channel"), xb.get("weight_blockify", "channel"))
+    for name, keys in BLOCKIFY_KEYS.items():
+        if pair == keys:
+            return name
+    raise ValueError(f"unsupported blockify pair {pair}")
+
+
+def effective_config(case, config):
+    """The config one case actually runs under: `config` plus the case's own
+    `mx` / `accum` overrides (element format, scale_bits, accumulator bits,
+    e_layer_min, ...). main.py hands the same dict to both sides."""
+    cfg = json.loads(json.dumps(config))
+    meta = case["meta"]
+    over = dict(meta.get("mx") or {})
+    if meta.get("accum"):
+        over["xblock_accum"] = meta["accum"]
+    cfg["mx_specs"] = _deep_merge(cfg["mx_specs"], over)
+    got = config_blockify(cfg)
+    if meta.get("blockify") and meta["blockify"] != got:
+        raise ValueError(f"case {meta['case']} was built for blockify="
+                         f"{meta['blockify']} but the config says {got}")
     return cfg
 
 
@@ -167,55 +216,35 @@ def quantize(model, config, out_quant=None, verbose=False):
 # =============================================================================
 #
 # Tap names follow the convention in `main.py` so the two sides line up key by
-# key:
+# key. Per layer:
 #
-#   <layer>/a_int, <layer>/a_exp   quantised activations: intN + shared exponent
-#   <layer>/w_int, <layer>/w_exp   quantised weights, same
-#   <layer>/out                    layer output
-#   model/out                      network output
+#   <layer>/a_int   intN activation mantissas, [B, C, H, W]
+#   <layer>/a_exp   activation exponent CODES, one per block (see tap_check.py:
+#                   code = E + emax, unsigned; all-zero block = 0)
+#                     npe      [B, C, H, ceil(W / bs)]
+#                     channel  [B, ceil(C / bs), H, W]
+#   <layer>/w_int   intN weight mantissas, [O, Cin, kH, kW]
+#   <layer>/w_exp   weight exponent codes, one per block
+#                     npe      [O, ceil(Cin*kH*kW / bs)], the filter flattened
+#                              C-major (c, kh, kw) - w_int.reshape(O, -1)
+#                     channel  [O, ceil(Cin / bs), kH, kW]
+#   <layer>/acc     int64 accumulator word after the last product, the bias
+#                   and the final clamp - THE bit-exact output of a HW layer
+#   <layer>/sat     uint8 [B, O, Ho, Wo], 1 where the accumulator clamped
+#   <layer>/out     acc * 2^e_layer_min as fp32 - lossy above 24 bits, float
+#                   comparison only
+#   model/out       network output
 #
-# The int taps are the ones that can be compared bit-exactly. `/out` is FP32 on
-# this side, so it is compared by SQNR until the HW side reports its own
-# integer output.
+# acc / sat exist only for layers on the HW datapath (MXConv2dHW).
 
-def _extract_padded(q_fp, bs, axis, fmt):
-    """`extract_mxint` on an axis that is not a multiple of `bs`.
-
-    The lib's `_reshape_to_blocks` zero-pads the quant axis, and zeros do not
-    move a max-abs shared exponent, so padding here reproduces the blocks the
-    forward pass actually formed. The pad is sliced back off the mantissas; the
-    shared exponent keeps its tail block.
-    """
-    axis = axis % q_fp.dim()
-    C = q_fp.shape[axis]
-    pad = (-C) % bs
-    if pad:
-        shape = list(q_fp.shape)
-        shape[axis] = pad
-        q_fp = torch.cat([q_fp, q_fp.new_zeros(shape)], dim=axis)
-    q_int, exp = extract_mxint(q_fp, bs, axis, fmt=fmt)
-    if pad:
-        q_int = q_int.narrow(axis, 0, C).contiguous()
-    return q_int, exp
-
-
-def _ints(q_fp, module, axes, bs, fmt):
-    """intN mantissas + per-block shared exponent from a fake-quant tensor.
-
-    Which extractor applies depends on how the layer blockifies: NPE mode
-    flattens the weights per filter and blocks activations along W; the default
-    MX path blocks both along channels.
-    """
-    from mx_stats import _is_npe
+def _decode(q_fp, axis, bs, fmt, scale_bits):
+    """`tap_check.mx_decode`, or (None, None) for formats with no integer form
+    (fp8 / MXFP) - those layers still get their float tap compared."""
     try:
-        if isinstance(module, MXConv2d) and _is_npe(module):
-            return (extract_mxint_flatten(q_fp, bs, fmt=fmt) if q_fp.dim() == 4
-                    and axes == [1] else extract_mxint_xblock(q_fp, bs, fmt=fmt))
-        return _extract_padded(q_fp, bs, axes[0], fmt)
-    except (ValueError, RuntimeError) as e:
-        # Non-int formats (fp8 / MXFP) have no intN representation; the float
-        # tap still gets compared.
+        mbits = TC.fmt_bits(fmt)
+    except ValueError:
         return None, None
+    return TC.mx_decode(q_fp, axis, bs, mbits, scale_bits)
 
 
 def _make_hook(name, taps, bs):
@@ -225,14 +254,24 @@ def _make_hook(name, taps, bs):
         sp = module.mx_specs
         act_axes, wt_axes = _layer_quant_axes(module)
         a_fmt, w_fmt = sp["a_elem_format"], sp["w_elem_format"]
+        sbits = sp["scale_bits"]
 
         x = inputs[0].detach()
         _, qa = _quant_operand(x, sp, a_fmt, act_axes, "round_output")
-        _, qw = _quant_operand(module.weight.detach(), sp, w_fmt, wt_axes,
-                               "round_weight")
-
-        a_int, a_exp = _ints(qa, module, act_axes, bs, a_fmt)
-        w_int, w_exp = _ints(qw, module, wt_axes, bs, w_fmt)
+        w = module.weight.detach()
+        if isinstance(module, MXConv2dHW) and _is_npe(module):
+            # NPE quantizes the per-filter flattened weight [O, Cin*kH*kW], so a
+            # block spans kernel taps as well as channels. Quantizing the 4D
+            # tensor along Cin forms different blocks whenever k > 1.
+            _, qw = _quant_operand(w.reshape(w.shape[0], -1), sp, w_fmt,
+                                   wt_axes, "round_weight")
+            w_int, w_exp = _decode(qw, 1, bs, w_fmt, sbits)
+            if w_int is not None:
+                w_int = w_int.reshape(w.shape)
+        else:
+            _, qw = _quant_operand(w, sp, w_fmt, wt_axes, "round_weight")
+            w_int, w_exp = _decode(qw, wt_axes[0], bs, w_fmt, sbits)
+        a_int, a_exp = _decode(qa, act_axes[0], bs, a_fmt, sbits)
 
         if a_int is not None:
             taps[f"{name}/a_int"] = a_int.cpu()
@@ -242,14 +281,15 @@ def _make_hook(name, taps, bs):
             taps[f"{name}/w_exp"] = w_exp.cpu()
         taps[f"{name}/out"] = output.detach().cpu()
 
-        # MXConv2dHW counts how many outputs its narrow accumulator clamped.
-        # The counters are bumped inside forward(), so they are already current
-        # by the time a forward hook runs. HW must report the same two numbers.
+        # MXConv2dHW keeps the int64 accumulator and the per-output clamp map
+        # of its last forward when `_tap_acc` is set (see run()).
         if isinstance(module, MXConv2dHW):
-            taps[f"{name}/sat_cnt"] = torch.tensor(module._sat_seen_life,
-                                                   dtype=torch.int64)
-            taps[f"{name}/sat_total"] = torch.tensor(module._sat_total_life,
-                                                     dtype=torch.int64)
+            if module._last_acc is None:
+                raise RuntimeError(f"{name}: no accumulator tap - the layer "
+                                   f"ran on a backend that does not keep it "
+                                   f"(use backend 'python')")
+            taps[f"{name}/acc"] = module._last_acc.cpu()
+            taps[f"{name}/sat"] = module._last_sat.to(torch.uint8).cpu()
 
     return hook
 
@@ -258,20 +298,28 @@ def _make_hook(name, taps, bs):
 # Run
 # =============================================================================
 
-def run(case, config=None, verbose=False):
+def run(case, config=None, verbose=False, check=True):
     """Run one case through the MX lib.
 
     Args:
         case: a dict from `models.build_case`.
-        config: config dict (see `DEFAULT_CONFIG`); default if None.
+        config: config dict (see `DEFAULT_CONFIG`); default if None. The case's
+            own `mx` / `accum` overrides are applied on top.
         verbose: let MXQuantizer print its replacement summary.
+        check: rebuild every HW layer's accumulator from its integer taps
+            (`tap_check.check_layer`) and raise if it differs from what
+            MXConv2dHW computed. On by default: a tap that does not explain
+            our own output must never reach arch.
 
     Returns:
         dict: tap name -> tensor, including "model/out". Cases carrying an
         `out_quant` also get "model/out_pre" (before the fixed-point stage),
         "model/out_code" (the integer word) and "model/out_clip".
     """
-    config = config or load_config(bs=case["meta"]["block_size"])
+    config = config or load_config(bs=case["meta"]["block_size"],
+                                   blockify=case["meta"].get("blockify"))
+    config = effective_config(case, config)
+    case["meta"]["config"] = config
     bs = config["mx_specs"]["block_size"]
     out_quant = case.get("out_quant")
 
@@ -305,6 +353,8 @@ def run(case, config=None, verbose=False):
 
     taps, handles = {}, []
     for name, mod in qmodel.named_modules():
+        if isinstance(mod, MXConv2dHW):
+            mod._tap_acc = True
         if isinstance(mod, (MXConv2d, MXLinear)):
             handles.append(mod.register_forward_hook(_make_hook(name, taps, bs)))
 
@@ -340,7 +390,26 @@ def run(case, config=None, verbose=False):
         if pre is not None:
             taps["model/out_clip"] = ((pre < lo) | (pre > hi)).to(torch.uint8)
 
+    if check:
+        case["meta"]["tap_check"] = _check_taps(qmodel, taps, case, config)
     return taps
+
+
+def _check_taps(qmodel, taps, case, config):
+    """`tap_check.check_layer` on every HW layer. Raises on the first one whose
+    taps do not rebuild its own accumulator."""
+    sp = config["mx_specs"]
+    xb = _get_xblock_cfg_dict(config)
+    res = {}
+    for name, mod in qmodel.named_modules():
+        if not isinstance(mod, MXConv2dHW):
+            continue
+        res[name] = TC.check_layer(
+            name, taps, mod, e_layer_min=int(case["meta"]["e_layer_min"][name]),
+            bits=int(xb["bits"]), sat_mode=xb["sat_mode"],
+            bs=sp["block_size"], mbits=TC.fmt_bits(sp["a_elem_format"]),
+            scale_bits=sp["scale_bits"], blockify=config_blockify(config))
+    return res
 
 
 def _datapath_name(mod):
@@ -403,6 +472,12 @@ def _print_taps(name, taps, case):
                ", ".join(f"{n}={c}" for n, c in soft.items()) if soft else "") +
               (f"   e_layer_min " +
                ", ".join(f"{n or '.'}={v}" for n, v in em.items()) if em else ""))
+    tc = case["meta"].get("tap_check")
+    if tc:
+        lossy = {n: r["acc_fp32_lossy"] for n, r in tc.items() if r["acc_fp32_lossy"]}
+        print(f"  tap_check: {len(tc)}/{len(tc)} HW layers rebuild bit-exact"
+              + (f"   acc wider than fp32 (use /acc, not /out): " +
+                 ", ".join(f"{n}={v}" for n, v in lossy.items()) if lossy else ""))
     oq = case["meta"].get("out_quant")
     if oq:
         n = taps["model/out_clip"].numel()
@@ -423,7 +498,7 @@ def main():
                              "12 bits)")
     args = parser.parse_args()
 
-    config = load_config(args.config, bs=args.bs)
+    config = load_config(args.config, bs=args.bs, blockify=args.blockify)
     if args.verbose:
         _get_xblock_cfg_dict(config)["verbose"] = 2
     if args.e_layer_min is not None:

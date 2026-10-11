@@ -12,24 +12,53 @@ intermediate value printable.
 ## Content
 
 - `models.py` — benchmark of small models: single conv, conv-relu, conv-relu-conv, dw conv,
-  concatenation, etc. Each model also comes in variants that hit the corner cases:
-  channels not a multiple of `block_size` (tail block), stride / dilation, spatial padding,
-  bias, blocks that fully underflow, blocks that saturate the accumulator.
+  concatenation, etc. Each model also comes in variants that hit the corner cases: tail
+  blocks, stride / dilation / non-square kernels, spatial padding, bias, batch > 1, blocks
+  that underflow or saturate the accumulator, MX rounding ties and mantissa overflow, zero
+  blocks, exponent-field clamping, other element formats and accumulator widths. A case can
+  override `mx_specs` (`mx=`) and `xblock_accum` (`accum=`) for itself.
 - Some cases also carry a **static fixed-point output stage** (`out_quant`): the network
   output leaves in a fixed `Qm.n` word rather than in MX. It is a different quantizer —
   MX takes its scale from each block's max and so cannot overflow, while a static scale is
   fixed up front and overflows silently. Tagged `fxp`.
-- `main_HW.py` — takes `model` (from `models.py`), `ckpt`, `tvs`, and a `config` holding the
-  HW-specific settings (accumulator bitwidth, scale size, blockification, saturation mode,
-  `e_layer_min`). Replaces every op with its HW implementation, returns output per tv.
-- `main_ALG.py` — same interface, using the MX lib as the replacement.
-- `main.py` — runs both and compares their outputs.
+- `main_HW.py` — the HW side, and the contract: tap names, shapes, config keys, the open
+  spec questions with the case that settles each.
+- `main_ALG.py` — same interface, using the MX lib (`MXConv2dHW`, the fixed-point
+  accumulator datapath).
+- `tap_check.py` — the ALG side's own check, written from the spec with no MX lib import:
+  rebuilds every HW layer's accumulator from its integer taps. `main_ALG.run` refuses to
+  return taps that fail it.
+- `main.py` — runs both and compares their taps in pipeline order.
+- `export_vectors.py` — freezes cases into `bundle/` (`.npy` + `.txt` + manifest) for a
+  side that has neither torch nor the MX lib.
 
-## Backlog
+## Geometry
 
-- [ ] Add prints at each stage of `main_HW` / `main_ALG`, to compare intermediate computation
-      states: W int + shared exp, A int + shared exp, accumulator before and after shift,
-      accumulator after saturation, output requant. First stage that differs is the spec line
-      we disagree on.
-- [ ] Report, per stage: bit-exact yes/no, flat index of the first mismatch, histogram of the
-      integer deltas.
+NPE by default, as confirmed by arch: activations blocked along W, weights flattened per
+filter (C-major) and blocked along that stream. `--blockify channel` switches both the
+config and the pattern layout to Cin blocking. The two have to agree: patterns such as
+"one dominant element per block" are laid out along the block axis.
+
+## Tap contract (per HW layer)
+
+| tap | dtype | shape (NPE) |
+|---|---|---|
+| `a_int` | int8 / int16 | `[B, C, H, W]` |
+| `a_exp` | int16, unsigned code `E + emax` | `[B, C, H, ceil(W/bs)]` |
+| `w_int` | int8 / int16 | `[O, Cin, kH, kW]` |
+| `w_exp` | int16, code | `[O, ceil(Cin·kH·kW/bs)]` |
+| `acc` | int64 | `[B, O, Ho, Wo]` — the bit-exact layer output |
+| `sat` | uint8 | `[B, O, Ho, Wo]` |
+| `out` | fp32 | `acc · 2^e_layer_min` (lossy above 24 bits) |
+
+`emax = 2^(scale_bits-1) - 1`; an all-zero block has code 0.
+
+## Usage
+
+```bash
+python main_ALG.py -m all                     # every case, taps + tap_check summary
+python main_ALG.py -m mxq --blockify channel  # a tag, other geometry
+python main.py -m baseline                    # both sides, compared (exit 2 until HW exists)
+python export_vectors.py -m corner --clean    # freeze cases for arch
+pytest ../tests/test_sim_cases.py             # every case rebuilds + triggers its target
+```

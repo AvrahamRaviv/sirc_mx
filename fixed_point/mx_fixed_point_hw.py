@@ -182,6 +182,7 @@ def _hw_fxp_conv2d_ref(
     bs, bits, sat_mode,
     bias_fp=None,
     mant_bias=MANTISSA_BIAS,
+    return_acc=False,
 ):
     """Pure-torch reference for the HW fixed-point conv2d kernel.
 
@@ -200,6 +201,9 @@ def _hw_fxp_conv2d_ref(
     -------
     out : [B, O, L]   fp32
     sat : [B, O, L]   bool  (True if the accumulator saturated at any step)
+    acc : [B, O, L]   int64, only with `return_acc` - the accumulator word
+          itself. `out` is that word cast to fp32, which keeps only 24 bits,
+          so a bit-exact comparison against HW has to use `acc`.
     """
     if not isinstance(stride, tuple):   stride   = (int(stride),   int(stride))
     if not isinstance(padding, tuple):  padding  = (int(padding),  int(padding))
@@ -277,6 +281,8 @@ def _hw_fxp_conv2d_ref(
         sat = sat | sat_step
 
     out = acc.to(torch.float32) * float(2.0 ** e_min)
+    if return_acc:
+        return out, sat, acc
     return out, sat
 
 
@@ -284,7 +290,7 @@ def _hw_fxp_conv2d_ref_npe(
     qi_i8, qw_i8, Ea_full, Ew_full,
     e_layer_min, stride, padding, dilation,
     bits, sat_mode,
-    bias_fp=None, mant_bias=MANTISSA_BIAS,
+    bias_fp=None, mant_bias=MANTISSA_BIAS, return_acc=False,
 ):
     """NPE reference: the two operands carry independent, full-resolution
     per-element shared exponents (weight = flatten-block, act = X-block). This
@@ -305,7 +311,7 @@ def _hw_fxp_conv2d_ref_npe(
         qi_i8, qw_i8, Ea_full, Ew_full,
         e_layer_min, stride, padding, dilation,
         bs=1, bits=bits, sat_mode=sat_mode,
-        bias_fp=bias_fp, mant_bias=mant_bias,
+        bias_fp=bias_fp, mant_bias=mant_bias, return_acc=return_acc,
     )
 
 
@@ -333,6 +339,10 @@ class HWFxpConv2dFn(torch.autograd.Function):
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
         npe = (act_blockify == "xblock" and weight_blockify == "flatten")
+        # A caller that taps the integer accumulator sets `want_acc` in the
+        # sink. Only the python reference keeps the int64 word around.
+        want_acc = bool(stats_sink is not None and stats_sink.get("want_acc"))
+        acc_flat = None
 
         if npe:
             # NPE: independent per-element exponents (act X-block, weight
@@ -366,13 +376,16 @@ class HWFxpConv2dFn(torch.autograd.Function):
                         bias_fp=bias_fp, mant_bias=int(mant_bias),
                     )
             else:
-                out_flat, sat_flat = _hw_fxp_conv2d_ref_npe(
+                res = _hw_fxp_conv2d_ref_npe(
                     qi_i8, qw_i8, Ea, Ew,
                     int(e_layer_min), stride, padding, dilation,
                     int(bits), sat_mode,
                     bias_fp=bias_fp,
                     mant_bias=int(mant_bias),
+                    return_acc=want_acc,
                 )
+                out_flat, sat_flat = res[0], res[1]
+                acc_flat = res[2] if want_acc else None
         else:
             with torch.no_grad():
                 qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
@@ -389,13 +402,16 @@ class HWFxpConv2dFn(torch.autograd.Function):
                     mant_bias=int(mant_bias),
                 )
             else:
-                out_flat, sat_flat = _hw_fxp_conv2d_ref(
+                res = _hw_fxp_conv2d_ref(
                     qi_i8, qw_i8, Ea, Ew,
                     int(e_layer_min), stride, padding, dilation,
                     bs, int(bits), sat_mode,
                     bias_fp=bias_fp,
                     mant_bias=int(mant_bias),
+                    return_acc=want_acc,
                 )
+                out_flat, sat_flat = res[0], res[1]
+                acc_flat = res[2] if want_acc else None
 
         B, _, H, W = qi_fp.shape
         O, _, kH, kW = qw_fp.shape
@@ -418,6 +434,10 @@ class HWFxpConv2dFn(torch.autograd.Function):
             stats_sink["sat_count"] = int(sat.sum().item())
             stats_sink["total"] = int(sat.numel())
             stats_sink["backend"] = "triton" if use_triton else "python"
+            if want_acc:
+                stats_sink["sat_map"] = sat.detach().clone()
+                stats_sink["acc"] = (None if acc_flat is None else
+                                     acc_flat.view(B, O, H_out, W_out).clone())
 
         ctx.save_for_backward(qi_fp, qw_fp, sat)
         ctx.has_bias = bias_fp is not None

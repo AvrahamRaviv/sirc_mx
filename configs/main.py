@@ -45,7 +45,10 @@ import main_ALG as ALG
 import main_HW as HW
 
 _INT_SUFFIXES = ("a_int", "a_exp", "w_int", "w_exp", "out_int", "out_exp",
-                 "acc_raw", "acc_shf", "acc_sat", "sat_cnt", "sat_total",
+                 # the accumulator word and its clamp map: the bit-exact
+                 # output of a HW layer (`/out` is that word cast to fp32)
+                 "acc", "sat",
+                 "acc_raw", "acc_shf", "acc_sat",
                  # static fixed-point output stage: the word itself is an
                  # integer, so it is the bit-exact comparable there too.
                  "out_code", "out_clip")
@@ -68,6 +71,16 @@ def _sqnr_db(ref, other):
     return float(10 * torch.log10(num / den))
 
 
+def _unravel(flat, shape):
+    """Flat index -> per-dim index, e.g. 37 -> (0, 9, 0, 1). A flat index on a
+    4D tap is not readable at a glance; which channel / row / column is."""
+    idx = []
+    for n in reversed(tuple(shape)):
+        idx.append(flat % n)
+        flat //= n
+    return tuple(reversed(idx))
+
+
 def compare_tap(name, alg, hw):
     """Compare one tap. Returns a row dict; `exact` is None for float taps."""
     row = {"tap": name, "shape": tuple(alg.shape), "exact": None,
@@ -85,7 +98,7 @@ def compare_tap(name, alg, hw):
         row["n_bad"] = int(bad.sum())
         row["exact"] = row["n_bad"] == 0
         if row["n_bad"]:
-            row["first_bad"] = int(bad.nonzero()[0])
+            row["first_bad"] = _unravel(int(bad.nonzero()[0]), alg.shape)
             d = (a.long() - h.long()).abs()
             row["max_delta"] = int(d.max())
     else:
@@ -94,15 +107,39 @@ def compare_tap(name, alg, hw):
         row["sqnr"] = _sqnr_db(a, h)
         row["n_bad"] = int((d > 0).sum())
         if row["n_bad"]:
-            row["first_bad"] = int((d > 0).nonzero()[0])
+            row["first_bad"] = _unravel(int((d > 0).nonzero()[0]), alg.shape)
 
     return row
+
+
+# Pipeline order inside one layer. "First diverging stage" is only the root
+# cause if the rows are in the order the data flows - alphabetical would put
+# acc ahead of w_int and blame the accumulator for a weight mismatch.
+_STAGE_ORDER = ("a_int", "a_exp", "w_int", "w_exp", "acc_raw", "acc_shf",
+                "acc_sat", "acc", "sat", "out_int", "out_exp", "out",
+                "out_pre", "out_code", "out_clip")
+
+
+def _pipeline_order(names, alg_taps):
+    """Layers in forward order (ALG taps are recorded as the hooks fire),
+    stages in `_STAGE_ORDER` within a layer, model/* last."""
+    layer_rank = {}
+    for k in alg_taps:
+        layer_rank.setdefault(k.rsplit("/", 1)[0], len(layer_rank))
+
+    def key(k):
+        layer, stage = k.rsplit("/", 1)
+        lr = len(layer_rank) if layer == "model" else layer_rank.get(layer, 0)
+        sr = _STAGE_ORDER.index(stage) if stage in _STAGE_ORDER else len(_STAGE_ORDER)
+        return (lr, sr, k)
+    return sorted(names, key=key)
 
 
 def compare(alg_taps, hw_taps):
     """Compare two tap dicts. Returns (rows, alg_only, hw_only)."""
     shared = [k for k in alg_taps if k in hw_taps]
-    rows = [compare_tap(k, alg_taps[k], hw_taps[k]) for k in sorted(shared)]
+    rows = [compare_tap(k, alg_taps[k], hw_taps[k])
+            for k in _pipeline_order(shared, alg_taps)]
     alg_only = sorted(k for k in alg_taps if k not in hw_taps)
     hw_only = sorted(k for k in hw_taps if k not in alg_taps)
     return rows, alg_only, hw_only
@@ -116,7 +153,7 @@ def report(case_name, rows, alg_only, hw_only):
     """Print the per-tap table. Returns True if every integer tap matched."""
     print(f"\n=== {case_name} ===")
     hdr = (f"  {'tap':<26} {'shape':<18} {'verdict':<12} "
-           f"{'n_bad':>7} {'first':>7} {'max_d':>12} {'SQNR dB':>9}")
+           f"{'n_bad':>7} {'first':>16} {'max_d':>12} {'SQNR dB':>9}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
 
@@ -133,7 +170,7 @@ def report(case_name, rows, alg_only, hw_only):
             "inf" if r["sqnr"] == float("inf") else f"{r['sqnr']:.2f}")
         first = "-" if r["first_bad"] is None else str(r["first_bad"])
         print(f"  {r['tap']:<26} {str(r['shape']):<18} {verdict:<12} "
-              f"{r['n_bad']:>7} {first:>7} {r['max_delta']:>12.6g} {sqnr:>9}"
+              f"{r['n_bad']:>7} {first:>16} {r['max_delta']:>12.6g} {sqnr:>9}"
               + (f"   {r['note']}" if r["note"] else ""))
 
     if hw_only:
@@ -146,7 +183,7 @@ def report(case_name, rows, alg_only, hw_only):
     bad = [r for r in rows if r["exact"] is False]
     if bad:
         print(f"  -> first diverging stage: {bad[0]['tap']} "
-              f"({bad[0]['n_bad']} elements, first at flat index "
+              f"({bad[0]['n_bad']} elements, first at index "
               f"{bad[0]['first_bad']})")
     return ok
 
@@ -161,6 +198,9 @@ def run_case(case, config, verbose=False):
     `ok` is None when the HW side could not run at all - distinct from False,
     which means it ran and disagreed.
     """
+    # One config for both sides, the case's own overrides (element format,
+    # scale_bits, accumulator bits, e_layer_min) already applied.
+    config = ALG.effective_config(case, config)
     alg_taps = ALG.run(case, config, verbose=verbose)
     try:
         hw_taps = HW.run(case, config, verbose=verbose)
@@ -184,7 +224,7 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    config = ALG.load_config(args.config, bs=args.bs)
+    config = ALG.load_config(args.config, bs=args.bs, blockify=args.blockify)
     results, dump = {}, {}
 
     for case in M.cases_from_args(args):

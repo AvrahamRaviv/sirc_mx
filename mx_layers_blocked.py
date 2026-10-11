@@ -223,6 +223,12 @@ class MXConv2dHW(MXConv2d):
         # Sampling-window counters (reset every verbose_sample_every forwards).
         self._sat_total_window = 0
         self._sat_seen_window = 0
+        # Opt-in integer taps for the single-layer simulator: when set, the
+        # forward keeps the int64 accumulator word and the per-output
+        # saturation map of the last call (python backend only).
+        self._tap_acc = False
+        self._last_acc = None
+        self._last_sat = None
 
     def forward(self, x):
         if self.mx_none:
@@ -326,7 +332,7 @@ class MXConv2dHW(MXConv2d):
             )
             self._hw_logged = True
 
-        stats = {}
+        stats = {"want_acc": True} if self._tap_acc else {}
         out = hw_fxp_conv2d(
             qi, qw, bf_bias,
             e_layer_min=int(e_min),
@@ -344,6 +350,9 @@ class MXConv2dHW(MXConv2d):
             weight_blockify=weight_blockify,
             npe_triton_variant=cfg.get('npe_triton_variant', 'reuse'),
         )
+        if self._tap_acc:
+            self._last_acc = stats.get('acc')
+            self._last_sat = stats.get('sat_map')
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))
         self._fwd_count += 1

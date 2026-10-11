@@ -46,24 +46,34 @@ import models as M
 # TAP NAMES
 # =============================================================================
 #
-# Must match `main_ALG` exactly. Per layer, in pipeline order:
+# Must match `main_ALG` exactly - name, shape and dtype. Per layer, in pipeline
+# order (main.py compares in this order and blames the first mismatch):
 #
-#   <layer>/a_int    intN activation mantissas, same shape as the activation
-#   <layer>/a_exp    per-block activation shared exponent
-#   <layer>/w_int    intN weight mantissas, same shape as the weight
-#   <layer>/w_exp    per-block weight shared exponent
-#   <layer>/out      layer output
+#   <layer>/a_int    intN activation mantissas, [B, C, H, W]
+#   <layer>/a_exp    activation exponent CODES, one per block, unsigned:
+#                      code = E + emax,  emax = 2^(scale_bits-1) - 1 (127)
+#                      all-zero block -> code 0
+#                    NPE shape [B, C, H, ceil(W/bs)]
+#   <layer>/w_int    intN weight mantissas, [O, Cin, kH, kW]
+#   <layer>/w_exp    weight exponent codes, one per block of the filter
+#                    flattened C-major (c, kh, kw): [O, ceil(Cin*kH*kW/bs)]
+#   <layer>/acc      int64 accumulator word after the last product, the bias
+#                    and the final clamp. THE bit-exact layer output.
+#   <layer>/sat      uint8 [B, O, Ho, Wo]: 1 where the accumulator clamped at
+#                    any step of that output's reduction
+#   <layer>/out      acc * 2^e_layer_min (float; ALG holds it in fp32, which
+#                    drops bits once acc is wider than 24 - compare acc)
 #   model/out        network output
 #
-# And the HW-only taps - the stages the MX lib does not have, which is exactly
-# where we expect the disagreement to be. `main.py` reports them as HW-only
-# rather than as a mismatch:
+# (`--blockify channel` cases use [B, ceil(C/bs), H, W] / [O, ceil(Cin/bs),
+# kH, kW] exponent shapes instead; NPE is the target.)
 #
-#   <layer>/acc_raw  accumulator contents before any shift, integer
-#   <layer>/acc_shf  after the per-product shift by Ew + Ea - 2*mant_bias
-#                    - e_layer_min
-#   <layer>/acc_sat  after saturation into the narrow accumulator
-#   <layer>/sat_cnt  how many products saturated (per output element)
+# Optional HW-only taps - stages the MX lib does not expose. `main.py` lists
+# them as HW-only rather than as a mismatch:
+#
+#   <layer>/acc_raw  accumulator contents before any shift
+#   <layer>/acc_shf  after the per-product shift
+#   <layer>/acc_sat  after saturation, per step
 #   <layer>/out_int  requantised integer output + <layer>/out_exp
 #
 # And, for cases carrying a static fixed-point output stage (case["out_quant"]
@@ -81,64 +91,71 @@ import models as M
 # Config keys this side has to honour
 # =============================================================================
 #
-# Read from the same config dict `main_ALG` gets, so one file drives both sides:
+# `main.py` passes `main_ALG.effective_config(case, config)`: the base config
+# with the case's own overrides (case["meta"]["mx"] / ["accum"]) already
+# applied, so element format, scale_bits, bits and e_layer_min can differ per
+# case. Read them from the config, never hard-code int8 / 48 / -20.
 #
 #   mx_specs.block_size        block length (32)
 #   mx_specs.w_elem_format     'int8' -> 8-bit mantissa, mant_bias = 6
-#   mx_specs.a_elem_format     same for activations
-#   mx_specs.scale_bits        width of the shared exponent field
+#   mx_specs.a_elem_format     same for activations (int10 / int16 cases too)
+#   mx_specs.scale_bits        width of the unsigned exponent field (8)
 #   mx_specs.shared_exp_method 'max' - exponent from the block max
-#   xblock_accum.bits          accumulator width (35 / 48)
-#   xblock_accum.sat_mode      'per_product' | 'per_block' - where the clamp is
-#   xblock_accum.e_layer_min   static per-layer exponent floor
-#   xblock_accum.weight_blockify  'flatten' | 'channel'
-#   xblock_accum.act_blockify     'xblock'  | 'channel'
+#   xblock_accum.bits          accumulator width (48; 35 in accum35_*)
+#   xblock_accum.sat_mode      'per_product' (NPE supports nothing else)
+#   xblock_accum.e_layer_min   accumulator LSB exponent; per layer in
+#                              case["meta"]["e_layer_min"] after ALG ran
+#   xblock_accum.weight_blockify  'flatten' (NPE) | 'channel'
+#   xblock_accum.act_blockify     'xblock'  (NPE) | 'channel'
 #
-# The open questions from the spec thread belong here, as explicit config, not
-# as an assumption buried in the code:
-#   - is the shared exponent / shift non-negative only (0..15), or can it go
-#     negative?
-#   - does a partial tail block get its own shared exponent, or is it padded
-#     to a full block?
-#   - do conv pad zeros join a block (shifting its alignment) or are they
-#     skipped?
-#   - is the bias added into the fixed-point accumulator, or after the requant?
-#   - when a product underflows the accumulator grid (shift < 0), does the
-#     right shift round toward -inf or truncate toward zero? MXConv2dHW uses an
-#     arithmetic shift, so -8064 >> 20 == -1, not 0: a block of underflowing
-#     products leaves -1 LSB per negative product and 0 per positive one, i.e.
-#     a systematic negative bias rather than a clean flush to zero. Truncating
-#     toward zero gives exactly 0 instead. The `flush_to_zero` case separates
-#     the two - it lands on [-2.1e-05 .. -1.0e-05] under arithmetic shift and
-#     on 0 under truncation.
-#   - per_product or per_block saturation? `accum_sat_transient` settles it:
-#     each block's partial sum leaves the accumulator range and comes back, so
-#     per_product clamps at the peak, loses the excess and ends pinned at the
-#     negative bound (-1.342e+08), while per_block sums first and returns
-#     exactly 0. No other case distinguishes them - accum_saturate pins the
-#     clamp bound but both modes agree there.
-#   - groups != 1 has no HW path at all (MXConv2dHW asserts groups == 1) and
-#     there is no HW Linear, so `depthwise`, `grouped4`, `linear` and half of
+# Settled with arch:
+#   - geometry is NPE: activations block along W, weights flatten per filter.
+#   - the exponent field is unsigned, scale_bits wide (default 8), biased by
+#     2^(scale_bits-1) - 1. The real exponent still goes negative; below the
+#     floor it clamps (`exp_underflow_clamp`, `scale_bits_5`).
+#
+# Still open - each has a case whose vectors differ between the candidates, so
+# the answer can be read off a comparison rather than argued:
+#   - MX mantissa tie rule. The lib rounds half AWAY from zero. Half-even or
+#     truncation changes a_int / w_int in `mx_round_ties`.
+#   - mantissa overflow: a block max just under 2^(E+1) rounds to 128. The lib
+#     keeps E and clamps to +-127. Bumping E, or allowing -128, changes
+#     `mx_mant_overflow`.
+#   - zero-block exponent code. The contract pins 0; `zero_blocks`.
+#   - do conv pad zeros join an X-block? The lib quantizes before padding, so
+#     they do not. `xblock_w32` / `padded_edges` differ if HW blocks the
+#     padded row.
+#   - right shift on underflow: arithmetic (floor, the lib: -8064 >> 20 == -1)
+#     or truncate toward zero (0)? `flush_to_zero` (all-or-nothing) and
+#     `e_layer_min_m8` (a few LSBs per output) separate them.
+#   - bias projection round(b * 2^-e_layer_min): the lib uses torch.round,
+#     ties to EVEN - unlike its own MX quantizer. `bias_ties`.
+#   - accumulation order. It only matters once per_product saturates
+#     (`accum_sat_transient`); the lib walks the flattened filter stream
+#     C-major: for c, for (kh, kw).
+#   - groups != 1 has no HW path (MXConv2dHW asserts groups == 1) and there is
+#     no HW Linear, so `depthwise`, `grouped4`, `linear` and the dw half of
 #     `dw_pw` fall back to the FP32 path on the ALG side. Does the real HW run
-#     depthwise convs on this datapath, and if so with what blockify?
+#     depthwise convs on this datapath?
 #
 # The static fixed-point output stage is configured per case rather than in
 # mx_specs, because it is a different quantizer (see `out_quant_fxp` below):
 #   out_quant.total_bits / frac_bits / signed / round / saturate
 
 
-def quantize_mx(t, bs, mbits, axis=None, blockify="channel"):
-    """FP tensor -> (intN mantissas, per-block shared exponent).
+def quantize_mx(t, bs, mbits, scale_bits=8, axis=None, blockify="xblock"):
+    """FP tensor -> (intN mantissas, per-block exponent codes).
 
     What it has to do:
-      * split `t` into blocks of `bs` along the blockified axis. `channel`
-        blocks along dim 1; `flatten` flattens [Cin,kH,kW] per output filter
-        and blocks along that stream; `xblock` blocks along W.
+      * split `t` into blocks of `bs` along the blockified axis. `xblock`
+        blocks activations along W; `flatten` flattens [Cin,kH,kW] per output
+        filter (C-major) and blocks along that stream; `channel` blocks along
+        dim 1. A tail shorter than `bs` is its own block.
       * E = floor(log2(max|x| in the block))  -- shared_exp_method 'max'
+      * clamp E to [-emax, emax], emax = 2^(scale_bits-1) - 1
       * mantissa = round(x * 2^(mant_bias - E)), clamped to +-(2^(mbits-1) - 1)
       * mant_bias = mbits - 2  (6 for int8)
-      * decide the tail block: own exponent, or zero-pad to full. See the open
-        questions above.
+      * code = E + emax; an all-zero block gets code 0
     """
     raise NotImplementedError("quantize_mx")
 
@@ -182,19 +199,16 @@ def conv2d_hw(a_int, a_exp, w_int, w_exp, bias, geom, cfg):
       2. shift = a_exp + w_exp - 2*mant_bias - e_layer_min
          p <<= shift                            signed shift; right shift drops
                                                 bits, which is a real loss
-      3. acc += p
-         if sat_mode == 'per_product': clamp acc to the accumulator width now,
-         every product. If 'per_block': only at the end of a block. These two
-         differ only once something saturates - that is what `accum_saturate`
-         in the registry is for.
-      4. record how many products hit the clamp -> <layer>/sat_cnt
+         (a_exp / w_exp here are the real exponents, code - emax)
+      3. acc += p, then clamp acc to the accumulator width - every product
+         (sat_mode 'per_product'). Walk the products in the flattened filter
+         order: for c in Cin, for (kh, kw) in the kernel.
+      4. mark the output in <layer>/sat if any step clamped
 
     Then the output side:
-      5. bias: into the accumulator at the e_layer_min scale, or after the
-         requant? Config decides, and `with_bias` is the case that shows it.
-      6. scale back by 2^e_layer_min and requantise to the output format,
-         emitting <layer>/out_int + <layer>/out_exp alongside the float
-         <layer>/out.
+      5. bias: round(b * 2^-e_layer_min) into the accumulator after the last
+         product, clamp once more. `with_bias` / `bias_ties` show it.
+      6. emit <layer>/acc (int64) and <layer>/out = acc * 2^e_layer_min.
 
     `geom` carries stride / padding / dilation / groups from the nn.Conv2d the
     case built; read them off the module rather than re-deriving.

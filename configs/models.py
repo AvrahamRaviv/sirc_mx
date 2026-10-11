@@ -36,6 +36,23 @@ import torch.nn.functional as F
 
 BLOCK_SIZE = 32  # default MX block size; cases are parametric in it
 
+# Which way the operands are cut into blocks. Arch confirmed NPE:
+#   npe      activations block along W (per b, c, y); each weight filter is
+#            flattened to [Cin*kH*kW] (C-major) and blocked along that stream.
+#   channel  both operands block along Cin - the plain MX lib layout.
+# Patterns that shape a block ("one big element per block", "+ then -") have to
+# know this, or under NPE they shape something that is not a block at all.
+BLOCKIFY = "npe"
+BLOCKIFY_CHOICES = ("npe", "channel")
+
+
+def act_block_axis(ndim, blockify=BLOCKIFY):
+    """Axis an activation is blocked along: W for NPE convs, else channels /
+    features."""
+    if ndim == 4:
+        return 3 if blockify == "npe" else 1
+    return ndim - 1
+
 
 # =============================================================================
 # Models
@@ -261,6 +278,81 @@ def _signs(shape, axis, bs, gen, scale=1.0):
     return t * sign.reshape(t.shape)
 
 
+def _ties(shape, axis, bs, gen, scale=1.0):
+    """Every non-leading element sits exactly on a rounding tie of the MX
+    mantissa grid.
+
+    The first element of each block is `scale`, which pins the shared exponent
+    to E = floor(log2 scale) and the mantissa step to 2^(E - mant_bias). The rest
+    are (k + 0.5) steps for k cycling through both signs and both parities, so
+    half-away-from-zero, half-to-even and truncation give three different
+    mantissa sets. The MX lib rounds half away from zero. Assumes int8
+    (mant_bias 6); for wider formats the ties fall on representable values.
+    """
+    t = torch.zeros(shape)
+    step = float(scale) * 2.0 ** -6
+    ks = torch.tensor([0, 1, 2, 3, -1, -2, -3, -4, 10, 11, -11, -12, 40, 41,
+                       -41, -42], dtype=torch.float32)
+    for blk in _blocks(t, axis, bs):
+        n = blk.shape[axis]
+        v = (ks.repeat((n + len(ks) - 1) // len(ks))[:n] + 0.5) * step
+        v[0] = float(scale)
+        view = [1] * blk.dim()
+        view[axis] = n
+        blk.copy_(v.reshape(view).expand_as(blk))
+    return t
+
+
+def _mant_overflow(shape, axis, bs, gen, scale=1.0):
+    """Block max just under the next power of two, so its mantissa rounds to
+    2^(mbits-1) = 128 - one past the int8 range.
+
+    The MX lib keeps the exponent and clamps the mantissa to +-127. Hardware
+    could instead bump the exponent (mantissa 64, E + 1), or allow -128 on the
+    negative side. Lead elements: +1.99609375 (127.75 -> 128), -1.99609375,
+    +1.9921875 (exact tie 127.5), -1.9921875; the rest random at half scale.
+    """
+    t = (torch.randn(shape, generator=gen) * 0.5).clamp(-1.5, 1.5) * float(scale)
+    lead = torch.tensor([1.99609375, -1.99609375, 1.9921875, -1.9921875]) * scale
+    for blk in _blocks(t, axis, bs):
+        n = min(blk.shape[axis], len(lead))
+        for j in range(n):
+            blk.narrow(axis, j, 1).fill_(float(lead[j]))
+    return t
+
+
+def _zero_blocks(shape, axis, bs, gen, scale=1.0):
+    """randn, with every second block along `axis` exactly zero.
+
+    An all-zero block has no defined shared exponent (log2 0). The contract
+    pins its code to 0; this is the vector that shows whether HW agrees.
+    """
+    t = torch.randn(shape, generator=gen) * float(scale)
+    for b, blk in enumerate(_blocks(t, axis, bs)):
+        if b % 2 == 1:
+            blk.zero_()
+    return t
+
+
+def _half_ties(shape, axis, bs, gen, step=2.0 ** -20, scale=0.25):
+    """Bias values lying exactly half-way between two accumulator LSBs.
+
+    The bias is projected onto the accumulator grid as round(b / step); with
+    step = 2^e_layer_min every value here is a tie, both signs and both
+    parities, plus a coarse +-`scale` offset so the bias is not negligible.
+    The MX lib uses torch.round (half to even) here, while its MX quantizer
+    rounds half away from zero - which one HW does is an open question.
+    """
+    n = shape[0]
+    k = torch.arange(n, dtype=torch.float64) - n // 2
+    off = (torch.arange(n) % 3 - 1).to(torch.float64) * float(scale)
+    return (off + (k + 0.5) * step).to(torch.float32).reshape(shape)
+
+
+def _abs_randn(shape, axis, bs, gen, scale=1.0):
+    return torch.randn(shape, generator=gen).abs() * float(scale)
+
+
 PATTERNS: Dict[str, Callable] = {
     "randn": _randn,
     "ramp": _ramp,
@@ -273,6 +365,11 @@ PATTERNS: Dict[str, Callable] = {
     "saturate": _saturate,
     "signs": _signs,
     "half_split": _half_split,
+    "ties": _ties,
+    "mant_overflow": _mant_overflow,
+    "zero_blocks": _zero_blocks,
+    "half_ties": _half_ties,
+    "abs_randn": _abs_randn,
 }
 
 
@@ -286,19 +383,25 @@ def make_tensor(shape, pattern="randn", axis=1, bs=BLOCK_SIZE, seed=0, **kw):
 
 
 def fill_params(model, pattern="randn", bs=BLOCK_SIZE, seed=0, bias_pattern=None,
-                **kw):
+                bias_kw=None, blockify=BLOCKIFY, **kw):
     """Overwrite every weight / bias in `model` with a pattern, in a fixed
     module order so the same seed gives the same checkpoint on both sides.
 
-    Weights are blockified along the input-channel axis (dim 1 for conv, dim 1
-    for linear), which is what `weight_blockify=flatten` reduces to for the
-    aligned cases.
+    The pattern is laid out along the axis the weight is actually blocked on:
+    under NPE a conv filter is flattened to [Cin*kH*kW] and blocked along that
+    stream, so the pattern is built on the flat view and reshaped back. Under
+    `channel` (and for every Linear) it runs along dim 1. For k=1 the two agree.
     """
     with torch.no_grad():
         for i, (name, p) in enumerate(sorted(model.named_parameters())):
             if p.dim() == 1:  # bias
                 pat = bias_pattern or "ramp"
-                p.copy_(make_tensor(p.shape, pat, axis=0, bs=bs, seed=seed + i))
+                p.copy_(make_tensor(p.shape, pat, axis=0, bs=bs, seed=seed + i,
+                                    **(bias_kw or {})))
+            elif p.dim() == 4 and blockify == "npe":
+                flat = (p.shape[0], int(p[0].numel()))
+                p.copy_(make_tensor(flat, pattern, axis=1, bs=bs,
+                                    seed=seed + i, **kw).reshape(p.shape))
             else:
                 p.copy_(make_tensor(p.shape, pattern, axis=1, bs=bs,
                                     seed=seed + i, **kw))
@@ -331,6 +434,18 @@ class Case:
     note: str = ""
     tags: Tuple[str, ...] = ()
     out_quant: dict = None
+    # Bias pattern (default "ramp") and its kwargs.
+    b_pattern: str = None
+    b_kw: dict = None
+    # Axis the input pattern runs along. None = the block axis of the active
+    # geometry; 1 keeps a channel ramp (e.g. conv1x1_ramp, whose sum(i^2) needs
+    # the input to vary along Cin whatever the blocking).
+    x_axis: int = None
+    # Per-case config overrides, merged into mx_specs / mx_specs.xblock_accum.
+    # Both sides apply them: element format, scale_bits, accumulator bits,
+    # e_layer_min, ...
+    mx: dict = None
+    accum: dict = None
 
 
 def _c(cin_mult=1, **kw):
@@ -344,14 +459,14 @@ CASES: Dict[str, Case] = {
     "conv1x1_ramp": Case(
         build=lambda bs: SingleConv(bs, bs, k=1),
         input_shape=lambda bs: (1, bs, 2, 2),
-        w_pattern="int_ramp", x_pattern="int_ramp",
+        w_pattern="int_ramp", x_pattern="int_ramp", x_axis=1,
         note="1x1 conv, one aligned block, small integers. Hand-checkable.",
         tags=("baseline",),
     ),
     "conv1x1_single_nonzero": Case(
         build=lambda bs: SingleConv(bs, bs, k=1),
         input_shape=lambda bs: (1, bs, 1, 1),
-        w_pattern="single_nonzero", x_pattern="single_nonzero",
+        w_pattern="single_nonzero", x_pattern="single_nonzero", x_axis=1,
         note="One product in the whole layer. Isolates the shift, not the sum.",
         tags=("baseline",),
     ),
@@ -420,7 +535,7 @@ CASES: Dict[str, Case] = {
     "with_bias": Case(
         build=lambda bs: SingleConv(bs, bs, k=1, bias=True),
         input_shape=lambda bs: (1, bs, 2, 2),
-        w_pattern="int_ramp", x_pattern="int_ramp",
+        w_pattern="int_ramp", x_pattern="int_ramp", x_axis=1,
         note="Bias on. Added into the fixed-point accumulator, or after the "
              "requant in FP? Different results once it saturates.",
         tags=("geometry", "corner"),
@@ -545,7 +660,7 @@ CASES: Dict[str, Case] = {
     "out_fxp_q8_8": Case(
         build=lambda bs: SingleConv(bs, bs, k=1),
         input_shape=lambda bs: (1, bs, 2, 2),
-        w_pattern="single_nonzero", x_pattern="single_nonzero",
+        w_pattern="single_nonzero", x_pattern="single_nonzero", x_axis=1,
         out_quant={"total_bits": 16, "frac_bits": 8, "signed": True,
                    "round": "half_away", "saturate": True},
         note="MX layer then a Q8.8 output word (step 1/256, range "
@@ -557,7 +672,7 @@ CASES: Dict[str, Case] = {
     "out_fxp_saturate": Case(
         build=lambda bs: SingleConv(bs, bs, k=1),
         input_shape=lambda bs: (1, bs, 2, 2),
-        w_pattern="int_ramp", x_pattern="int_ramp",
+        w_pattern="int_ramp", x_pattern="int_ramp", x_axis=1,
         out_quant={"total_bits": 16, "frac_bits": 8, "signed": True,
                    "saturate": True},
         note="Same Q8.8, but int_ramp products reach ~11440 - far past +128, "
@@ -570,7 +685,8 @@ CASES: Dict[str, Case] = {
         out_quant={"total_bits": 16, "frac_bits": 4, "signed": True,
                    "round": "half_away", "saturate": True},
         note="Coarse Q12.4 (step 1/16) so ties are common: half_away vs "
-             "half_even vs trunc give different words here.",
+             "half_even vs trunc give different words here - the other two "
+             "rules are out_fxp_round_half_even / out_fxp_round_trunc.",
         tags=("fxp", "corner"),
     ),
     "out_fxp_unsigned": Case(
@@ -592,6 +708,187 @@ CASES: Dict[str, Case] = {
              "asymmetries that all-positive data hides.",
         tags=("stress",),
     ),
+
+    # --- MX quantizer rounding: the spec lines arch still has to confirm -----
+    "mx_round_ties": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 2, bs),
+        w_pattern="ties", x_pattern="ties",
+        note="Every non-leading element of every block is an exact mantissa "
+             "tie ((k+0.5) steps, both signs, both parities). The lib rounds "
+             "half away from zero; half-even or truncation shows up in "
+             "a_int / w_int directly.",
+        tags=("mxq", "corner"),
+    ),
+    "mx_mant_overflow": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 2, bs),
+        w_pattern="mant_overflow", x_pattern="mant_overflow",
+        note="Block max at 1.996 / 1.992 (127.75 / 127.5 steps): the mantissa "
+             "rounds to 128. The lib keeps E and clamps to +-127; HW may bump "
+             "the exponent or allow -128.",
+        tags=("mxq", "corner"),
+    ),
+    "zero_blocks": Case(
+        build=lambda bs: SingleConv(2 * bs, bs, k=1),
+        input_shape=lambda bs: (1, 2 * bs, 2, 2 * bs),
+        w_pattern="zero_blocks", x_pattern="zero_blocks",
+        note="Every second block of both operands is all zero. Its shared "
+             "exponent is undefined; the contract pins the code to 0.",
+        tags=("mxq", "corner"),
+    ),
+    "exp_underflow_clamp": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 2, 2),
+        x_pattern="tiny", x_kw={"scale": 2.0 ** -130},
+        note="Activations at 2^-130 (fp32 subnormal), below the 8-bit field's "
+             "floor of -127: E clamps to -127 (code 0) and the mantissa is 8, "
+             "not 64. HW must clamp, not wrap.",
+        tags=("mxq", "corner"),
+    ),
+    "scale_bits_5": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 2, 2),
+        x_pattern="randn", x_kw={"scale": 2.0 ** -18},
+        mx={"scale_bits": 5},
+        note="5-bit exponent field (bias 15, floor -15). Activations sit at "
+             "~2^-18, so their exponent clamps and the mantissas shrink by 3 "
+             "bits. Keeps the field width a parameter, not a constant.",
+        tags=("mxq", "corner"),
+    ),
+
+    # --- NPE X-blocks: W against the block size -----------------------------
+    "xblock_w32": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
+        input_shape=lambda bs: (1, bs, 3, bs),
+        note="W = block size: exactly one full X-block per row, no tail. With "
+             "padding=1 the pad columns sit outside the block - does HW block "
+             "the padded row (bs+2 wide) instead?",
+        tags=("xblock", "geometry"),
+    ),
+    "xblock_w33": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
+        input_shape=lambda bs: (1, bs, 3, bs + 1),
+        x_pattern="wide_dyn",
+        note="One full X-block + a 1-wide tail per row, wide dynamic range so "
+             "a tail that is merged into, or padded off, the full block gets a "
+             "visibly different exponent.",
+        tags=("xblock", "geometry", "corner"),
+    ),
+    "xblock_w64": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
+        input_shape=lambda bs: (1, bs, 3, 2 * bs),
+        x_pattern="underflow",
+        note="Two full X-blocks per row; the 3x3 window straddles the block "
+             "boundary at x = bs-1 / bs, so one output mixes two activation "
+             "exponents.",
+        tags=("xblock", "geometry"),
+    ),
+
+    # --- geometry the first 30 cases never touched --------------------------
+    "batch2": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
+        input_shape=lambda bs: (2, bs, 3, 6),
+        note="Batch of 2 with different data. Catches a batch index dropped "
+             "or mixed up in the HW walk.",
+        tags=("geometry",),
+    ),
+    "kernel_1x3": Case(
+        build=lambda bs: SingleConv(bs, bs, k=(1, 3), padding=(0, 1)),
+        input_shape=lambda bs: (1, bs, 3, 7),
+        note="Non-square kernel and non-square input: kH != kW, H != W. "
+             "Swapped H/W anywhere shows up here and nowhere else.",
+        tags=("geometry",),
+    ),
+    "stride_2x1_odd": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, stride=(2, 1), padding=1),
+        input_shape=lambda bs: (1, bs, 7, 9),
+        note="Asymmetric stride on odd H / W: the last row is reached only if "
+             "the output-size formula rounds the way torch does.",
+        tags=("geometry",),
+    ),
+    "kernel_5x5": Case(
+        build=lambda bs: SingleConv(bs, bs, k=5, padding=2),
+        input_shape=lambda bs: (1, bs, 6, 6),
+        note="5x5: flatten length 25*Cin, so weight blocks start at kernel "
+             "taps other than (0,0) - the C-major flatten order is exercised.",
+        tags=("geometry",),
+    ),
+
+    # --- accumulator configs ------------------------------------------------
+    "e_layer_min_m8": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=0),
+        input_shape=lambda bs: (1, bs, 5, 5),
+        accum={"e_layer_min": -8},
+        note="Accumulator LSB at 2^-8: products with Ea + Ew < 4 are right-"
+             "shifted and lose bits, of both signs - partial underflow, so "
+             "floor (arith shift) vs truncate-toward-zero differ on a few "
+             "LSBs instead of all-or-nothing.",
+        tags=("accum", "corner"),
+    ),
+    "e_layer_min_0": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=0),
+        input_shape=lambda bs: (1, bs, 5, 5),
+        accum={"e_layer_min": 0},
+        note="LSB at 2^0: every product loses ~10 bits. Heavy truncation; the "
+             "output is a small integer.",
+        tags=("accum",),
+    ),
+    "accum35_partial_sat": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=0),
+        input_shape=lambda bs: (1, bs, 5, 5),
+        w_kw={"scale": 2.0 ** 5}, x_kw={"scale": 2.0 ** 5},
+        accum={"bits": 35},
+        note="35-bit accumulator (DVNR config): bound 2^34 * 2^-20 = 16384, "
+             "and the outputs straddle it, so some saturate and some do not.",
+        tags=("accum", "corner"),
+    ),
+    "bias_ties": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1, bias=True),
+        input_shape=lambda bs: (1, bs, 2, 2),
+        b_pattern="half_ties", b_kw={"step": 2.0 ** -20},
+        note="Every bias is an exact tie on the 2^-20 accumulator grid. The "
+             "lib projects it with torch.round (half to even) - while its MX "
+             "quantizer rounds half away. Which one does HW use?",
+        tags=("accum", "corner"),
+    ),
+
+    # --- element formats ----------------------------------------------------
+    "fmt_int10": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=0),
+        input_shape=lambda bs: (1, bs, 5, 5),
+        mx={"w_elem_format": "int10", "a_elem_format": "int10"},
+        note="MXINT10: mant_bias 8, mantissa +-511. Checks nothing is hard-"
+             "wired to int8.",
+        tags=("fmt",),
+    ),
+    "fmt_int16": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=0),
+        input_shape=lambda bs: (1, bs, 5, 5),
+        mx={"w_elem_format": "int16", "a_elem_format": "int16"},
+        accum={"e_layer_min": -32},
+        note="MXINT16: mant_bias 14, products up to 2^30. e_layer_min -32 so "
+             "no product is right-shifted (-20 would drop ~8 bits).",
+        tags=("fmt",),
+    ),
+
+    # --- output-stage tie rules (the other two of out_fxp_round_modes) ------
+    "out_fxp_round_half_even": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 4, 4),
+        out_quant={"total_bits": 16, "frac_bits": 4, "signed": True,
+                   "round": "half_even", "saturate": True},
+        note="out_fxp_round_modes with round=half_even.",
+        tags=("fxp", "corner"),
+    ),
+    "out_fxp_round_trunc": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 4, 4),
+        out_quant={"total_bits": 16, "frac_bits": 4, "signed": True,
+                   "round": "trunc", "saturate": True},
+        note="out_fxp_round_modes with round=trunc (toward zero).",
+        tags=("fxp", "corner"),
+    ),
 }
 
 
@@ -599,8 +896,12 @@ CASES: Dict[str, Case] = {
 # Entry points
 # =============================================================================
 
-def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None):
+def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None, blockify=None):
     """Materialise one case.
+
+    `blockify` ('npe' | 'channel', default `BLOCKIFY`) decides which axis the
+    block-shaping patterns run along, so it has to match the config the case
+    is run under - `main_ALG.load_config(blockify=...)` takes the same value.
 
     Returns a dict with:
       model   - nn.Module, weights filled, in eval mode
@@ -612,13 +913,19 @@ def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None):
         raise KeyError(f"unknown case {name!r}; have {sorted(CASES)}")
     case = CASES[name]
 
+    blockify = blockify or BLOCKIFY
+    if blockify not in BLOCKIFY_CHOICES:
+        raise ValueError(f"blockify must be one of {BLOCKIFY_CHOICES}")
     model = case.build(bs).eval()
-    fill_params(model, case.w_pattern, bs=bs, seed=seed, **(case.w_kw or {}))
+    fill_params(model, case.w_pattern, bs=bs, seed=seed,
+                bias_pattern=case.b_pattern, bias_kw=case.b_kw,
+                blockify=blockify, **(case.w_kw or {}))
 
     shape = list(case.input_shape(bs))
     if batch is not None:
         shape[0] = batch
-    axis = 1 if len(shape) > 2 else 1  # channels for 4D, features for 2D
+    axis = case.x_axis if case.x_axis is not None else \
+        act_block_axis(len(shape), blockify)
     x = make_tensor(shape, case.x_pattern, axis=axis, bs=bs, seed=seed + 1000,
                     **(case.x_kw or {}))
 
@@ -637,6 +944,12 @@ def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None):
         "x_pattern": case.x_pattern,
         "w_kw": case.w_kw or {},
         "x_kw": case.x_kw or {},
+        "b_pattern": case.b_pattern,
+        "b_kw": case.b_kw or {},
+        "x_axis": axis,
+        "blockify": blockify,
+        "mx": case.mx or {},
+        "accum": case.accum or {},
         "params": {n: list(p.shape) for n, p in model.named_parameters()},
         "note": case.note,
         "tags": list(case.tags),
@@ -687,13 +1000,20 @@ def add_model_args(parser):
                         metavar="NAME",
                         help="case name from the registry, or 'all' / a tag "
                              "(baseline, align, geometry, topology, stress, "
-                             "corner) to select a group. --list prints them.")
+                             "corner, fxp, mxq, xblock, accum, fmt) to select "
+                             "a group. --list prints them.")
     parser.add_argument("--bs", type=int, default=BLOCK_SIZE,
                         help=f"MX block size (default {BLOCK_SIZE})")
     parser.add_argument("--seed", type=int, default=0,
                         help="seed for the weight / input patterns")
     parser.add_argument("--batch", type=int, default=None,
                         help="override the batch dim of the input")
+    parser.add_argument("--blockify", choices=BLOCKIFY_CHOICES,
+                        default=BLOCKIFY,
+                        help="operand blocking: npe (acts along W, weights "
+                             "flattened per filter - what HW does) or channel "
+                             "(both along Cin). Sets the config AND the "
+                             f"pattern layout (default {BLOCKIFY})")
     parser.add_argument("--list", action="store_true",
                         help="print the case registry and exit")
     return parser
@@ -730,7 +1050,8 @@ def cases_from_args(args):
         list_cases(bs=args.bs, names=names)
         raise SystemExit(0)
     for name in names:
-        yield build_case(name, bs=args.bs, seed=args.seed, batch=args.batch)
+        yield build_case(name, bs=args.bs, seed=args.seed, batch=args.batch,
+                         blockify=getattr(args, "blockify", None))
 
 
 if __name__ == "__main__":

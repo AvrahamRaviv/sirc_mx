@@ -5,26 +5,36 @@ Writes everything the other side needs to reproduce one run, with no PyTorch
 and no MX lib required to read it:
 
     bundle/<case>/
-      manifest.json      shapes, config, the MX format spec, what each file is
-      weight.{npy,txt}   the checkpoint
-      bias.{npy,txt}     only when the layer has a bias
-      input.{npy,txt}    the test vector
-      ref_fp32.{npy,txt} unquantised conv output - the FP reference
-      alg_out.{npy,txt}  our MX output - the number to compare against
-      alg_<tap>.{npy,txt}  per-tap integer intermediates (a_int, a_exp, ...)
+      manifest.json           topology, per-layer geometry and accumulator
+                              config, the MX format spec, the conventions,
+                              what each file is
+      param_<layer>_weight    every parameter of the model, in module order
+      param_<layer>_bias      (only layers that have one)
+      input                   the test vector
+      ref_fp32                unquantised network output - context only
+      alg_out                 our network output
+      alg_<layer>_<tap>       per-layer taps: a_int, a_exp, w_int, w_exp, acc,
+                              sat, out (and model_out_code / _clip for cases
+                              with a fixed-point output stage)
 
 Every tensor is written twice: `.npy` for whoever uses numpy/torch, and `.txt`
 for C or Excel - one value per line, C order (last axis fastest), with the
 shape in a header comment. Integer taps are written as integers, so a text diff
 is a bit-exact diff.
 
+The run goes through `main_ALG.run`, which refuses to return taps that do not
+rebuild their own accumulator (`tap_check.py`), so nothing inconsistent can be
+exported.
+
     python export_vectors.py -m conv1x1_ramp
     python export_vectors.py -m conv1x1_ramp,conv3x3_randn --out bundle
+    python export_vectors.py -m corner --blockify npe --clean
 """
 
 import argparse
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -36,6 +46,8 @@ if _HERE not in sys.path:
 
 import models as M
 import main_ALG as ALG
+import tap_check as TC
+from mx_layers_blocked import MXConv2dHW
 
 
 def _write(path_base, t):
@@ -53,75 +65,156 @@ def _write(path_base, t):
             "shape": list(a.shape), "dtype": str(a.dtype)}
 
 
-def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0):
+def _fname(key):
+    return key.replace("/", "_").replace(".", "_") or "model"
+
+
+def _format_spec(sp, blockify):
+    mbits = TC.fmt_bits(sp["a_elem_format"])
+    emax = TC.scale_emax(sp["scale_bits"])
+    bs = sp["block_size"]
+    if blockify == "npe":
+        blk = (f"activations: blocks of {bs} along W (dim 3), per (n, c, h); "
+               f"a_exp is [N, C, H, ceil(W/{bs})]. weights: each filter "
+               f"flattened C-major (c, kh, kw) to Cin*kH*kW and cut into blocks "
+               f"of {bs} along that stream; w_exp is [O, ceil(Cin*kH*kW/{bs})]. "
+               f"A tail shorter than {bs} is its own block. Conv zero padding "
+               f"is applied AFTER quantization - pad zeros join no block.")
+    else:
+        blk = (f"both operands: blocks of {bs} along dim 1 (Cin); a_exp is "
+               f"[N, ceil(C/{bs}), H, W], w_exp [O, ceil(Cin/{bs}), kH, kW]. "
+               f"A tail shorter than {bs} is its own block.")
+    return {
+        "elem_format": sp["a_elem_format"],
+        "mantissa_bits": mbits,
+        "mant_bias": mbits - 2,
+        "mantissa_range": [-((1 << (mbits - 1)) - 1), (1 << (mbits - 1)) - 1],
+        "scale_bits": sp["scale_bits"],
+        "exp_bias": emax,
+        "exp_code_range": [0, 2 * emax],
+        "shared_exp_method": sp["shared_exp_method"],
+        "value": "value = mantissa * 2**(code - exp_bias - mant_bias)",
+        "shared_exp": (f"E = floor(log2(max |x| over the block)), clamped to "
+                       f"[-{emax}, {emax}]; code = E + {emax} (unsigned)"),
+        "zero_block": "an all-zero block has code 0 (its exponent is undefined)",
+        "mantissa": ("round(x * 2**(mant_bias - E)), ties away from zero, then "
+                     "clamped to mantissa_range (an overflow to 2**(mbits-1) "
+                     "keeps E and clamps)"),
+        "blockify": blk,
+    }
+
+
+def _accum_spec(xb, sp, blockify):
+    mbits = TC.fmt_bits(sp["a_elem_format"])
+    order = ("for each input channel c, for each kernel tap (kh, kw): the "
+             "flattened filter stream, C-major" if blockify == "npe" else
+             "for each channel block, for each kernel tap, for each lane")
+    return {
+        "bits": xb["bits"],
+        "sat_mode": xb["sat_mode"],
+        "product": f"p = a_int * w_int, exact ({2 * mbits} bits)",
+        "shift": (f"shift = Ea + Ew - {2 * (mbits - 2)} - e_layer_min, with Ea, "
+                  f"Ew the real exponents (code - exp_bias). shift >= 0: "
+                  f"p << shift; shift < 0: arithmetic p >> -shift (rounds "
+                  f"toward -inf)"),
+        "accumulate": (f"acc += shifted p, clamped to the signed {xb['bits']}-bit "
+                       f"range after every product ({xb['sat_mode']})"),
+        "order": order,
+        "bias": ("round(b * 2**-e_layer_min), ties to even, added after the "
+                 "last product, then clamped once more"),
+        "output": ("acc is the layer's integer result; out = acc * "
+                   "2**e_layer_min in fp32 (lossy above 24 bits - compare acc)"),
+    }
+
+
+def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0,
+           blockify=None, clean=False):
     """Freeze one case to `out_dir/<case_name>/`. Returns the manifest."""
-    case = M.build_case(case_name, bs=bs, seed=seed)
-    config = config or ALG.load_config(bs=bs)
+    blockify = blockify or M.BLOCKIFY
+    case = M.build_case(case_name, bs=bs, seed=seed, blockify=blockify)
+    config = config or ALG.load_config(bs=bs, blockify=blockify)
     taps = ALG.run(case, config)
+    cfg = case["meta"]["config"]
+    sp = cfg["mx_specs"]
+    xb = sp["xblock_accum"]
 
     d = os.path.join(out_dir, case_name)
+    if clean and os.path.isdir(d):
+        shutil.rmtree(d)
     os.makedirs(d, exist_ok=True)
 
     files = {}
-    # The layer under test. Single-conv cases have exactly one; the walk keeps
-    # the first conv/linear so this also works on the multi-layer cases.
-    layer_name, layer = next(
-        (n, m) for n, m in case["model"].named_modules()
-        if isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)))
-
-    files["weight"] = _write(os.path.join(d, "weight"), layer.weight)
-    if layer.bias is not None:
-        files["bias"] = _write(os.path.join(d, "bias"), layer.bias)
+    for pname, p in case["model"].named_parameters():
+        files[f"param_{_fname(pname)}"] = _write(
+            os.path.join(d, f"param_{_fname(pname)}"), p)
     files["input"] = _write(os.path.join(d, "input"), case["x"])
     files["ref_fp32"] = _write(os.path.join(d, "ref_fp32"), case["y_fp32"])
     files["alg_out"] = _write(os.path.join(d, "alg_out"), taps["model/out"])
-    for k, v in sorted(taps.items()):
+    for k, v in taps.items():
         if k == "model/out":
             continue
-        name = "alg_" + k.replace("/", "_")
+        name = "alg_" + _fname(k)
         files[name] = _write(os.path.join(d, name), v)
 
-    geom = {}
-    if isinstance(layer, torch.nn.Conv2d):
-        geom = {"in_channels": layer.in_channels,
-                "out_channels": layer.out_channels,
-                "kernel_size": list(layer.kernel_size),
-                "stride": list(layer.stride), "padding": list(layer.padding),
-                "dilation": list(layer.dilation), "groups": layer.groups,
-                "bias": layer.bias is not None}
+    layers = []
+    for name, mod in case["model"].named_modules():
+        if not isinstance(mod, (torch.nn.Conv2d, torch.nn.Linear)):
+            continue
+        dp = case["meta"]["datapath"].get(name)
+        row = {"name": name, "type": type(mod).__name__, "datapath": dp,
+               "bias": mod.bias is not None}
+        if isinstance(mod, torch.nn.Conv2d):
+            row.update(in_channels=mod.in_channels, out_channels=mod.out_channels,
+                       kernel_size=list(mod.kernel_size), stride=list(mod.stride),
+                       padding=list(mod.padding), dilation=list(mod.dilation),
+                       groups=mod.groups)
+        else:
+            row.update(in_features=mod.in_features, out_features=mod.out_features)
+        if dp == "MXConv2dHW":
+            row["e_layer_min"] = case["meta"]["e_layer_min"][name]
+        else:
+            row["note"] = ("not on the HW datapath: MX-quantized operands "
+                           "(channel blocks), FP32 reduction - no acc / sat taps")
+        layers.append(row)
 
+    int_taps = [f"alg_{_fname(k)}" for k in taps
+                if k.rsplit("/", 1)[-1] in ("a_int", "a_exp", "w_int", "w_exp",
+                                            "acc", "sat", "out_code", "out_clip")]
     manifest = {
         "case": case_name,
         "note": case["meta"]["note"],
-        "layer": {"name": layer_name, "type": type(layer).__name__, **geom},
+        "tags": case["meta"]["tags"],
+        "blockify": blockify,
+        "model": {
+            "class": case["meta"]["model"],
+            "doc": (type(case["model"]).__doc__ or "").strip(),
+            "repr": str(case["model"]),
+            "forward": "ReLU / concat / add run in FP32 between quantized layers",
+        },
+        "layers": layers,
         "block_size": bs,
         "seed": seed,
         "patterns": {"weight": case["meta"]["w_pattern"],
-                     "input": case["meta"]["x_pattern"]},
+                     "input": case["meta"]["x_pattern"],
+                     "bias": case["meta"]["b_pattern"],
+                     "w_kw": case["meta"]["w_kw"], "x_kw": case["meta"]["x_kw"],
+                     "b_kw": case["meta"]["b_kw"]},
         "out_quant": case["meta"].get("out_quant"),
-        # `layers` is empty in the stored config because the mains fill it from
-        # the model; record what it resolved to so the manifest is self-contained.
-        "mx_config": {**config, "layers": ALG._layer_names(case["model"])},
+        "mx_format": _format_spec(sp, blockify),
+        "accumulator": _accum_spec(xb, sp, blockify),
+        "mx_config": {**cfg, "layers": ALG._layer_names(case["model"])},
         "files": files,
-        "mx_format": {
-            "elem_format": config["mx_specs"]["w_elem_format"],
-            "mantissa_bits": 8,
-            "mant_bias": 6,
-            "mantissa_range": [-127, 127],
-            "shared_exp_method": config["mx_specs"]["shared_exp_method"],
-            "value": "value = mantissa * 2**(shared_exp - mant_bias)",
-            "shared_exp": "shared_exp = floor(log2(max(|x|) over the block))",
-            "blockify": "activations and weights block along dim 1 (channels), "
-                        "block_size elements per block; a tail shorter than "
-                        "block_size is zero-padded, which does not move a "
-                        "max-abs shared exponent",
-        },
         "how_to_compare": {
-            "bit_exact": ["alg_a_int", "alg_a_exp", "alg_w_int", "alg_w_exp"],
-            "float": ["alg_out"],
-            "note": "The int taps are the contract. Match those first; "
-                    "alg_out follows from them. ref_fp32 is the unquantised "
-                    "output, for context only - neither side should match it.",
+            "bit_exact": int_taps,
+            "float": ["alg_out"] + [f"alg_{_fname(k)}" for k in taps
+                                    if k.endswith("/out") and k != "model/out"],
+            "order": ("compare in pipeline order - a_int, a_exp, w_int, w_exp, "
+                      "acc, sat - layer by layer; the first mismatch is the "
+                      "root cause, the rest are downstream of it"),
+            "note": ("The int taps are the contract. acc is the bit-exact "
+                     "layer output; alg_*_out is acc cast to fp32 and loses bits "
+                     "above 24. ref_fp32 is the unquantised output, context "
+                     "only."),
         },
     }
     with open(os.path.join(d, "manifest.json"), "w") as f:
@@ -130,21 +223,29 @@ def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", "-m", default="conv1x1_ramp",
                     help="case name(s), comma-separated, or a tag, or 'all'")
     ap.add_argument("--out", default=os.path.join(_HERE, "bundle"))
+    ap.add_argument("--config", default=None,
+                    help="config JSON over the default (deep-merged)")
+    ap.add_argument("--blockify", choices=M.BLOCKIFY_CHOICES, default=M.BLOCKIFY)
     ap.add_argument("--bs", type=int, default=M.BLOCK_SIZE)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--clean", action="store_true",
+                    help="delete each case directory before writing it, so no "
+                         "stale file from an older export survives")
     args = ap.parse_args()
 
     names = []
     for part in args.model.split(","):
         names.extend(M.resolve_models(part.strip()))
 
-    config = ALG.load_config(bs=args.bs)
+    config = ALG.load_config(args.config, bs=args.bs, blockify=args.blockify)
     for name in names:
-        man = export(name, args.out, config=config, bs=args.bs, seed=args.seed)
+        man = export(name, args.out, config=config, bs=args.bs, seed=args.seed,
+                     blockify=args.blockify, clean=args.clean)
         n = len(man["files"])
         print(f"{name:<24} -> {os.path.join(args.out, name)}  ({n} tensors)")
 
