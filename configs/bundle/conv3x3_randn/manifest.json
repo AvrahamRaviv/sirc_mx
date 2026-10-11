@@ -1,37 +1,86 @@
 {
   "case": "conv3x3_randn",
   "note": "Plain 3x3, aligned channels, random data. The reference point.",
-  "layer": {
-    "name": "conv",
-    "type": "Conv2d",
-    "in_channels": 32,
-    "out_channels": 32,
-    "kernel_size": [
-      3,
-      3
-    ],
-    "stride": [
-      1,
-      1
-    ],
-    "padding": [
-      0,
-      0
-    ],
-    "dilation": [
-      1,
-      1
-    ],
-    "groups": 1,
-    "bias": false
+  "tags": [
+    "baseline"
+  ],
+  "blockify": "npe",
+  "model": {
+    "class": "SingleConv",
+    "doc": "One Conv2d. Covers plain / strided / dilated / grouped / depthwise.",
+    "repr": "SingleConv(\n  (conv): Conv2d(32, 32, kernel_size=(3, 3), stride=(1, 1), bias=False)\n)",
+    "forward": "ReLU / concat / add run in FP32 between quantized layers"
   },
+  "layers": [
+    {
+      "name": "conv",
+      "type": "Conv2d",
+      "datapath": "MXConv2dHW",
+      "bias": false,
+      "in_channels": 32,
+      "out_channels": 32,
+      "kernel_size": [
+        3,
+        3
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "padding": [
+        0,
+        0
+      ],
+      "dilation": [
+        1,
+        1
+      ],
+      "groups": 1,
+      "e_layer_min": -20
+    }
+  ],
   "block_size": 32,
   "seed": 0,
   "patterns": {
     "weight": "randn",
-    "input": "randn"
+    "input": "randn",
+    "bias": null,
+    "w_kw": {},
+    "x_kw": {},
+    "b_kw": {}
   },
   "out_quant": null,
+  "mx_format": {
+    "elem_format": "int8",
+    "mantissa_bits": 8,
+    "mant_bias": 6,
+    "mantissa_range": [
+      -127,
+      127
+    ],
+    "scale_bits": 8,
+    "exp_bias": 127,
+    "exp_code_range": [
+      0,
+      254
+    ],
+    "shared_exp_method": "max",
+    "value": "value = mantissa * 2**(code - exp_bias - mant_bias)",
+    "shared_exp": "E = floor(log2(max |x| over the block)), clamped to [-127, 127]; code = E + 127 (unsigned)",
+    "zero_block": "an all-zero block has code 0 (its exponent is undefined)",
+    "mantissa": "round(x * 2**(mant_bias - E)), ties away from zero, then clamped to mantissa_range (an overflow to 2**(mbits-1) keeps E and clamps)",
+    "blockify": "activations: blocks of 32 along W (dim 3), per (n, c, h); a_exp is [N, C, H, ceil(W/32)]. weights: each filter flattened C-major (c, kh, kw) to Cin*kH*kW and cut into blocks of 32 along that stream; w_exp is [O, ceil(Cin*kH*kW/32)]. A tail shorter than 32 is its own block. Conv zero padding is applied AFTER quantization - pad zeros join no block."
+  },
+  "accumulator": {
+    "bits": 48,
+    "sat_mode": "per_product",
+    "product": "p = a_int * w_int, exact (16 bits)",
+    "shift": "shift = Ea + Ew - 12 - e_layer_min, with Ea, Ew the real exponents (code - exp_bias). shift >= 0: p << shift; shift < 0: arithmetic p >> -shift (rounds toward -inf)",
+    "accumulate": "acc += shifted p, clamped to the signed 48-bit range after every product (per_product)",
+    "order": "for each input channel c, for each kernel tap (kh, kw): the flattened filter stream, C-major",
+    "bias": "round(b * 2**-e_layer_min), ties to even, added after the last product, then clamped once more",
+    "output": "acc is the layer's integer result; out = acc * 2**e_layer_min in fp32 (lossy above 24 bits - compare acc)"
+  },
   "mx_config": {
     "mx_specs": {
       "w_elem_format": "int8",
@@ -39,7 +88,19 @@
       "block_size": 32,
       "scale_bits": 8,
       "shared_exp_method": "max",
-      "custom_cuda": false
+      "custom_cuda": false,
+      "xblock_accum": {
+        "enabled": true,
+        "mode": "hw_fixed_point",
+        "bits": 48,
+        "sat_mode": "per_product",
+        "e_layer_min": -20,
+        "weight_blockify": "flatten",
+        "act_blockify": "xblock",
+        "pad_channels": true,
+        "backend": "python",
+        "verbose": 1
+      }
     },
     "layers": [
       "conv"
@@ -48,9 +109,9 @@
     "measure_error": false
   },
   "files": {
-    "weight": {
-      "npy": "weight.npy",
-      "txt": "weight.txt",
+    "param_conv_weight": {
+      "npy": "param_conv_weight.npy",
+      "txt": "param_conv_weight.txt",
       "shape": [
         32,
         32,
@@ -92,17 +153,6 @@
       ],
       "dtype": "float32"
     },
-    "alg_conv_a_exp": {
-      "npy": "alg_conv_a_exp.npy",
-      "txt": "alg_conv_a_exp.txt",
-      "shape": [
-        1,
-        1,
-        5,
-        5
-      ],
-      "dtype": "int16"
-    },
     "alg_conv_a_int": {
       "npy": "alg_conv_a_int.npy",
       "txt": "alg_conv_a_int.txt",
@@ -114,25 +164,14 @@
       ],
       "dtype": "int8"
     },
-    "alg_conv_out": {
-      "npy": "alg_conv_out.npy",
-      "txt": "alg_conv_out.txt",
+    "alg_conv_a_exp": {
+      "npy": "alg_conv_a_exp.npy",
+      "txt": "alg_conv_a_exp.txt",
       "shape": [
         1,
         32,
-        3,
-        3
-      ],
-      "dtype": "float32"
-    },
-    "alg_conv_w_exp": {
-      "npy": "alg_conv_w_exp.npy",
-      "txt": "alg_conv_w_exp.txt",
-      "shape": [
-        32,
-        1,
-        3,
-        3
+        5,
+        1
       ],
       "dtype": "int16"
     },
@@ -146,31 +185,64 @@
         3
       ],
       "dtype": "int8"
+    },
+    "alg_conv_w_exp": {
+      "npy": "alg_conv_w_exp.npy",
+      "txt": "alg_conv_w_exp.txt",
+      "shape": [
+        32,
+        9
+      ],
+      "dtype": "int16"
+    },
+    "alg_conv_out": {
+      "npy": "alg_conv_out.npy",
+      "txt": "alg_conv_out.txt",
+      "shape": [
+        1,
+        32,
+        3,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "alg_conv_acc": {
+      "npy": "alg_conv_acc.npy",
+      "txt": "alg_conv_acc.txt",
+      "shape": [
+        1,
+        32,
+        3,
+        3
+      ],
+      "dtype": "int64"
+    },
+    "alg_conv_sat": {
+      "npy": "alg_conv_sat.npy",
+      "txt": "alg_conv_sat.txt",
+      "shape": [
+        1,
+        32,
+        3,
+        3
+      ],
+      "dtype": "uint8"
     }
-  },
-  "mx_format": {
-    "elem_format": "int8",
-    "mantissa_bits": 8,
-    "mant_bias": 6,
-    "mantissa_range": [
-      -127,
-      127
-    ],
-    "shared_exp_method": "max",
-    "value": "value = mantissa * 2**(shared_exp - mant_bias)",
-    "shared_exp": "shared_exp = floor(log2(max(|x|) over the block))",
-    "blockify": "activations and weights block along dim 1 (channels), block_size elements per block; a tail shorter than block_size is zero-padded, which does not move a max-abs shared exponent"
   },
   "how_to_compare": {
     "bit_exact": [
-      "alg_a_int",
-      "alg_a_exp",
-      "alg_w_int",
-      "alg_w_exp"
+      "alg_conv_a_int",
+      "alg_conv_a_exp",
+      "alg_conv_w_int",
+      "alg_conv_w_exp",
+      "alg_conv_acc",
+      "alg_conv_sat"
     ],
     "float": [
-      "alg_out"
+      "alg_out",
+      "alg_conv_out"
     ],
-    "note": "The int taps are the contract. Match those first; alg_out follows from them. ref_fp32 is the unquantised output, for context only - neither side should match it."
+    "order": "compare in pipeline order - a_int, a_exp, w_int, w_exp, acc, sat - layer by layer; the first mismatch is the root cause, the rest are downstream of it",
+    "note": "The int taps are the contract. acc is the bit-exact layer output; alg_*_out is acc cast to fp32 and loses bits above 24. ref_fp32 is the unquantised output, context only."
   }
 }
