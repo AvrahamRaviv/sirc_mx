@@ -55,11 +55,14 @@ def _write(path_base, t):
     a = t.detach().cpu().numpy() if torch.is_tensor(t) else np.asarray(t)
     np.save(path_base + ".npy", a)
     is_int = np.issubdtype(a.dtype, np.integer)
+    prec = 17 if a.dtype == np.float64 else 9
     with open(path_base + ".txt", "w") as f:
         f.write(f"# shape={list(a.shape)} dtype={a.dtype} order=C "
                 f"(last axis fastest) count={a.size}\n")
         for v in a.reshape(-1):
-            f.write(f"{int(v)}\n" if is_int else f"{float(v):.9g}\n")
+            # float64 taps (the warp's arbitrary-real scales) need all 17
+            # digits to round-trip; fp32 needs 9
+            f.write(f"{int(v)}\n" if is_int else f"{float(v):.{prec}g}\n")
     return {"npy": os.path.basename(path_base) + ".npy",
             "txt": os.path.basename(path_base) + ".txt",
             "shape": list(a.shape), "dtype": str(a.dtype)}
@@ -127,6 +130,31 @@ def _accum_spec(xb, sp, blockify):
     }
 
 
+def _warp_spec(w):
+    def word(c):
+        return {k: c.get(k) for k in ("total_bits", "frac_bits", "scale",
+                                      "signed", "round", "saturate")
+                if c.get(k) is not None}
+    return {
+        "call_sites": w["call_sites"],
+        "ref": word(w["ref"]), "grid": word(w["grid"]), "out": word(w["out"]),
+        "scales": ("ref / out steps are in alg_warp*_ref_scale / _out_scale "
+                   "(one per call site; calibrated = max|x| / 127, an "
+                   "arbitrary positive real). grid step = 2^-frac_bits."),
+        "quantize": "code = clamp(round_half_away(x / step), lo, hi)",
+        "grid_meaning": ("grid_code [B, 2, H, W]: channel 0 = x, 1 = y, a "
+                         "DISPLACEMENT in pixels added to the output pixel's "
+                         "own coordinate"),
+        "interpolate": ("X = (x << 8) + gx; x0 = X >> 8 (arithmetic, floor); "
+                        "fx = X & 255; same for y. acc = sum over the 4 "
+                        "neighbours of ref_code * wx * wy, wx in {256 - fx, "
+                        "fx}, wy likewise (exact integer); a neighbour outside "
+                        "the image contributes 0"),
+        "output": ("out_code = clamp(round_half_away(acc * ref_step / "
+                   "out_step / 65536), -128, 127)"),
+    }
+
+
 def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0,
            blockify=None, clean=False):
     """Freeze one case to `out_dir/<case_name>/`. Returns the manifest."""
@@ -148,6 +176,8 @@ def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0,
         files[f"param_{_fname(pname)}"] = _write(
             os.path.join(d, f"param_{_fname(pname)}"), p)
     files["input"] = _write(os.path.join(d, "input"), case["x"])
+    if case.get("flow") is not None:
+        files["input_flow"] = _write(os.path.join(d, "input_flow"), case["flow"])
     files["ref_fp32"] = _write(os.path.join(d, "ref_fp32"), case["y_fp32"])
     files["alg_out"] = _write(os.path.join(d, "alg_out"), taps["model/out"])
     for k, v in taps.items():
@@ -177,9 +207,18 @@ def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0,
                            "(channel blocks), FP32 reduction - no acc / sat taps")
         layers.append(row)
 
+    warp = case["meta"].get("warp_config")
+    if warp:
+        for name in ALG._warp_names(case["model"]):
+            layers.append({"name": name, "type": "Warp", "datapath": "fxp",
+                           "call_sites": warp["call_sites"],
+                           "inputs": ["ref = input 0 (features)",
+                                      "grid = input 1 (flow, px)"]})
+
     int_taps = [f"alg_{_fname(k)}" for k in taps
                 if k.rsplit("/", 1)[-1] in ("a_int", "a_exp", "w_int", "w_exp",
-                                            "acc", "sat", "out_code", "out_clip")]
+                                            "acc", "sat", "out_code", "out_clip",
+                                            "ref_code", "grid_code")]
     manifest = {
         "case": case_name,
         "note": case["meta"]["note"],
@@ -202,6 +241,7 @@ def export(case_name, out_dir, config=None, bs=M.BLOCK_SIZE, seed=0,
         "out_quant": case["meta"].get("out_quant"),
         "mx_format": _format_spec(sp, blockify),
         "accumulator": _accum_spec(xb, sp, blockify),
+        "warp": _warp_spec(warp) if warp else None,
         "mx_config": {**cfg, "layers": ALG._layer_names(case["model"])},
         "files": files,
         "how_to_compare": {

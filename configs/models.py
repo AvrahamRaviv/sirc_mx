@@ -157,6 +157,95 @@ class SingleLinear(nn.Module):
         return self.fc(x)
 
 
+# --- warp (DOF) --------------------------------------------------------------
+
+class Warp(nn.Module):
+    """Backward warp: out[b,c,y,x] = bilinear(ref[b,c], x + flow_x, y + flow_y).
+
+    This is the spec the warp cases are built on, written out instead of going
+    through grid_sample so every step is visible:
+
+      * `flow` [B, 2, H, W] is a DISPLACEMENT in pixels (channel 0 = x,
+        channel 1 = y), added to the output pixel's own integer coordinate.
+      * x0 = floor(X), ax = X - x0 (same for y); the four neighbours are
+        weighted (1-ax)(1-ay), ax(1-ay), (1-ax)ay, ax*ay.
+      * a neighbour outside the image contributes 0 (zero padding).
+
+    Computed in float64: with the grid on the 1/256 lattice the weights are
+    exact, so the only rounding left is the output quantizer's - the float
+    model and an integer bilinear agree bit for bit (`tap_check.ref_warp`).
+    DOF's production warp goes through grid_sample in fp32, whose coordinate
+    normalise / unnormalise round trip is not exact; see main_HW.py.
+    """
+
+    def forward(self, ref, flow):
+        B, C, H, W = ref.shape
+        r = ref.double()
+        f = flow.double()
+        X = torch.arange(W, dtype=torch.float64).view(1, 1, W) + f[:, 0]
+        Y = torch.arange(H, dtype=torch.float64).view(1, H, 1) + f[:, 1]
+        x0, y0 = torch.floor(X), torch.floor(Y)
+        ax, ay = X - x0, Y - y0
+        x0, y0 = x0.long(), y0.long()
+        out = torch.zeros(B, C, H, W, dtype=torch.float64)
+        flat = r.reshape(B, C, H * W)
+        for dy, wy in ((0, 1 - ay), (1, ay)):
+            for dx, wx in ((0, 1 - ax), (1, ax)):
+                yy, xx = y0 + dy, x0 + dx
+                inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+                idx = (yy.clamp(0, H - 1) * W + xx.clamp(0, W - 1)).view(B, 1, -1)
+                v = flat.gather(2, idx.expand(B, C, -1)).view(B, C, H, W)
+                out += v * (wx * wy * inside).unsqueeze(1)
+        return out
+
+
+class WarpOnly(nn.Module):
+    """The warp alone: ref and flow are both network inputs."""
+
+    def __init__(self):
+        super().__init__()
+        self.warp = Warp()
+
+    def forward(self, x, flow):
+        return self.warp(x, flow)
+
+
+class ConvWarp(nn.Module):
+    """Conv2d -> warp, the DOF feature path: the warp reference is a conv's
+    output, so its int8 ref code is a requant of that conv's accumulator."""
+
+    def __init__(self, cin, cout, k=3, padding=1, bias=False):
+        super().__init__()
+        self.conv = nn.Conv2d(cin, cout, k, padding=padding, bias=bias)
+        self.warp = Warp()
+
+    def forward(self, x, flow):
+        return self.warp(self.conv(x), flow)
+
+
+class WarpLevels(nn.Module):
+    """One warp instance called once per pyramid level, coarse to fine, as in
+    DOF (call_sites = 3). Level l works at 1/2^l resolution on features that
+    grow 4x in magnitude per level, so a single static scale cannot fit all
+    three - each call site gets its own. Output: the three warped levels,
+    flattened and concatenated."""
+
+    def __init__(self, levels=3, gain=4.0):
+        super().__init__()
+        self.levels, self.gain = levels, gain
+        self.warp = Warp()
+
+    def forward(self, x, flow):
+        outs = []
+        for lvl in range(self.levels):
+            s = 2 ** (self.levels - 1 - lvl)
+            xs = F.avg_pool2d(x, s) * self.gain ** lvl if s > 1 else \
+                x * self.gain ** lvl
+            fs = F.avg_pool2d(flow, s) / s if s > 1 else flow
+            outs.append(self.warp(xs, fs).flatten(1))
+        return torch.cat(outs, dim=1)
+
+
 # =============================================================================
 # Tensor patterns
 # =============================================================================
@@ -278,7 +367,7 @@ def _signs(shape, axis, bs, gen, scale=1.0):
     return t * sign.reshape(t.shape)
 
 
-def _ties(shape, axis, bs, gen, scale=1.0):
+def _ties(shape, axis, bs, gen, scale=1.0, mbits=8):
     """Every non-leading element sits exactly on a rounding tie of the MX
     mantissa grid.
 
@@ -286,13 +375,15 @@ def _ties(shape, axis, bs, gen, scale=1.0):
     to E = floor(log2 scale) and the mantissa step to 2^(E - mant_bias). The rest
     are (k + 0.5) steps for k cycling through both signs and both parities, so
     half-away-from-zero, half-to-even and truncation give three different
-    mantissa sets. The MX lib rounds half away from zero. Assumes int8
-    (mant_bias 6); for wider formats the ties fall on representable values.
+    mantissa sets. The MX lib rounds half away from zero. `mbits` is the
+    element width the ties are laid out for (mant_bias = mbits - 2); k stays
+    inside the mantissa range, so no tie is hidden by the clamp.
     """
     t = torch.zeros(shape)
-    step = float(scale) * 2.0 ** -6
+    step = float(scale) * 2.0 ** -(mbits - 2)
     ks = torch.tensor([0, 1, 2, 3, -1, -2, -3, -4, 10, 11, -11, -12, 40, 41,
                        -41, -42], dtype=torch.float32)
+    ks = ks[(ks + 0.5).abs() < (1 << (mbits - 1)) - 1]
     for blk in _blocks(t, axis, bs):
         n = blk.shape[axis]
         v = (ks.repeat((n + len(ks) - 1) // len(ks))[:n] + 0.5) * step
@@ -373,6 +464,95 @@ PATTERNS: Dict[str, Callable] = {
 }
 
 
+def _step_ties(shape, axis, bs, gen, step=2.0 ** -4, scale=None):
+    """Every element an exact tie (k + 0.5) * step, k over both signs and both
+    parities. For a static fixed-point quantizer with that step: half-away,
+    half-even and truncation give three different codes."""
+    n = int(torch.tensor(shape).prod())
+    ks = torch.tensor([0, 1, 2, 3, -1, -2, -3, -4, 10, 11, -11, -12, 60, 61,
+                       -61, -62], dtype=torch.float64)
+    k = ks.repeat((n + len(ks) - 1) // len(ks))[:n]
+    return ((k + 0.5) * step).to(torch.float32).reshape(shape)
+
+
+PATTERNS["step_ties"] = _step_ties
+
+
+# --- flow fields [B, 2, H, W], in pixels ------------------------------------
+#
+# The warp grid is a Q8.8 word: 1/256 px steps, range [-128, +127.996]. These
+# fill it so that one convention at a time is the only thing that differs.
+
+def _flow_zero(shape, gen):
+    return torch.zeros(shape)
+
+
+def _flow_const(shape, gen, dx=0.0, dy=0.0):
+    """Constant displacement. Integer values make the warp a pure shift."""
+    t = torch.zeros(shape)
+    t[:, 0], t[:, 1] = float(dx), float(dy)
+    return t
+
+
+def _flow_subpix(shape, gen, max_px=3.0, lattice=True):
+    """Random displacement in [-max_px, max_px]. `lattice` snaps it to 1/256 so
+    the grid quantizer is exact and only the interpolation is under test;
+    otherwise the grid rounding is exercised too."""
+    t = (torch.rand(shape, generator=gen) * 2 - 1) * float(max_px)
+    return torch.round(t * 256) / 256 if lattice else t
+
+
+def _flow_ties(shape, gen):
+    """Every value an exact half-step of the Q8.8 grid, (k + 0.5)/256, both
+    signs and both parities: the grid's own rounding rule decides the code."""
+    n = int(torch.tensor(shape).prod())
+    ks = torch.tensor([0, 1, 2, 3, -1, -2, -3, -4, 100, 101, -101, -102],
+                      dtype=torch.float64)
+    k = ks.repeat((n + len(ks) - 1) // len(ks))[:n]
+    return ((k + 0.5) / 256).to(torch.float32).reshape(shape)
+
+
+def _flow_oob(shape, gen):
+    """Displacements that push every pixel across an image edge by a fraction
+    of a pixel, so each output mixes in-bounds and out-of-bounds neighbours.
+    Zero padding and border clamping give different values everywhere."""
+    B, _, H, W = shape
+    xs = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+    ys = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+    t = torch.zeros(shape)
+    # left half goes off the left edge, right half off the right one
+    t[:, 0] = torch.where(xs < W / 2, -xs - 0.375, (W - 1) - xs + 0.625)
+    t[:, 1] = torch.where(ys < H / 2, -ys - 0.25, (H - 1) - ys + 0.5)
+    return t
+
+
+def _flow_sat(shape, gen):
+    """Displacements past the Q8.8 range (+-128 px) and right at its edge:
+    200, -200, 127.998 (rounds to code 32767.5 -> clamps), -128.002."""
+    vals = torch.tensor([200.0, -200.0, 127.998046875, -128.001953125,
+                         127.99609375, -128.0, 1.5, -1.5])
+    n = int(torch.tensor(shape).prod())
+    return vals.repeat((n + len(vals) - 1) // len(vals))[:n].reshape(shape)
+
+
+FLOW_PATTERNS: Dict[str, Callable] = {
+    "zero": _flow_zero,
+    "const": _flow_const,
+    "subpix": _flow_subpix,
+    "ties": _flow_ties,
+    "oob": _flow_oob,
+    "sat": _flow_sat,
+}
+
+
+def make_flow(shape, pattern="zero", seed=0, **kw):
+    if pattern not in FLOW_PATTERNS:
+        raise ValueError(f"unknown flow pattern {pattern!r}; have "
+                         f"{sorted(FLOW_PATTERNS)}")
+    gen = torch.Generator().manual_seed(seed)
+    return FLOW_PATTERNS[pattern](tuple(shape), gen, **kw).to(torch.float32)
+
+
 def make_tensor(shape, pattern="randn", axis=1, bs=BLOCK_SIZE, seed=0, **kw):
     """Build one tensor. `axis` is the blockified axis (channels for
     activations, input-features for weights / linear)."""
@@ -446,6 +626,20 @@ class Case:
     # e_layer_min, ...
     mx: dict = None
     accum: dict = None
+    # Warp cases: the second network input is a flow field [B, 2, H, W] in
+    # pixels (`FLOW_PATTERNS`), and `warp` overrides the DOF warp quantizers
+    # per operand - {"ref": {...}, "grid": {...}, "out": {...},
+    # "call_sites": N} over `main_ALG.WARP_DEFAULT`.
+    flow_pattern: str = None
+    flow_kw: dict = None
+    warp: dict = None
+
+
+# Explicit power-of-two scales for the warp cases that pin one convention: the
+# ref and out words share the step, so an identity warp returns the ref code
+# unchanged and a half-pixel warp lands exactly on ties.
+_WARP_POW2 = {"ref": {"scale": 2.0 ** -5, "calibrate": False},
+              "out": {"scale": 2.0 ** -5, "calibrate": False}}
 
 
 def _c(cin_mult=1, **kw):
@@ -889,7 +1083,251 @@ CASES: Dict[str, Case] = {
         note="out_fxp_round_modes with round=trunc (toward zero).",
         tags=("fxp", "corner"),
     ),
+
+    # --- DOF element formats: the ladder runs int4 / int6 / int8 ------------
+    "fmt_int4": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
+        input_shape=lambda bs: (1, bs, 4, bs + 8),
+        mx={"w_elem_format": "int4", "a_elem_format": "int4"},
+        note="MXINT4 (DOF ladder rung): mant_bias 2, mantissa +-7, so most "
+             "elements of a block round to a handful of codes and ties are "
+             "everywhere. Partial X-block tail on top.",
+        tags=("fmt", "dof"),
+    ),
+    "fmt_int6": Case(
+        build=lambda bs: SingleConv(bs, bs, k=3, padding=1),
+        input_shape=lambda bs: (1, bs, 4, bs + 8),
+        mx={"w_elem_format": "int6", "a_elem_format": "int6"},
+        note="MXINT6 (DOF ladder rung): mant_bias 4, mantissa +-31.",
+        tags=("fmt", "dof"),
+    ),
+    "fmt_int4_ties": Case(
+        build=lambda bs: SingleConv(bs, bs, k=1),
+        input_shape=lambda bs: (1, bs, 2, bs),
+        w_pattern="ties", x_pattern="ties", w_kw={"mbits": 4},
+        x_kw={"mbits": 4},
+        mx={"w_elem_format": "int4", "a_elem_format": "int4"},
+        note="mx_round_ties at int4: every non-leading element is an exact "
+             "tie of the 3-bit mantissa grid (k + 0.5 steps, |k + 0.5| < 7). "
+             "int4 is where a tie rule costs most - one step is 1/8 of the "
+             "block max.",
+        tags=("fmt", "dof", "mxq"),
+    ),
+
+    # --- warp (DOF): int8 ref, Q8.8 grid, int8 out -------------------------
+    "warp_identity": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 8),
+        flow_pattern="zero", warp=_WARP_POW2,
+        note="Zero flow, ref and out share a 2^-5 step: out_code must equal "
+             "ref_code exactly. The first warp vector to match.",
+        tags=("warp", "dof", "baseline"),
+    ),
+    "warp_int_shift": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 5, 9),
+        flow_pattern="const", flow_kw={"dx": 3.0, "dy": -1.0}, warp=_WARP_POW2,
+        note="Integer flow (+3 px x, -1 px y): a pure shift of the ref codes, "
+             "zeros entering from the edges. Settles the grid's meaning - a "
+             "displacement added to the pixel coordinate (the spec) vs an "
+             "absolute source coordinate - and which channel is x.",
+        tags=("warp", "dof"),
+    ),
+    "warp_half_pixel": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 9),
+        flow_pattern="const", flow_kw={"dx": 0.5, "dy": 0.0}, warp=_WARP_POW2,
+        note="Half-pixel flow, equal ref / out steps: out = (a + b) / 2 in "
+             "codes, an exact tie wherever a + b is odd. The out quantizer's "
+             "tie rule (lib: half away) is the only thing that decides it.",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_neg_frac": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 8),
+        flow_pattern="const", flow_kw={"dx": -0.25, "dy": -0.75},
+        warp=_WARP_POW2,
+        note="Negative fractional flow: the grid word splits into integer and "
+             "fraction by an arithmetic shift (x0 = floor, frac in [0, 1)). "
+             "Splitting toward zero instead gives the wrong neighbour pair.",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_subpix": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 8, 6, 12),
+        flow_pattern="subpix", flow_kw={"max_px": 3.0},
+        note="Random flow on the 1/256 lattice, random features, calibrated "
+             "arbitrary-real ref / out scales: the DOF configuration as is. "
+             "Settles the interpolation weight precision (8 fractional bits).",
+        tags=("warp", "dof"),
+    ),
+    "warp_grid_ties": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 12),
+        flow_pattern="ties", warp=_WARP_POW2,
+        note="Every flow value an exact half-step of the Q8.8 grid: the grid "
+             "quantizer's tie rule (lib: half away) decides every grid_code.",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_ref_ties": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 8),
+        x_pattern="step_ties", x_kw={"step": 2.0 ** -5},
+        flow_pattern="zero", warp=_WARP_POW2,
+        note="Every feature an exact tie of the 2^-5 ref step: the ref "
+             "quantizer's tie rule decides every ref_code.",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_oob": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 6, 10),
+        flow_pattern="oob", warp=_WARP_POW2,
+        note="Every pixel sampled a fraction of a pixel past an image edge: "
+             "zero padding (the spec) and border clamping differ on every "
+             "output.",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_grid_sat": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 8),
+        flow_pattern="sat", warp=_WARP_POW2,
+        note="Flow at and past +-128 px: the Q8.8 grid word clamps to "
+             "[-32768, 32767] (127.998 rounds to 32767.5 and clamps).",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_out_sat": Case(
+        build=lambda bs: WarpOnly(),
+        input_shape=lambda bs: (1, 4, 4, 8),
+        x_kw={"scale": 2.0}, flow_pattern="subpix", flow_kw={"max_px": 1.0},
+        warp={"ref": {"scale": 2.0 ** -4, "calibrate": False},
+              "out": {"scale": 2.0 ** -7, "calibrate": False}},
+        note="Out step 8x finer than the ref's, so warped values beyond "
+             "+-1 clip (the ref itself does not): the int8 out word saturates "
+             "both ways. The lib allows "
+             "-128 (two's complement); a symmetric +-127 HW differs.",
+        tags=("warp", "dof", "corner"),
+    ),
+    "warp_levels": Case(
+        build=lambda bs: WarpLevels(),
+        input_shape=lambda bs: (1, 8, 8, 16),
+        flow_pattern="subpix", flow_kw={"max_px": 2.0},
+        warp={"call_sites": 3},
+        note="One warp, three pyramid levels (1/4, 1/2, 1 res; features 4x "
+             "larger per level): each call site calibrates its own ref and "
+             "out scale, as arch specified. Taps are warp@0 .. warp@2.",
+        tags=("warp", "dof"),
+    ),
+    "conv_warp": Case(
+        build=lambda bs: ConvWarp(bs, 8, k=3, padding=1),
+        input_shape=lambda bs: (1, bs, 4, 12),
+        flow_pattern="subpix", flow_kw={"max_px": 2.0},
+        note="MX conv -> warp: the warp's int8 ref is the conv's accumulator "
+             "requantised to a static scale. The MX -> fxp handoff.",
+        tags=("warp", "dof", "topology"),
+    ),
 }
+
+
+# =============================================================================
+# DOF-shaped convs, from a shape dump of the real network
+# =============================================================================
+#
+# `dump_layer_shapes.py` run on DOF writes every conv's geometry and input
+# shape; each distinct Conv2d geometry becomes one `dof_<layer>` case with the
+# real Cin / Cout / kernel / stride / padding / dilation / bias and the real
+# input W - which is what sets the X-block tail under NPE. H is cropped to the
+# few rows that give two output rows: under NPE no block spans H, so more rows
+# only repeat the same blocking.
+
+import json as _json
+import os as _os
+
+DOF_SHAPES = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                           "dof_shapes.json")
+DOF_CONFIG = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                           "mx_config_dof_npe_auto_ladder.json")
+DOF_SKIPPED: Dict[str, str] = {}
+
+
+def _dof_plain_layers(path=DOF_CONFIG):
+    """DOF layers the production config pins to a plain-MX group (off the HW
+    accumulator path)."""
+    try:
+        with open(path) as f:
+            cfg = _json.load(f)
+    except OSError:
+        return set()
+    return {l["name"] for l in cfg.get("layers", [])
+            if isinstance(l, dict) and l.get("group") == "convT_plain"}
+
+
+def _short(name):
+    return (name[len("model."):] if name.startswith("model.") else name) \
+        .replace(".", "_")
+
+
+def register_dof_cases(path=DOF_SHAPES, cases=None):
+    """Add one case per distinct DOF Conv2d geometry. Returns the new names.
+
+    ConvTranspose2d (no HW path yet) and groups != 1 (falls back to FP32) are
+    not registered; they are listed in `DOF_SKIPPED` with the reason.
+    """
+    cases = CASES if cases is None else cases
+    if not _os.path.exists(path):
+        return []
+    with open(path) as f:
+        rec = _json.load(f)
+    plain = _dof_plain_layers()
+    seen, added = {}, []
+    for row in rec.get("convs", []):
+        name = row["name"]
+        if row["type"] != "Conv2d":
+            DOF_SKIPPED[name] = f"{row['type']}: no HW path in the lib yet"
+            continue
+        if row["groups"] != 1:
+            DOF_SKIPPED[name] = f"groups={row['groups']}: FP32 fallback"
+            continue
+        kH, kW = row["kernel_size"]
+        sH, sW = row["stride"]
+        pH, pW = row["padding"]
+        dH, dW = row["dilation"]
+        B, cin, H, W = row["input_shape"]
+        key = (cin, row["out_channels"], kH, kW, sH, sW, pH, pW, dH, dW,
+               row["bias"], W)
+        if key in seen:
+            seen[key].append(name)
+            continue
+        seen[key] = [name]
+        Hc = max(sH + dH * (kH - 1) + 1 - 2 * pH, 2)
+        cname = "dof_" + _short(name)
+        cout, bias = row["out_channels"], row["bias"]
+        cases[cname] = Case(
+            build=lambda bs, a=(cin, cout, (kH, kW), (sH, sW), (pH, pW),
+                                (dH, dW), bias):
+                SingleConv(a[0], a[1], k=a[2], stride=a[3], padding=a[4],
+                           dilation=a[5], bias=a[6]),
+            input_shape=lambda bs, s=(1, cin, Hc, W): s,
+            note="",            # filled below, once every sharer is known
+            tags=("dof", "dof_conv"),
+        )
+        cases[cname]._dof = (key, name, H, W, name in plain)
+        added.append(cname)
+    for cname in added:
+        key, name, H, W, is_plain = cases[cname]._dof
+        sharers = seen[key]
+        cin, cout, kH, kW, sH, sW, pH, pW = key[:8]
+        cases[cname].note = (
+            f"DOF {name}: {cin}->{cout} {kH}x{kW} s{sH}x{sW} p{pH}x{pW}, real "
+            f"input H x W = {H} x {W} (H cropped). W = {W} is "
+            f"{W // BLOCK_SIZE} full X-block(s) + a {W % BLOCK_SIZE}-wide tail."
+            + (f" Same geometry: {', '.join(sharers[1:])}." if len(sharers) > 1
+               else "")
+            + (" DOF pins this layer to plain MX (convT_plain), so the real "
+               "net does not run it on the HW accumulator." if is_plain else ""))
+    return added
+
+
+DOF_CASES = register_dof_cases()
 
 
 # =============================================================================
@@ -928,9 +1366,13 @@ def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None, blockify=None):
         act_block_axis(len(shape), blockify)
     x = make_tensor(shape, case.x_pattern, axis=axis, bs=bs, seed=seed + 1000,
                     **(case.x_kw or {}))
+    flow = None
+    if case.flow_pattern:
+        flow = make_flow((shape[0], 2, shape[2], shape[3]), case.flow_pattern,
+                         seed=seed + 2000, **(case.flow_kw or {}))
 
     with torch.no_grad():
-        y = model(x)
+        y = model(*inputs_of({"x": x, "flow": flow}))
 
     meta = {
         "case": name,
@@ -953,9 +1395,17 @@ def build_case(name, bs=BLOCK_SIZE, seed=0, batch=None, blockify=None):
         "params": {n: list(p.shape) for n, p in model.named_parameters()},
         "note": case.note,
         "tags": list(case.tags),
+        "flow_pattern": case.flow_pattern,
+        "flow_kw": case.flow_kw or {},
+        "warp": case.warp or {},
     }
-    return {"model": model, "x": x, "y_fp32": y, "meta": meta,
+    return {"model": model, "x": x, "flow": flow, "y_fp32": y, "meta": meta,
             "out_quant": case.out_quant}
+
+
+def inputs_of(case):
+    """The positional network inputs of a built case: (x,) or (x, flow)."""
+    return (case["x"],) if case.get("flow") is None else (case["x"], case["flow"])
 
 
 def case_names(tag=None):
@@ -1000,8 +1450,9 @@ def add_model_args(parser):
                         metavar="NAME",
                         help="case name from the registry, or 'all' / a tag "
                              "(baseline, align, geometry, topology, stress, "
-                             "corner, fxp, mxq, xblock, accum, fmt) to select "
-                             "a group. --list prints them.")
+                             "corner, fxp, mxq, xblock, accum, fmt, dof, warp, "
+                             "dof_conv) to select a group. --list prints "
+                             "them.")
     parser.add_argument("--bs", type=int, default=BLOCK_SIZE,
                         help=f"MX block size (default {BLOCK_SIZE})")
     parser.add_argument("--seed", type=int, default=0,

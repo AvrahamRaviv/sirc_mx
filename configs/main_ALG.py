@@ -37,9 +37,10 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
 from microxcaling.mx.convolution import Conv2d as MXConv2d
 from microxcaling.mx.linear import Linear as MXLinear
 from mx_layers_blocked import MXConv2dHW
+from mx_layers_act import MXActQuant
 from mx_quantizer import MXQuantizer
 from mx_stats import _is_npe, _layer_quant_axes, _quant_operand
-from fixed_point.fxp_quant import normalize_out_quant, fxp_format_str
+from fixed_point.fxp_quant import normalize_out_quant, fxp_format_str, fxp_step
 
 import models as M
 import tap_check as TC
@@ -97,6 +98,37 @@ DEFAULT_CONFIG = {
     "ptq": False,
     "measure_error": False,
 }
+
+
+# The DOF warp as arch specified it (mx_config_dof_*.json, `model.warp`): the
+# reference and the result are int8 words with a static, arbitrary positive
+# real scale calibrated per call site; the grid is a Q8.8 word (16 bits, step
+# 1/256 px). All three round half away from zero and saturate. A case's
+# `warp` dict overrides these per operand ({"ref": {...}, "grid": {...},
+# "out": {...}, "call_sites": N}).
+WARP_DEFAULT = {
+    "call_sites": 1,
+    "ref": {"total_bits": 8, "signed": True, "calibrate": True, "pow2": False,
+            "round": "half_away", "saturate": True},
+    "grid": {"total_bits": 16, "frac_bits": 8, "signed": True,
+             "round": "half_away", "saturate": True},
+    "out": {"total_bits": 8, "signed": True, "calibrate": True, "pow2": False,
+            "round": "half_away", "saturate": True},
+}
+
+
+def warp_config(case):
+    """WARP_DEFAULT with the case's own `warp` overrides."""
+    over = case["meta"].get("warp") or {}
+    cfg = _deep_merge(WARP_DEFAULT, over)
+    for k in ("ref", "out"):
+        if cfg[k].get("scale") is not None:
+            cfg[k]["calibrate"] = False
+    return cfg
+
+
+def _warp_names(model):
+    return [n for n, m in model.named_modules() if isinstance(m, M.Warp)]
 
 
 BLOCKIFY_KEYS = {"npe": ("xblock", "flatten"), "channel": ("channel", "channel")}
@@ -179,7 +211,7 @@ def _layer_names(model):
 # Quantize
 # =============================================================================
 
-def quantize(model, config, out_quant=None, verbose=False):
+def quantize(model, config, out_quant=None, verbose=False, warp=None):
     """Replace every Conv2d / Linear with its MX equivalent.
 
     `MXQuantizer` reads `mx_config.json` from a directory, so the config dict is
@@ -197,6 +229,14 @@ def quantize(model, config, out_quant=None, verbose=False):
     if out_quant:
         cfg["layers"] = list(cfg["layers"]) + [
             {"name": "", "kind": "out_quant", **out_quant}]
+    # The warp is parameter-free, so MXQuantizer wraps it as an act_quant
+    # layer: fixed-point ref (input 0), grid (input 1) and output.
+    for name in _warp_names(model):
+        w = warp or WARP_DEFAULT
+        cfg["layers"] = list(cfg["layers"]) + [
+            {"name": name, "kind": "act_quant", "call_sites": w["call_sites"],
+             "inputs": [{"fxp": w["ref"]}, {"fxp": w["grid"]}],
+             "output": {"fxp": w["out"]}}]
 
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "mx_config.json"), "w") as f:
@@ -294,6 +334,59 @@ def _make_hook(name, taps, bs):
     return hook
 
 
+def warp_prefix(name, site, call_sites):
+    """Tap prefix of one warp call: 'warp', or 'warp@<site>' when the instance
+    runs more than once per forward."""
+    return name if call_sites == 1 else f"{name}@{site}"
+
+
+def _code_of(q, cfg, what):
+    """Fake-quant fxp tensor -> its integer word, asserting it is on the
+    lattice (a tap that is not a quantized tensor must not reach arch)."""
+    step = fxp_step(cfg)
+    v = q.double() / step
+    code = torch.round(v)
+    if not bool(((v - code).abs() < 1e-3).all()):
+        raise AssertionError(f"{what}: not on the fxp lattice of step {step}")
+    dt = torch.int8 if cfg["total_bits"] <= 8 else (
+        torch.int16 if cfg["total_bits"] <= 16 else torch.int32)
+    return code.to(dt)
+
+
+def _make_warp_hook(name, taps):
+    """Forward hook on the MXActQuant around a warp: the integer ref and grid
+    words it consumed, the result before and after its output quantizer, and
+    the scales - per call site."""
+
+    def hook(module, inputs, output):
+        site = module.last_site
+        pfx = warp_prefix(name, site, module.call_sites)
+        ref_cfg = module.fxp_cfg(0, site)
+        grid_cfg = module.fxp_cfg(1, site)
+        out_cfg = module.out_fxp_cfg(site)
+        q_ref = module.quant_input(inputs[0].detach(), 0, site)
+        q_grid = module.quant_input(inputs[1].detach(), 1, site)
+        with torch.no_grad():
+            pre = module.inner(q_ref, q_grid)
+        taps[f"{pfx}/ref_code"] = _code_of(q_ref, ref_cfg, f"{pfx}/ref")
+        taps[f"{pfx}/grid_code"] = _code_of(q_grid, grid_cfg, f"{pfx}/grid")
+        taps[f"{pfx}/out_pre"] = pre.detach().cpu()
+        taps[f"{pfx}/out_code"] = _code_of(output.detach(), out_cfg,
+                                           f"{pfx}/out")
+        lo, hi = TC.code_range(out_cfg["total_bits"], out_cfg["signed"])
+        v = TC.round_int(pre.double() / fxp_step(out_cfg), out_cfg["round"])
+        taps[f"{pfx}/out_clip"] = ((v < lo) | (v > hi)).to(torch.uint8)
+        taps[f"{pfx}/ref_scale"] = torch.tensor(fxp_step(ref_cfg),
+                                                dtype=torch.float64)
+        taps[f"{pfx}/grid_scale"] = torch.tensor(fxp_step(grid_cfg),
+                                                 dtype=torch.float64)
+        taps[f"{pfx}/out_scale"] = torch.tensor(fxp_step(out_cfg),
+                                                dtype=torch.float64)
+        taps[f"{pfx}/out"] = output.detach().cpu()
+
+    return hook
+
+
 # =============================================================================
 # Run
 # =============================================================================
@@ -323,7 +416,11 @@ def run(case, config=None, verbose=False, check=True):
     bs = config["mx_specs"]["block_size"]
     out_quant = case.get("out_quant")
 
-    qmodel = quantize(case["model"], config, out_quant=out_quant, verbose=verbose)
+    warp = warp_config(case) if _warp_names(case["model"]) else None
+    case["meta"]["warp_config"] = warp
+    inputs = M.inputs_of(case)
+    qmodel = quantize(case["model"], config, out_quant=out_quant,
+                      verbose=verbose, warp=warp)
 
     # Which datapath each layer actually got. MXConv2dHW is the one under test;
     # the quantizer silently falls back to MXConv2d when a layer cannot take the
@@ -351,12 +448,23 @@ def run(case, config=None, verbose=False, check=True):
         if isinstance(mod, MXConv2dHW)
     }
 
+    # Static warp scales marked `calibrate` are frozen from this case's own
+    # inputs, per call site - the same post-training pass DOF runs, on one
+    # deterministic batch.
+    if warp:
+        from fixed_point.mx_fixed_point_hw import calibrate_act_scales
+        calibrate_act_scales(qmodel, [inputs], num_batches=1,
+                             forward_fn=lambda m, b: m(*b), verbose=0)
+
     taps, handles = {}, []
     for name, mod in qmodel.named_modules():
         if isinstance(mod, MXConv2dHW):
             mod._tap_acc = True
         if isinstance(mod, (MXConv2d, MXLinear)):
             handles.append(mod.register_forward_hook(_make_hook(name, taps, bs)))
+        if isinstance(mod, MXActQuant) and isinstance(mod.inner, M.Warp):
+            mod.reset_calls()
+            handles.append(mod.register_forward_hook(_make_warp_hook(name, taps)))
 
     if out_quant:
         # prepend so this runs *before* the out_quant hook and sees the output
@@ -367,7 +475,7 @@ def run(case, config=None, verbose=False, check=True):
 
     try:
         with torch.no_grad():
-            out = qmodel(case["x"])
+            out = qmodel(*inputs)
     finally:
         for h in handles:
             h.remove()
@@ -392,7 +500,22 @@ def run(case, config=None, verbose=False, check=True):
 
     if check:
         case["meta"]["tap_check"] = _check_taps(qmodel, taps, case, config)
+        if warp:
+            case["meta"]["warp_check"] = _check_warps(taps, warp)
     return taps
+
+
+def _check_warps(taps, warp):
+    """`tap_check.check_warp` on every recorded warp call."""
+    res = {}
+    for k in taps:
+        if k.endswith("/ref_code"):
+            pfx = k.rsplit("/", 1)[0]
+            res[pfx] = TC.check_warp(
+                pfx, taps, grid_frac=warp["grid"]["frac_bits"],
+                out_bits=warp["out"]["total_bits"],
+                out_round=warp["out"]["round"])
+    return res
 
 
 def _check_taps(qmodel, taps, case, config):
@@ -478,6 +601,16 @@ def _print_taps(name, taps, case):
         print(f"  tap_check: {len(tc)}/{len(tc)} HW layers rebuild bit-exact"
               + (f"   acc wider than fp32 (use /acc, not /out): " +
                  ", ".join(f"{n}={v}" for n, v in lossy.items()) if lossy else ""))
+    wc = case["meta"].get("warp_check")
+    if wc:
+        parts = []
+        for pfx, r in wc.items():
+            rs = float(taps[f"{pfx}/ref_scale"])
+            os_ = float(taps[f"{pfx}/out_scale"])
+            parts.append(f"{pfx} ref_step={rs:.6g} out_step={os_:.6g} "
+                         f"clip={int(taps[f'{pfx}/out_clip'].sum())}")
+        print(f"  warp: {len(wc)}/{len(wc)} calls rebuild out_code bit-exact   "
+              + "; ".join(parts))
     oq = case["meta"].get("out_quant")
     if oq:
         n = taps["model/out_clip"].numel()

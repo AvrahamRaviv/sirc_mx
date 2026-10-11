@@ -83,6 +83,20 @@ import models as M
 #   model/out_code   the integer word: round(value * 2^frac_bits), clamped
 #   model/out_clip   1 where saturation touched the element, else 0
 #
+# Warp cases (tag `warp`; case["flow"] is the second network input), per call
+# of the warp - prefix "warp", or "warp@<site>" when one instance runs once per
+# pyramid level (`warp_levels`):
+#
+#   warp/ref_scale   float64 scalar: the int8 reference word's step
+#   warp/ref_code    int8 [B, C, H, W]: round(ref / ref_scale), clamped
+#   warp/grid_scale  float64 scalar: the grid step, 2^-8
+#   warp/grid_code   int16 [B, 2, H, W]: the Q8.8 flow word, channel 0 = x
+#   warp/out_scale   float64 scalar: the int8 result word's step
+#   warp/out_pre     float64: the warped value before the out quantizer
+#   warp/out_code    int8 [B, C, H, W]: THE bit-exact warp output
+#   warp/out_clip    uint8: 1 where the out word saturated
+#   warp/out         out_code * out_scale
+#
 # <layer> is the module name from `model.named_modules()`, e.g. "conv",
 # "conv1", "dw", "head". `models.py` prints them with --list.
 
@@ -141,6 +155,32 @@ import models as M
 # The static fixed-point output stage is configured per case rather than in
 # mx_specs, because it is a different quantizer (see `out_quant_fxp` below):
 #   out_quant.total_bits / frac_bits / signed / round / saturate
+#
+# The warp is configured per case too (`main_ALG.warp_config(case)`, recorded
+# in case["meta"]["warp_config"]): ref / grid / out words, call_sites. Settled
+# with arch: ref and out are int8 with a static arbitrary-real scale, one per
+# pyramid level; the grid is Q8.8 (16 bits, 1/256 px). Still open, each with
+# the case that settles it:
+#   - grid meaning: a displacement added to the output pixel's coordinate (the
+#     spec), or an absolute source coordinate? Which channel is x?
+#     `warp_int_shift` - a pure shift under the spec.
+#   - coordinate split: x0 = X >> 8 (arithmetic, floor) and fx = X & 255, or a
+#     split toward zero? Only differs for negative coordinates:
+#     `warp_neg_frac`.
+#   - out of bounds: a neighbour outside the image contributes 0 (spec), or
+#     the index clamps to the border? `warp_oob`.
+#   - tie rules of the three quantizers (lib: half away from zero everywhere):
+#     `warp_ref_ties`, `warp_grid_ties`, `warp_half_pixel` (the out word).
+#   - saturation: the grid clamps to [-32768, 32767] (`warp_grid_sat`); the
+#     out word to [-128, 127], i.e. -128 is reachable (`warp_out_sat`).
+#   - the rescale acc * ref_scale / out_scale: in what precision does HW
+#     multiply by an arbitrary real (fp32? a fixed-point multiplier + shift)?
+#     The lib uses float64, so a coarser multiplier can move an out_code by
+#     one near a tie. `warp_subpix` / `warp_levels` use calibrated scales.
+#   - DOF's production warp is grid_sample (fp32, coordinates normalised to
+#     [-1, 1] and back), not this exact form: its round trip is not exact, so
+#     the trained model may sit up to one out LSB away from the integer warp
+#     near ties.
 
 
 def quantize_mx(t, bs, mbits, scale_bits=8, axis=None, blockify="xblock"):
@@ -216,6 +256,29 @@ def conv2d_hw(a_int, a_exp, w_int, w_exp, bias, geom, cfg):
     raise NotImplementedError("conv2d_hw")
 
 
+def warp_hw(ref, flow, wcfg, site=0):
+    """The DOF warp, the way the HW does it. Integer only once quantized.
+
+      1. ref_code  = clamp(round_half_away(ref / ref_scale), -128, 127)
+         grid_code = clamp(round_half_away(flow * 256), -32768, 32767)
+         (ref_scale / out_scale per call site: case taps warp*/ref_scale, or
+         calibrate max|x| / 127 the way `calibrate_act_scales` does)
+      2. per output pixel (x, y), per channel:
+           X  = (x << 8) + grid_code[:, 0]      Y = (y << 8) + grid_code[:, 1]
+           x0 = X >> 8, fx = X & 255           y0 = Y >> 8, fy = Y & 255
+           acc = sum of ref_code[y0 + dy, x0 + dx] * wx * wy over dx, dy in
+                 {0, 1}, wx = 256 - fx | fx, wy = 256 - fy | fy; a neighbour
+                 outside the image contributes 0
+      3. out_code = clamp(round_half_away(acc * ref_scale / out_scale / 65536),
+                          -128, 127)
+      4. emit the warp taps listed under TAP NAMES.
+
+    `tap_check.ref_warp` is the ALG side's version of exactly this (the
+    options it takes are the alternatives listed as open above).
+    """
+    raise NotImplementedError("warp_hw")
+
+
 def run(case, config=None, verbose=False):
     """Run one case through the HW implementation.
 
@@ -237,6 +300,9 @@ def run(case, config=None, verbose=False):
     What must be true before anything else: layer N+1's activations are layer
     N's *requantised* output, not an FP32 one. That handoff is `conv_relu_conv`
     in the registry, and getting it wrong is invisible on single-layer cases.
+
+    Warp cases take two inputs: `models.inputs_of(case)` is (x, flow). Run
+    every `models.Warp` module through `warp_hw`, in call order.
 
     Finally, if `case["out_quant"]` is set, push the network output through
     `out_quant_fxp` and emit the model/out_pre, model/out_code and

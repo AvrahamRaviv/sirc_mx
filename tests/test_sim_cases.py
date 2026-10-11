@@ -230,3 +230,171 @@ def test_acc_wider_than_fp32_is_flagged():
     """/out loses bits here; /acc is the bit-exact comparable."""
     case, _ = _run("with_bias")
     assert case["meta"]["tap_check"]["conv"]["acc_fp32_lossy"] > 0
+
+
+# =============================================================================
+# DOF formats
+# =============================================================================
+
+def test_int4_ties_separate_rounding_rules():
+    case, taps = _run("fmt_int4_ties")
+    raw = _mant_raw(case["x"], taps["conv/a_exp"], 3, M.BLOCK_SIZE, mbits=4)
+    got = taps["conv/a_int"].double()
+    away = (torch.sign(raw) * torch.floor(raw.abs() + 0.5)).clamp(-7, 7)
+    assert torch.equal(got, away)
+    assert int((got != torch.round(raw).clamp(-7, 7)).sum()) > 0
+
+
+# =============================================================================
+# Warp: every case rebuilds, and each corner splits its alternatives
+# =============================================================================
+
+WARP_CASES = M.case_names("warp")
+
+
+def _warp_variant(taps, pfx="warp", **kw):
+    return TC.ref_warp(taps[f"{pfx}/ref_code"], taps[f"{pfx}/grid_code"],
+                       float(taps[f"{pfx}/ref_scale"]),
+                       float(taps[f"{pfx}/out_scale"]), **kw)[0]
+
+
+@pytest.mark.parametrize("name", WARP_CASES)
+def test_warp_case_rebuilds(name):
+    case, taps = _run(name)
+    wc = case["meta"]["warp_check"]
+    assert wc and all(f"{p}/out_code" in taps for p in wc)
+    for p in wc:
+        assert taps[f"{p}/ref_code"].dtype == torch.int8
+        assert taps[f"{p}/grid_code"].dtype == torch.int16
+
+
+def test_warp_identity_returns_ref():
+    _, taps = _run("warp_identity")
+    assert torch.equal(taps["warp/out_code"], taps["warp/ref_code"])
+
+
+def test_warp_int_shift_is_a_shift():
+    _, taps = _run("warp_int_shift")
+    ref, out = taps["warp/ref_code"], taps["warp/out_code"]
+    # dx = +3, dy = -1: out[y, x] = ref[y - 1, x + 3]
+    assert torch.equal(out[:, :, 1:, :-3], ref[:, :, :-1, 3:])
+    assert bool((out[:, :, 0] == 0).all()) and bool((out[..., -3:] == 0).all())
+    assert not torch.equal(_warp_variant(taps, grid="absolute"), out)
+
+
+def test_warp_half_pixel_ties():
+    _, taps = _run("warp_half_pixel")
+    out = taps["warp/out_code"]
+    assert int((_warp_variant(taps, out_round="half_even") != out).sum()) > 5
+    assert int((_warp_variant(taps, out_round="trunc") != out).sum()) > 5
+
+
+def test_warp_neg_frac_split():
+    _, taps = _run("warp_neg_frac")
+    assert not torch.equal(_warp_variant(taps, split="trunc"),
+                           taps["warp/out_code"])
+
+
+def test_warp_oob_zero_vs_border():
+    _, taps = _run("warp_oob")
+    out = taps["warp/out_code"]
+    border = _warp_variant(taps, oob="border")
+    assert int((border != out).sum()) > out.numel() // 2
+
+
+def _fxp_ties(x, step):
+    v = x.double() / step
+    return (v - v.floor()) == 0.5
+
+
+@pytest.mark.parametrize("name,inp,tap,step", [
+    ("warp_grid_ties", "flow", "grid_code", 2.0 ** -8),
+    ("warp_ref_ties", "x", "ref_code", 2.0 ** -5)])
+def test_warp_quantizer_ties(name, inp, tap, step):
+    case, taps = _run(name)
+    v = case[inp].double() / step
+    assert bool(_fxp_ties(case[inp], step).all())
+    got = taps[f"warp/{tap}"].double()
+    assert torch.equal(got, torch.sign(v) * torch.floor(v.abs() + 0.5))
+    assert int((got != torch.round(v)).sum()) > v.numel() // 4
+
+
+def test_warp_grid_saturates():
+    _, taps = _run("warp_grid_sat")
+    g = taps["warp/grid_code"]
+    assert int((g == 32767).sum()) > 0 and int((g == -32768).sum()) > 0
+
+
+def test_warp_out_saturates_both_ways():
+    _, taps = _run("warp_out_sat")
+    out, ref = taps["warp/out_code"], taps["warp/ref_code"]
+    assert int((out == 127).sum()) > 0 and int((out == -128).sum()) > 0
+    assert int((ref.abs() >= 127).sum()) == 0          # only the out clips
+
+
+def test_warp_subpix_is_fractional():
+    _, taps = _run("warp_subpix")
+    frac = taps["warp/grid_code"].long() & 255
+    assert int((frac != 0).sum()) > frac.numel() * 0.9
+
+
+def test_warp_levels_scale_per_site():
+    _, taps = _run("warp_levels")
+    s = [float(taps[f"warp@{i}/ref_scale"]) for i in range(3)]
+    assert s[0] < s[1] < s[2]
+    assert taps["warp@0/ref_code"].shape[-1] * 4 == taps["warp@2/ref_code"].shape[-1]
+
+
+def test_conv_warp_handoff():
+    """The warp ref is the conv's output requantised to the static ref step."""
+    _, taps = _run("conv_warp")
+    step = float(taps["warp/ref_scale"])
+    v = taps["conv/out"].double() / step
+    want = (torch.sign(v) * torch.floor(v.abs() + 0.5)).clamp(-128, 127)
+    assert torch.equal(taps["warp/ref_code"].double(), want)
+
+
+# =============================================================================
+# DOF-shaped convs from a shape dump
+# =============================================================================
+
+def test_register_dof_cases_from_dump(tmp_path):
+    import json
+    import torch.nn as nn
+    from dump_layer_shapes import dump_layer_shapes
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Conv2d(3, 16, 3, stride=2, padding=1)
+            self.b = nn.Conv2d(16, 16, 3, padding=1)
+            self.c = nn.Conv2d(16, 16, 3, padding=1)        # same as b
+            self.d = nn.Conv2d(16, 16, 3, padding=1, groups=16)
+            self.up = nn.ConvTranspose2d(16, 4, 4, stride=2, padding=1)
+
+        def forward(self, x):
+            x = self.b(self.a(x))
+            return self.up(self.d(self.c(x)))
+
+    path = tmp_path / "shapes.json"
+    dump_layer_shapes(Toy(), torch.randn(1, 3, 10, 90), str(path))
+    rec = json.loads(path.read_text())
+    assert [r["name"] for r in rec["convs"]] == ["a", "b", "c", "d", "up"]
+
+    cases = {}
+    names = M.register_dof_cases(str(path), cases=cases)
+    assert names == ["dof_a", "dof_b"]
+    assert "c" in cases["dof_b"].note
+    assert set(M.DOF_SKIPPED) >= {"d", "up"}
+
+    saved = dict(M.CASES)
+    try:
+        M.CASES.update(cases)
+        case = M.build_case("dof_b")
+        assert case["x"].shape[-1] == 45                  # real W kept
+        taps = ALG.run(case, ALG.load_config())
+        assert case["meta"]["datapath"] == {"conv": "MXConv2dHW"}
+        assert taps["conv/a_exp"].shape[-1] == 2          # 32 + 13-wide tail
+    finally:
+        M.CASES.clear()
+        M.CASES.update(saved)

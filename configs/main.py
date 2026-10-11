@@ -51,7 +51,10 @@ _INT_SUFFIXES = ("a_int", "a_exp", "w_int", "w_exp", "out_int", "out_exp",
                  "acc_raw", "acc_shf", "acc_sat",
                  # static fixed-point output stage: the word itself is an
                  # integer, so it is the bit-exact comparable there too.
-                 "out_code", "out_clip")
+                 "out_code", "out_clip",
+                 # warp: the int8 reference word and the Q8.8 grid word it
+                 # consumed (out_code / out_clip above are its result)
+                 "ref_code", "grid_code")
 
 
 # =============================================================================
@@ -116,8 +119,9 @@ def compare_tap(name, alg, hw):
 # cause if the rows are in the order the data flows - alphabetical would put
 # acc ahead of w_int and blame the accumulator for a weight mismatch.
 _STAGE_ORDER = ("a_int", "a_exp", "w_int", "w_exp", "acc_raw", "acc_shf",
-                "acc_sat", "acc", "sat", "out_int", "out_exp", "out",
-                "out_pre", "out_code", "out_clip")
+                "acc_sat", "acc", "sat", "out_int", "out_exp",
+                "ref_scale", "ref_code", "grid_scale", "grid_code",
+                "out_scale", "out_pre", "out_code", "out_clip", "out")
 
 
 def _pipeline_order(names, alg_taps):

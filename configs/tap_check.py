@@ -211,6 +211,104 @@ def ref_conv(a_int, a_code, w_int, w_code, bias, *, stride, padding, dilation,
     return acc.view(B, O, Ho, Wo), sat.view(B, O, Ho, Wo)
 
 
+# =============================================================================
+# Warp
+# =============================================================================
+
+def round_int(v, mode):
+    """float64 -> nearest integer under a tie rule (as float64)."""
+    if mode == "half_away":
+        return torch.sign(v) * torch.floor(v.abs() + 0.5)
+    if mode == "half_even":
+        return torch.round(v)
+    if mode == "trunc":
+        return torch.trunc(v)
+    raise ValueError(f"round mode {mode!r}")
+
+
+def code_range(total_bits, signed=True):
+    if signed:
+        return -(1 << (total_bits - 1)), (1 << (total_bits - 1)) - 1
+    return 0, (1 << total_bits) - 1
+
+
+def ref_warp(ref_code, grid_code, ref_scale, out_scale, *, grid_frac=8,
+             out_bits=8, out_round="half_away", oob="zeros", grid="displacement",
+             split="floor"):
+    """Rebuild the warp's int8 output word from its integer taps.
+
+      X     = (x << frac) + grid_code[:, 0]        Q8.8 source coordinate
+      x0    = X >> frac  (arithmetic: floor)       fx = X - (x0 << frac)
+      (same for y with grid_code[:, 1])
+      acc   = sum over the 4 neighbours of ref_code * wx * wy,
+              wx in {2^frac - fx, fx}, wy likewise    (exact integer)
+      out   = round(acc * ref_scale / out_scale / 2^(2 frac)), clamped to
+              the out word (signed: [-128, 127])
+
+    A neighbour outside the image contributes 0. The other options exist to
+    show what a HW that chose differently would produce: oob='border' clamps
+    the neighbour index to the edge, grid='absolute' takes grid_code as the
+    source coordinate itself rather than a displacement, split='trunc' splits
+    the coordinate toward zero instead of by an arithmetic shift.
+
+    Returns (out_code int64 [B,C,H,W], acc int64 [B,C,H,W]).
+    """
+    B, C, H, W = ref_code.shape
+    one = 1 << grid_frac
+    g = grid_code.long()
+    if grid == "displacement":
+        X = (torch.arange(W).view(1, 1, W) << grid_frac) + g[:, 0]
+        Y = (torch.arange(H).view(1, H, 1) << grid_frac) + g[:, 1]
+    elif grid == "absolute":
+        X, Y = g[:, 0], g[:, 1]
+    else:
+        raise ValueError(f"grid {grid!r}")
+    if split == "floor":
+        x0, y0 = X >> grid_frac, Y >> grid_frac
+    elif split == "trunc":
+        x0 = torch.sign(X) * (X.abs() >> grid_frac)
+        y0 = torch.sign(Y) * (Y.abs() >> grid_frac)
+    else:
+        raise ValueError(f"split {split!r}")
+    fx, fy = X - (x0 << grid_frac), Y - (y0 << grid_frac)
+
+    flat = ref_code.long().reshape(B, C, H * W)
+    acc = torch.zeros(B, C, H, W, dtype=torch.long)
+    for dy, wy in ((0, one - fy), (1, fy)):
+        for dx, wx in ((0, one - fx), (1, fx)):
+            yy, xx = y0 + dy, x0 + dx
+            if oob == "zeros":
+                inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+            elif oob == "border":
+                inside = torch.ones_like(yy, dtype=torch.bool)
+            else:
+                raise ValueError(f"oob {oob!r}")
+            idx = (yy.clamp(0, H - 1) * W + xx.clamp(0, W - 1)).view(B, 1, -1)
+            v = flat.gather(2, idx.expand(B, C, -1)).view(B, C, H, W)
+            acc += v * (wx * wy * inside).unsqueeze(1)
+
+    v = acc.double() / float(one * one) * float(ref_scale) / float(out_scale)
+    lo, hi = code_range(out_bits, signed=True)
+    return round_int(v, out_round).clamp(lo, hi).long(), acc
+
+
+def check_warp(prefix, taps, *, grid_frac, out_bits, out_round):
+    """Assert one warp call's taps rebuild its own out_code. Returns a short
+    dict for the run summary."""
+    out, _ = ref_warp(taps[f"{prefix}/ref_code"], taps[f"{prefix}/grid_code"],
+                      float(taps[f"{prefix}/ref_scale"]),
+                      float(taps[f"{prefix}/out_scale"]), grid_frac=grid_frac,
+                      out_bits=out_bits, out_round=out_round)
+    got = taps[f"{prefix}/out_code"].long()
+    if not torch.equal(out, got):
+        n = int((out != got).sum())
+        raise AssertionError(f"tap_check {prefix}: out_code rebuilt from the "
+                             f"integer taps differs from the lib in {n} "
+                             f"elements")
+    lo, hi = code_range(out_bits)
+    return {"out_clip": int(((got == lo) | (got == hi)).sum())}
+
+
 def check_layer(name, taps, mod, *, e_layer_min, bits, sat_mode, bs, mbits,
                 scale_bits, blockify):
     """Assert one layer's integer taps rebuild its own accumulator and output.
