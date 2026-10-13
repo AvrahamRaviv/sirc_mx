@@ -1,25 +1,25 @@
 """
-main_ALG.py - run a benchmark case through the MX lib (the ALG side).
+main_ALG.py - run one case through the MX lib (the ALG side).
 
-Takes a model from `models.py`, a checkpoint (the filled weights that come with
-the case), the test vectors, and a config; replaces every Conv2d / Linear with
-its MX-quantized equivalent via `MXQuantizer`; returns the output per tv plus
-the intermediate taps.
+One function per op. Each builds the single torch layer, lets MXQuantizer
+replace it, runs it, and logs every intermediate value with `tap`.
 
-This is the side we already trust to be a correct MX implementation. `main_HW`
-re-implements the same arithmetic independently, and `main.py` compares them.
-
-Usage:
-
-    python main_ALG.py -m conv1x1_ramp           # one case, print taps
-    python main_ALG.py -m corner --config my.json
-    python main_ALG.py -m all --dump taps_alg.pt
+    python main_ALG.py -m conv3x3        # one case
+    python main_ALG.py -m warp           # every warp case
+    python main_ALG.py -m all
 
     from main_ALG import run
-    taps = run(case, config)                     # {tap_name: tensor}
+    taps = run(cases.build("conv3x3"))   # {tap_name: tensor}
+
+MX integer form (taps a_int / a_exp / w_int / w_exp):
+    value    = mant * 2^(E - 6)            int8: mant in [-127, 127]
+    E        = floor(log2 max|block|)
+    code     = E + 127                     unsigned; all-zero block -> 0
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -34,617 +34,244 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from microxcaling.mx.convolution import Conv2d as MXConv2d
-from microxcaling.mx.linear import Linear as MXLinear
-from mx_layers_blocked import MXConv2dHW
-from mx_layers_act import MXActQuant
 from mx_quantizer import MXQuantizer
-from mx_stats import _is_npe, _layer_quant_axes, _quant_operand
-from fixed_point.fxp_quant import normalize_out_quant, fxp_format_str, fxp_step
+from mx_stats import _quant_operand
+from fixed_point.fxp_quant import fxp_step
 
-import models as M
-import tap_check as TC
-
+import cases as C
+from taps import tap, show
 
 # =============================================================================
 # Config
 # =============================================================================
 
-# Plain MX, CPU-friendly: no custom CUDA kernel, no PTQ, no error measurement,
-# so a run is deterministic and depends on nothing but the case and this dict.
-DEFAULT_CONFIG = {
-    "mx_specs": {
-        "w_elem_format": "int8",
-        "a_elem_format": "int8",
-        "block_size": M.BLOCK_SIZE,
-        "scale_bits": 8,
-        "shared_exp_method": "max",
-        "custom_cuda": False,
-        # The thing under test. `mode: hw_fixed_point` makes MXQuantizer install
-        # MXConv2dHW instead of MXConv2d, so the conv runs the per-product
-        # int8 x int8 multiply -> signed shift -> narrow saturating accumulator
-        # that the HW datapath implements, rather than an FP32 block dot-product.
-        # This is what main_HW has to reproduce; plain MXConv2d is not the target.
-        "xblock_accum": {
-            "enabled": True,
-            "mode": "hw_fixed_point",
-            "bits": 48,
-            "sat_mode": "per_product",
-            # Exponent of the accumulator's LSB. Low enough that no product
-            # gets right-shifted, so it costs nothing on 27 of the 29 cases and
-            # the accumulator datapath is what gets compared, not a truncation
-            # artefact. -20 is also what mx_config_npe_*.json ships, so the sim
-            # and the production configs agree. The two cases it does change:
-            # `with_bias` becomes exact (finer bias grid than a calibrated -2),
-            # and `flush_to_zero` flushes, which is that case's whole point.
-            # null = calibrate per layer instead; --e-layer-min pins any value
-            # (0 right-shifts every product by 9-12 bits - see the README).
-            "e_layer_min": -20,
-            # NPE geometry, confirmed by arch: activations block along W, each
-            # weight filter is flattened [Cin*kH*kW] and blocked along that
-            # stream. --blockify channel switches both operands to Cin.
-            "weight_blockify": "flatten",
-            "act_blockify": "xblock",
-            "pad_channels": True,
-            "backend": "python",
-            # NOT 0. MXQuantizer._replace_layers derives its own verbosity from
-            # this key (mx_quantizer.py:1360), so 0 here also suppresses the
-            # "replace summary" and "fallback reasons" lines - the ones that say
-            # a layer never reached the HW path. --verbose raises it to 2.
-            "verbose": 1,
-        },
+MX_SPECS = {
+    "w_elem_format": "int8",
+    "a_elem_format": "int8",
+    "block_size": C.BS,
+    "scale_bits": 8,
+    "shared_exp_method": "max",
+    "custom_cuda": False,
+    # conv runs on MXConv2dHW: int8 x int8 products, shifted onto a fixed
+    # 48-bit accumulator with LSB 2^e_layer_min, saturating per product.
+    # NPE blocking: activations along W, weights per filter flattened C-major.
+    "xblock_accum": {
+        "enabled": True, "mode": "hw_fixed_point", "bits": 48,
+        "sat_mode": "per_product", "e_layer_min": -20,
+        "act_blockify": "xblock", "weight_blockify": "flatten",
+        "pad_channels": True, "backend": "python", "verbose": 0,
     },
-    "layers": [],          # filled in per model by `_layer_names`
-    "ptq": False,
-    "measure_error": False,
 }
 
-
-# The DOF warp as arch specified it (mx_config_dof_*.json, `model.warp`): the
-# reference and the result are int8 words with a static, arbitrary positive
-# real scale calibrated per call site; the grid is a Q8.8 word (16 bits, step
-# 1/256 px). All three round half away from zero and saturate. A case's
-# `warp` dict overrides these per operand ({"ref": {...}, "grid": {...},
-# "out": {...}, "call_sites": N}).
-WARP_DEFAULT = {
-    "call_sites": 1,
-    "ref": {"total_bits": 8, "signed": True, "calibrate": True, "pow2": False,
-            "round": "half_away", "saturate": True},
-    "grid": {"total_bits": 16, "frac_bits": 8, "signed": True,
-             "round": "half_away", "saturate": True},
-    "out": {"total_bits": 8, "signed": True, "calibrate": True, "pow2": False,
-            "round": "half_away", "saturate": True},
-}
+E_LAYER_MIN = MX_SPECS["xblock_accum"]["e_layer_min"]
 
 
-def warp_config(case):
-    """WARP_DEFAULT with the case's own `warp` overrides."""
-    over = case["meta"].get("warp") or {}
-    cfg = _deep_merge(WARP_DEFAULT, over)
-    for k in ("ref", "out"):
-        if cfg[k].get("scale") is not None:
-            cfg[k]["calibrate"] = False
-    return cfg
+def _fxp(total_bits, scale=None, frac_bits=None):
+    """Static fixed-point word: round half away, saturate."""
+    d = {"total_bits": total_bits, "signed": True, "round": "half_away",
+         "saturate": True, "calibrate": False}
+    if scale is not None:
+        d["scale"] = scale
+    else:
+        d["frac_bits"] = frac_bits
+    return d
 
 
-def _warp_names(model):
-    return [n for n, m in model.named_modules() if isinstance(m, M.Warp)]
+class _One(nn.Module):
+    """Holds the single layer as `op`, so MXQuantizer has a name to replace."""
+
+    def __init__(self, op):
+        super().__init__()
+        self.op = op
+
+    def forward(self, *args):
+        return self.op(*args)
 
 
-BLOCKIFY_KEYS = {"npe": ("xblock", "flatten"), "channel": ("channel", "channel")}
-
-
-def _deep_merge(base, over):
-    """`over` into a copy of `base`, recursing into dicts - so a config file
-    that sets one xblock_accum key does not wipe the other defaults."""
-    out = json.loads(json.dumps(base))
-    for k, v in (over or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
-def load_config(path=None, bs=None, blockify=None):
-    """Read a config JSON over the default, or return the default.
-
-    The file is deep-merged, so it only has to name what it changes. `bs`
-    overrides block_size so `--bs` stays the single knob for both the model
-    shapes and the quantizer; `blockify` ('npe' | 'channel') sets both
-    operands' blocking, and must match the one the cases were built with.
-    """
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))     # deep copy
-    if path:
-        with open(path) as f:
-            cfg = _deep_merge(cfg, json.load(f))
-    if bs is not None:
-        cfg.setdefault("mx_specs", {})["block_size"] = bs
-    if blockify is not None:
-        act_b, wt_b = BLOCKIFY_KEYS[blockify]
-        xb = _get_xblock_cfg_dict(cfg)
-        xb["act_blockify"], xb["weight_blockify"] = act_b, wt_b
-    return cfg
-
-
-def config_blockify(config):
-    """'npe' or 'channel', from the xblock_accum keys."""
-    xb = _get_xblock_cfg_dict(config)
-    pair = (xb.get("act_blockify", "channel"), xb.get("weight_blockify", "channel"))
-    for name, keys in BLOCKIFY_KEYS.items():
-        if pair == keys:
-            return name
-    raise ValueError(f"unsupported blockify pair {pair}")
-
-
-def effective_config(case, config):
-    """The config one case actually runs under: `config` plus the case's own
-    `mx` / `accum` overrides (element format, scale_bits, accumulator bits,
-    e_layer_min, ...). main.py hands the same dict to both sides."""
-    cfg = json.loads(json.dumps(config))
-    meta = case["meta"]
-    over = dict(meta.get("mx") or {})
-    if meta.get("accum"):
-        over["xblock_accum"] = meta["accum"]
-    cfg["mx_specs"] = _deep_merge(cfg["mx_specs"], over)
-    got = config_blockify(cfg)
-    if meta.get("blockify") and meta["blockify"] != got:
-        raise ValueError(f"case {meta['case']} was built for blockify="
-                         f"{meta['blockify']} but the config says {got}")
-    return cfg
-
-
-def _layer_names(model):
-    """Every Conv2d / Linear in the model, in module order.
-
-    The sim quantizes the whole toy model, so the config's `layers` list is
-    derived from the model rather than written by hand.
-    """
-    names = []
-    for name, mod in model.named_modules():
-        if isinstance(mod, (nn.Conv2d, nn.Linear)):
-            names.append(name)
-    return names
-
-
-# =============================================================================
-# Quantize
-# =============================================================================
-
-def quantize(model, config, out_quant=None, verbose=False, warp=None):
-    """Replace every Conv2d / Linear with its MX equivalent.
-
-    `MXQuantizer` reads `mx_config.json` from a directory, so the config dict is
-    written to a temp dir with the layer list filled in from the model.
-
-    `out_quant` adds the static fixed-point output stage - a separate quantizer
-    from MX (`fixed_point/fxp_quant.py`), installed as a forward hook on the
-    root module so the network output leaves in a fixed Qm.n word. "" is the
-    root module's name in `named_modules()`; the production configs say "model"
-    because the real net sits under a `.model` attribute.
-    """
-    cfg = json.loads(json.dumps(config))
-    if not cfg.get("layers"):
-        cfg["layers"] = _layer_names(model)
-    if out_quant:
-        cfg["layers"] = list(cfg["layers"]) + [
-            {"name": "", "kind": "out_quant", **out_quant}]
-    # The warp is parameter-free, so MXQuantizer wraps it as an act_quant
-    # layer: fixed-point ref (input 0), grid (input 1) and output.
-    for name in _warp_names(model):
-        w = warp or WARP_DEFAULT
-        cfg["layers"] = list(cfg["layers"]) + [
-            {"name": name, "kind": "act_quant", "call_sites": w["call_sites"],
-             "inputs": [{"fxp": w["ref"]}, {"fxp": w["grid"]}],
-             "output": {"fxp": w["out"]}}]
-
+def quantize(layer, layer_cfg="op"):
+    """MXQuantizer on a one-layer model. Returns the replaced layer."""
+    cfg = {"mx_specs": MX_SPECS, "layers": [layer_cfg],
+           "ptq": False, "measure_error": False}
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "mx_config.json"), "w") as f:
             json.dump(cfg, f)
-        quantizer = MXQuantizer(save_dir=d)
-        if not verbose:
-            import contextlib, io
-            with contextlib.redirect_stdout(io.StringIO()):
-                qmodel = quantizer.quant(model)
-        else:
-            qmodel = quantizer.quant(model)
-    return qmodel.eval()
+        with contextlib.redirect_stdout(io.StringIO()):
+            q = MXQuantizer(save_dir=d).quant(_One(layer))
+    return q.eval().op
 
 
 # =============================================================================
-# Taps
-# =============================================================================
-#
-# Tap names follow the convention in `main.py` so the two sides line up key by
-# key. Per layer:
-#
-#   <layer>/a_int   intN activation mantissas, [B, C, H, W]
-#   <layer>/a_exp   activation exponent CODES, one per block (see tap_check.py:
-#                   code = E + emax, unsigned; all-zero block = 0)
-#                     npe      [B, C, H, ceil(W / bs)]
-#                     channel  [B, ceil(C / bs), H, W]
-#   <layer>/w_int   intN weight mantissas, [O, Cin, kH, kW]
-#   <layer>/w_exp   weight exponent codes, one per block
-#                     npe      [O, ceil(Cin*kH*kW / bs)], the filter flattened
-#                              C-major (c, kh, kw) - w_int.reshape(O, -1)
-#                     channel  [O, ceil(Cin / bs), kH, kW]
-#   <layer>/acc     int64 accumulator word after the last product, the bias
-#                   and the final clamp - THE bit-exact output of a HW layer
-#   <layer>/sat     uint8 [B, O, Ho, Wo], 1 where the accumulator clamped
-#   <layer>/out     acc * 2^e_layer_min as fp32 - lossy above 24 bits, float
-#                   comparison only
-#   model/out       network output
-#
-# acc / sat exist only for layers on the HW datapath (MXConv2dHW).
-
-def _decode(q_fp, axis, bs, fmt, scale_bits):
-    """`tap_check.mx_decode`, or (None, None) for formats with no integer form
-    (fp8 / MXFP) - those layers still get their float tap compared."""
-    try:
-        mbits = TC.fmt_bits(fmt)
-    except ValueError:
-        return None, None
-    return TC.mx_decode(q_fp, axis, bs, mbits, scale_bits)
-
-
-def _make_hook(name, taps, bs):
-    """Forward hook: record the quantised operands and the output of a layer."""
-
-    def hook(module, inputs, output):
-        sp = module.mx_specs
-        act_axes, wt_axes = _layer_quant_axes(module)
-        a_fmt, w_fmt = sp["a_elem_format"], sp["w_elem_format"]
-        sbits = sp["scale_bits"]
-
-        x = inputs[0].detach()
-        _, qa = _quant_operand(x, sp, a_fmt, act_axes, "round_output")
-        w = module.weight.detach()
-        if isinstance(module, MXConv2dHW) and _is_npe(module):
-            # NPE quantizes the per-filter flattened weight [O, Cin*kH*kW], so a
-            # block spans kernel taps as well as channels. Quantizing the 4D
-            # tensor along Cin forms different blocks whenever k > 1.
-            _, qw = _quant_operand(w.reshape(w.shape[0], -1), sp, w_fmt,
-                                   wt_axes, "round_weight")
-            w_int, w_exp = _decode(qw, 1, bs, w_fmt, sbits)
-            if w_int is not None:
-                w_int = w_int.reshape(w.shape)
-        else:
-            _, qw = _quant_operand(w, sp, w_fmt, wt_axes, "round_weight")
-            w_int, w_exp = _decode(qw, wt_axes[0], bs, w_fmt, sbits)
-        a_int, a_exp = _decode(qa, act_axes[0], bs, a_fmt, sbits)
-
-        if a_int is not None:
-            taps[f"{name}/a_int"] = a_int.cpu()
-            taps[f"{name}/a_exp"] = a_exp.cpu()
-        if w_int is not None:
-            taps[f"{name}/w_int"] = w_int.cpu()
-            taps[f"{name}/w_exp"] = w_exp.cpu()
-        taps[f"{name}/out"] = output.detach().cpu()
-
-        # MXConv2dHW keeps the int64 accumulator and the per-output clamp map
-        # of its last forward when `_tap_acc` is set (see run()).
-        if isinstance(module, MXConv2dHW):
-            if module._last_acc is None:
-                raise RuntimeError(f"{name}: no accumulator tap - the layer "
-                                   f"ran on a backend that does not keep it "
-                                   f"(use backend 'python')")
-            taps[f"{name}/acc"] = module._last_acc.cpu()
-            taps[f"{name}/sat"] = module._last_sat.to(torch.uint8).cpu()
-
-    return hook
-
-
-def warp_prefix(name, site, call_sites):
-    """Tap prefix of one warp call: 'warp', or 'warp@<site>' when the instance
-    runs more than once per forward."""
-    return name if call_sites == 1 else f"{name}@{site}"
-
-
-def _code_of(q, cfg, what):
-    """Fake-quant fxp tensor -> its integer word, asserting it is on the
-    lattice (a tap that is not a quantized tensor must not reach arch)."""
-    step = fxp_step(cfg)
-    v = q.double() / step
-    code = torch.round(v)
-    if not bool(((v - code).abs() < 1e-3).all()):
-        raise AssertionError(f"{what}: not on the fxp lattice of step {step}")
-    dt = torch.int8 if cfg["total_bits"] <= 8 else (
-        torch.int16 if cfg["total_bits"] <= 16 else torch.int32)
-    return code.to(dt)
-
-
-def _make_warp_hook(name, taps):
-    """Forward hook on the MXActQuant around a warp: the integer ref and grid
-    words it consumed, the result before and after its output quantizer, and
-    the scales - per call site."""
-
-    def hook(module, inputs, output):
-        site = module.last_site
-        pfx = warp_prefix(name, site, module.call_sites)
-        ref_cfg = module.fxp_cfg(0, site)
-        grid_cfg = module.fxp_cfg(1, site)
-        out_cfg = module.out_fxp_cfg(site)
-        q_ref = module.quant_input(inputs[0].detach(), 0, site)
-        q_grid = module.quant_input(inputs[1].detach(), 1, site)
-        with torch.no_grad():
-            pre = module.inner(q_ref, q_grid)
-        taps[f"{pfx}/ref_code"] = _code_of(q_ref, ref_cfg, f"{pfx}/ref")
-        taps[f"{pfx}/grid_code"] = _code_of(q_grid, grid_cfg, f"{pfx}/grid")
-        taps[f"{pfx}/out_pre"] = pre.detach().cpu()
-        taps[f"{pfx}/out_code"] = _code_of(output.detach(), out_cfg,
-                                           f"{pfx}/out")
-        lo, hi = TC.code_range(out_cfg["total_bits"], out_cfg["signed"])
-        v = TC.round_int(pre.double() / fxp_step(out_cfg), out_cfg["round"])
-        taps[f"{pfx}/out_clip"] = ((v < lo) | (v > hi)).to(torch.uint8)
-        taps[f"{pfx}/ref_scale"] = torch.tensor(fxp_step(ref_cfg),
-                                                dtype=torch.float64)
-        taps[f"{pfx}/grid_scale"] = torch.tensor(fxp_step(grid_cfg),
-                                                 dtype=torch.float64)
-        taps[f"{pfx}/out_scale"] = torch.tensor(fxp_step(out_cfg),
-                                                dtype=torch.float64)
-        taps[f"{pfx}/out"] = output.detach().cpu()
-
-    return hook
-
-
-# =============================================================================
-# Run
+# MX decode: fake-quant float -> (int mantissa, exponent code per block)
 # =============================================================================
 
-def run(case, config=None, verbose=False, check=True):
-    """Run one case through the MX lib.
+def mx_decode(q, axis, bs=C.BS, mbits=8, scale_bits=8):
+    """`q` is already on the MXINT lattice; read its integers back.
 
-    Args:
-        case: a dict from `models.build_case`.
-        config: config dict (see `DEFAULT_CONFIG`); default if None. The case's
-            own `mx` / `accum` overrides are applied on top.
-        verbose: let MXQuantizer print its replacement summary.
-        check: rebuild every HW layer's accumulator from its integer taps
-            (`tap_check.check_layer`) and raise if it differs from what
-            MXConv2dHW computed. On by default: a tap that does not explain
-            our own output must never reach arch.
-
-    Returns:
-        dict: tap name -> tensor, including "model/out". Cases carrying an
-        `out_quant` also get "model/out_pre" (before the fixed-point stage),
-        "model/out_code" (the integer word) and "model/out_clip".
+    Returns (mant int8, code int16 with `axis` reduced to ceil(n/bs)).
     """
-    config = config or load_config(bs=case["meta"]["block_size"],
-                                   blockify=case["meta"].get("blockify"))
-    config = effective_config(case, config)
-    case["meta"]["config"] = config
-    bs = config["mx_specs"]["block_size"]
-    out_quant = case.get("out_quant")
+    emax = (1 << (scale_bits - 1)) - 1
+    x = q.detach().double().movedim(axis, -1)
+    n = x.shape[-1]
+    x = nn.functional.pad(x, (0, (-n) % bs))
+    xb = x.reshape(*x.shape[:-1], -1, bs)
 
-    warp = warp_config(case) if _warp_names(case["model"]) else None
-    case["meta"]["warp_config"] = warp
-    inputs = M.inputs_of(case)
-    qmodel = quantize(case["model"], config, out_quant=out_quant,
-                      verbose=verbose, warp=warp)
+    m = xb.abs().amax(-1, keepdim=True)
+    nz = m > 0
+    E = torch.floor(torch.log2(torch.where(nz, m, torch.ones_like(m))))
+    E = torch.where(nz, E.clamp(min=-emax), torch.full_like(E, -emax))
+    mant = xb * 2.0 ** (mbits - 2 - E)
+    assert bool((mant == mant.round()).all()), "not on the MXINT lattice"
 
-    # Which datapath each layer actually got. MXConv2dHW is the one under test;
-    # the quantizer silently falls back to MXConv2d when a layer cannot take the
-    # HW path (groups != 1 is the common one), and a case that falls back is not
-    # testing the accumulator at all - so record it rather than let it pass
-    # unnoticed.
-    case["meta"]["datapath"] = {
-        name: _datapath_name(mod)
-        for name, mod in qmodel.named_modules()
-        if isinstance(mod, (MXConv2d, MXLinear))
-    }
+    mant = mant.reshape(x.shape)[..., :n].movedim(-1, axis).to(torch.int8)
+    code = (E.squeeze(-1) + emax).to(torch.int16).movedim(-1, axis)
+    return mant.contiguous(), code.contiguous()
 
-    # e_layer_min unset -> calibrate from this case's own input. One batch is
-    # exact here: the case is deterministic and single-input, so the running min
-    # over blocks is the true min, not a sample of it.
-    xb = _get_xblock_cfg_dict(config)
-    if xb.get("enabled") and xb.get("mode") == "hw_fixed_point" \
-            and xb.get("e_layer_min") is None:
-        from fixed_point.mx_fixed_point_hw import calibrate_e_layer_min
-        with torch.no_grad():
-            calibrate_e_layer_min(qmodel, [case["x"]], num_batches=1)
-    case["meta"]["e_layer_min"] = {
-        name: mod.e_layer_min
-        for name, mod in qmodel.named_modules()
-        if isinstance(mod, MXConv2dHW)
-    }
 
-    # Static warp scales marked `calibrate` are frozen from this case's own
-    # inputs, per call site - the same post-training pass DOF runs, on one
-    # deterministic batch.
-    if warp:
-        from fixed_point.mx_fixed_point_hw import calibrate_act_scales
-        calibrate_act_scales(qmodel, [inputs], num_batches=1,
-                             forward_fn=lambda m, b: m(*b), verbose=0)
+# =============================================================================
+# Ops
+# =============================================================================
 
-    taps, handles = {}, []
-    for name, mod in qmodel.named_modules():
-        if isinstance(mod, MXConv2dHW):
-            mod._tap_acc = True
-        if isinstance(mod, (MXConv2d, MXLinear)):
-            handles.append(mod.register_forward_hook(_make_hook(name, taps, bs)))
-        if isinstance(mod, MXActQuant) and isinstance(mod.inner, M.Warp):
-            mod.reset_calls()
-            handles.append(mod.register_forward_hook(_make_warp_hook(name, taps)))
+def conv(case, taps):
+    """MXConv2dHW, NPE. Taps: x w | a_int a_exp | w_int w_exp | acc sat | out."""
+    x, w, p = case["x"], case["w"], case["params"]
+    O, Cin, kH, kW = w.shape
+    layer = nn.Conv2d(Cin, O, (kH, kW), stride=p["stride"], padding=p["padding"],
+                      dilation=p["dilation"], bias=case["b"] is not None)
+    with torch.no_grad():
+        layer.weight.copy_(w)
+        if case["b"] is not None:
+            layer.bias.copy_(case["b"])
+    mod = quantize(layer)
+    mod._tap_acc = True                 # keep the int64 accumulator word
+    sp = mod.mx_specs
+    tap(taps, "x", x)
+    tap(taps, "w", w)
 
-    if out_quant:
-        # prepend so this runs *before* the out_quant hook and sees the output
-        # the fixed-point stage is about to quantize.
-        def pre_fxp(mod, inputs, output, taps=taps):
-            taps["model/out_pre"] = output.detach().cpu()
-        handles.append(qmodel.register_forward_hook(pre_fxp, prepend=True))
+    # activation: blocks along W
+    _, qa = _quant_operand(x, sp, sp["a_elem_format"], [3], "round_output")
+    a_int, a_exp = mx_decode(qa, axis=3)
+    tap(taps, "a_int", a_int)           # [B, Cin, H, W]
+    tap(taps, "a_exp", a_exp)           # [B, Cin, H, ceil(W/bs)]
 
-    try:
-        with torch.no_grad():
-            out = qmodel(*inputs)
-    finally:
-        for h in handles:
-            h.remove()
+    # weight: each filter flattened to [Cin*kH*kW] (C-major), blocks along it
+    _, qw = _quant_operand(w.reshape(O, -1), sp, sp["w_elem_format"], [1],
+                           "round_weight")
+    w_int, w_exp = mx_decode(qw, axis=1)
+    tap(taps, "w_int", w_int.reshape(w.shape))   # [O, Cin, kH, kW]
+    tap(taps, "w_exp", w_exp)                    # [O, ceil(Cin*kH*kW/bs)]
 
-    taps["model/out"] = out.detach().cpu()
+    with torch.no_grad():
+        out = mod(x)
+    tap(taps, "acc", mod._last_acc)              # int64 [B, O, Ho, Wo]
+    tap(taps, "sat", mod._last_sat.to(torch.uint8))
+    tap(taps, "out", out)                        # acc * 2^e_layer_min
+    return out
 
-    if out_quant:
-        # The fixed-point output IS an integer word: code = value / 2^-frac.
-        # That integer is what HW emits and what can be compared bit-exactly -
-        # the float tap is just the same number scaled.
-        oq = normalize_out_quant(out_quant)
-        from fixed_point.fxp_quant import fxp_step
-        step = fxp_step(oq)
-        code = (taps["model/out"].double() / step).round().to(torch.int64)
-        taps["model/out_code"] = code
-        # Clip mask: a static scale can overflow where MX cannot, so flag which
-        # elements the saturation actually touched.
-        lo, hi = _fxp_range(oq)
-        pre = taps.get("model/out_pre")
-        if pre is not None:
-            taps["model/out_clip"] = ((pre < lo) | (pre > hi)).to(torch.uint8)
 
-    if check:
-        case["meta"]["tap_check"] = _check_taps(qmodel, taps, case, config)
-        if warp:
-            case["meta"]["warp_check"] = _check_warps(taps, warp)
+def convt(case, taps):
+    """MXConvTranspose2d. Taps: x w | a_int a_exp | w_int w_exp | out.
+
+    The lib has no HW path for convT: plain MX operands, fp32 accumulation, and
+    blocks along Cin (input axis 1, weight axis 0) - not the NPE layout. HW does
+    convT as zero-insert + conv; whether it quantizes before or after the zero
+    insert is an open question. Compare `out` as float until that is settled.
+    """
+    x, w, p = case["x"], case["w"], case["params"]
+    Cin, O, kH, kW = w.shape
+    layer = nn.ConvTranspose2d(Cin, O, (kH, kW), stride=p["stride"],
+                               padding=p["padding"],
+                               output_padding=p.get("output_padding", 0),
+                               dilation=p["dilation"], bias=case["b"] is not None)
+    with torch.no_grad():
+        layer.weight.copy_(w)
+        if case["b"] is not None:
+            layer.bias.copy_(case["b"])
+    mod = quantize(layer)
+    sp = mod.mx_specs
+    tap(taps, "x", x)
+    tap(taps, "w", w)
+
+    _, qa = _quant_operand(x, sp, sp["a_elem_format"], [1], "round_output")
+    a_int, a_exp = mx_decode(qa, axis=1)
+    tap(taps, "a_int", a_int)           # [B, Cin, H, W]
+    tap(taps, "a_exp", a_exp)           # [B, ceil(Cin/bs), H, W]
+    _, qw = _quant_operand(w, sp, sp["w_elem_format"], [0], "round_weight")
+    w_int, w_exp = mx_decode(qw, axis=0)
+    tap(taps, "w_int", w_int)           # [Cin, O, kH, kW]
+    tap(taps, "w_exp", w_exp)           # [ceil(Cin/bs), O, kH, kW]
+
+    with torch.no_grad():
+        out = mod(x)
+    tap(taps, "out", out)
+    return out
+
+
+def warp(case, taps):
+    """MXActQuant around cases.Warp. Taps: x flow | ref_code grid_code |
+    out_pre out_code | out.
+
+    ref: int8, static scale.  grid: Q8.8 (int16, step 1/256 px).
+    out: int8, static scale.  All round half away from zero and saturate.
+    """
+    x, flow, s = case["x"], case["flow"], case["warp"]
+    ref_cfg = _fxp(8, scale=s["ref_scale"])
+    grid_cfg = _fxp(16, frac_bits=8)
+    out_cfg = _fxp(8, scale=s["out_scale"])
+    mod = quantize(C.Warp(), {"name": "op", "kind": "act_quant",
+                              "inputs": [{"fxp": ref_cfg}, {"fxp": grid_cfg}],
+                              "output": {"fxp": out_cfg}})
+    tap(taps, "x", x)
+    tap(taps, "flow", flow)
+
+    q_ref = mod.quant_input(x, 0, site=0)
+    q_grid = mod.quant_input(flow, 1, site=0)
+    tap(taps, "ref_code", _code(q_ref, ref_cfg, torch.int8))
+    tap(taps, "grid_code", _code(q_grid, grid_cfg, torch.int16))
+
+    with torch.no_grad():
+        pre = mod.inner(q_ref, q_grid)  # bilinear on the quantized operands
+        out = mod(x, flow)
+    tap(taps, "out_pre", pre)
+    tap(taps, "out_code", _code(out, out_cfg, torch.int8))
+    tap(taps, "out", out)
+    return out
+
+
+def _code(q, cfg, dtype):
+    """Fake-quant fixed-point value -> its integer word."""
+    v = q.double() / fxp_step(cfg)
+    assert bool(((v - v.round()).abs() < 1e-3).all()), "not on the fxp lattice"
+    return v.round().to(dtype)
+
+
+OPS = {"conv": conv, "convt": convt, "warp": warp}
+
+
+def run(case):
+    """One case -> {tap_name: tensor}."""
+    taps = {}
+    OPS[case["op"]](case, taps)
     return taps
-
-
-def _check_warps(taps, warp):
-    """`tap_check.check_warp` on every recorded warp call."""
-    res = {}
-    for k in taps:
-        if k.endswith("/ref_code"):
-            pfx = k.rsplit("/", 1)[0]
-            res[pfx] = TC.check_warp(
-                pfx, taps, grid_frac=warp["grid"]["frac_bits"],
-                out_bits=warp["out"]["total_bits"],
-                out_round=warp["out"]["round"])
-    return res
-
-
-def _check_taps(qmodel, taps, case, config):
-    """`tap_check.check_layer` on every HW layer. Raises on the first one whose
-    taps do not rebuild its own accumulator."""
-    sp = config["mx_specs"]
-    xb = _get_xblock_cfg_dict(config)
-    res = {}
-    for name, mod in qmodel.named_modules():
-        if not isinstance(mod, MXConv2dHW):
-            continue
-        res[name] = TC.check_layer(
-            name, taps, mod, e_layer_min=int(case["meta"]["e_layer_min"][name]),
-            bits=int(xb["bits"]), sat_mode=xb["sat_mode"],
-            bs=sp["block_size"], mbits=TC.fmt_bits(sp["a_elem_format"]),
-            scale_bits=sp["scale_bits"], blockify=config_blockify(config))
-    return res
-
-
-def _datapath_name(mod):
-    """Readable class label for the `datapath:` line.
-
-    microxcaling names its MX conv/linear classes plain `Conv2d` / `Linear`, so
-    printing __name__ makes a fallback look like an unquantized torch layer. It
-    is not: the operands are still MX-quantized, only the reduction runs in FP32
-    instead of the fixed-point accumulator. Say that.
-    """
-    cls = type(mod)
-    if cls.__module__.startswith("microxcaling"):
-        return f"MX{cls.__name__}(fp32-accum)"
-    return cls.__name__
-
-
-def _get_xblock_cfg_dict(config):
-    """The xblock_accum sub-dict of a config, or {} when absent."""
-    return (config.get("mx_specs") or {}).get("xblock_accum") or {}
-
-
-def _fxp_range(oq):
-    """Representable float range of a normalized out_quant config.
-
-    `fxp_range` returns the bounds in *code* units plus the step; the float
-    bounds are code * step.
-    """
-    from fixed_point.fxp_quant import fxp_range
-    lo, hi, step = fxp_range(total_bits=oq["total_bits"],
-                             frac_bits=oq["frac_bits"], signed=oq["signed"],
-                             scale=oq.get("scale"))
-    return lo * step, hi * step
 
 
 # =============================================================================
 # CLI
 # =============================================================================
 
-def _print_taps(name, taps, case):
-    y = case["y_fp32"]
-    q = taps["model/out"]
-    err = (y - q).flatten()
-    sqnr = 10 * torch.log10(y.pow(2).sum() / err.pow(2).sum().clamp_min(1e-30))
-    print(f"\n=== {name} ===")
-    print(f"  {'tap':<28} {'shape':<20} {'dtype':<9} range")
-    for k in sorted(taps):
-        t = taps[k]
-        rng = (f"[{t.min().item():g} .. {t.max().item():g}]" if t.numel()
-               else "[]")
-        print(f"  {k:<28} {str(tuple(t.shape)):<20} {str(t.dtype).replace('torch.',''):<9} {rng}")
-    print(f"  out vs FP32: SQNR {sqnr.item():7.2f} dB   "
-          f"max|err| {err.abs().max().item():.6g}")
-    dp = case["meta"].get("datapath") or {}
-    if dp:
-        hw = [n for n, c in dp.items() if c == "MXConv2dHW"]
-        soft = {n: c for n, c in dp.items() if c != "MXConv2dHW"}
-        em = case["meta"].get("e_layer_min") or {}
-        print(f"  datapath: {len(hw)}/{len(dp)} layers on MXConv2dHW" +
-              (f"   NOT on HW path: " +
-               ", ".join(f"{n}={c}" for n, c in soft.items()) if soft else "") +
-              (f"   e_layer_min " +
-               ", ".join(f"{n or '.'}={v}" for n, v in em.items()) if em else ""))
-    tc = case["meta"].get("tap_check")
-    if tc:
-        lossy = {n: r["acc_fp32_lossy"] for n, r in tc.items() if r["acc_fp32_lossy"]}
-        print(f"  tap_check: {len(tc)}/{len(tc)} HW layers rebuild bit-exact"
-              + (f"   acc wider than fp32 (use /acc, not /out): " +
-                 ", ".join(f"{n}={v}" for n, v in lossy.items()) if lossy else ""))
-    wc = case["meta"].get("warp_check")
-    if wc:
-        parts = []
-        for pfx, r in wc.items():
-            rs = float(taps[f"{pfx}/ref_scale"])
-            os_ = float(taps[f"{pfx}/out_scale"])
-            parts.append(f"{pfx} ref_step={rs:.6g} out_step={os_:.6g} "
-                         f"clip={int(taps[f'{pfx}/out_clip'].sum())}")
-        print(f"  warp: {len(wc)}/{len(wc)} calls rebuild out_code bit-exact   "
-              + "; ".join(parts))
-    oq = case["meta"].get("out_quant")
-    if oq:
-        n = taps["model/out_clip"].numel()
-        n_clip = int(taps["model/out_clip"].sum())
-        print(f"  out_quant: {fxp_format_str(normalize_out_quant(oq))}   "
-              f"clipped {n_clip}/{n} ({100.0 * n_clip / max(n, 1):.1f}%)")
-
-
 def main():
-    parser = M.add_model_args(argparse.ArgumentParser(description=__doc__))
-    parser.add_argument("--config", default=None, help="config JSON (default: built-in)")
-    parser.add_argument("--dump", default=None, help="save all taps to a .pt file")
-    parser.add_argument("--verbose", action="store_true", help="MXQuantizer logs")
-    parser.add_argument("--e-layer-min", type=int, default=None, metavar="N",
-                        help="pin the accumulator LSB exponent instead of "
-                             "calibrating it (negative; -12 is lossless for "
-                             "int8 operands at small exponents, 0 throws away "
-                             "12 bits)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("-m", default="all", help="case name, op (conv/convt/warp) or all")
+    ap.add_argument("--dump", default=None, help="save all taps to a .pt file")
+    args = ap.parse_args()
 
-    config = load_config(args.config, bs=args.bs, blockify=args.blockify)
-    if args.verbose:
-        _get_xblock_cfg_dict(config)["verbose"] = 2
-    if args.e_layer_min is not None:
-        _get_xblock_cfg_dict(config)["e_layer_min"] = args.e_layer_min
-    all_taps = {}
-    for case in M.cases_from_args(args):
-        name = case["meta"]["case"]
-        taps = run(case, config, verbose=args.verbose)
-        all_taps[name] = taps
-        _print_taps(name, taps, case)
-
+    dump = {}
+    for name in C.select(args.m):
+        taps = run(C.build(name))
+        show(taps, f"{name}  ALG")
+        dump[name] = taps
     if args.dump:
-        torch.save({"config": config, "taps": all_taps}, args.dump)
+        torch.save(dump, args.dump)
         print(f"\nwrote {args.dump}")
 
 
