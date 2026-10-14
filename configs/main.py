@@ -4,6 +4,7 @@ main.py - run a case through both sides and compare tap by tap.
     python main.py -m conv3x3
     python main.py -m warp
     python main.py -m all
+    python main.py -m conv --config mx_config_dof_npe_int6.json --backend python
 
 Integer taps must match exactly; float taps report max |delta|. Taps are
 compared in ALG order and the first integer tap that differs is named - every
@@ -78,12 +79,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("-m", default="all", help="case name, op (conv/convt/warp) or all")
+    ap.add_argument("--config", default=ALG.DEFAULT_CONFIG,
+                    help="framework mx_config.json (default mx_config_dof.json)")
+    ap.add_argument("--layer", default=None,
+                    help="entry of the config's layers to use (its group/kind)")
+    ap.add_argument("--backend", default=None,
+                    help="override xblock_accum.backend (python / triton)")
     args = ap.parse_args()
 
+    cfg = ALG.load_config(args.config, args.layer, args.backend)
     results = {}
     for name in C.select(args.m):
         case = C.build(name)
-        alg = ALG.run(case)
+        alg = ALG.run(case, cfg)
         try:
             hw = HW.run(case)
         except NotImplementedError as e:

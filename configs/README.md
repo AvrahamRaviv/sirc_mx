@@ -43,10 +43,28 @@ conv), and **warp**.
 
 ```bash
 python cases.py                      # list cases
-python main_ALG.py -m conv3x3        # one case, ALG taps
+python main_ALG.py -m conv3x3        # one case, ALG taps (mx_config_dof.json)
+python main_ALG.py -m conv3x3 --config mx_config_dof_npe_int6.json
+python main_ALG.py -m convt --layer model.block2.conv1   # use that entry's group
+python main_ALG.py -m conv3x3 --backend python           # step into the python ref
 python main_ALG.py -m warp           # every warp case
 python main.py -m all                # both sides compared (exit 2 until HW is filled)
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
+
+## Config
+
+The ALG side reads a real framework `mx_config.json` (`--config`, default
+`mx_config_dof.json`) and calls `MXQuantizer(save_dir).quant(model)` the same
+way the training/eval code does. The file's `mx_specs` and `groups` are used
+unchanged; `layers` is reduced to the one layer under test:
+
+- `--layer NAME` copies that `layers` entry (its group, kind, inputs).
+  Defaults: conv/convT use plain global `mx_specs`; warp uses the file's first
+  `act_quant` entry.
+- `--backend` overrides `xblock_accum.backend` and nothing else.
+- With no CUDA, `custom_cuda` is set to False; triton already falls back to
+  python on a CPU tensor.
+- Warp: the case's static ref/out scales replace the file's `calibrate`.
 
 To debug, start in `main_ALG.py`, set `-m <case>`, and break in the op function.
