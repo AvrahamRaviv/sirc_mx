@@ -223,10 +223,13 @@ class MXConv2dHW(MXConv2d):
         # Sampling-window counters (reset every verbose_sample_every forwards).
         self._sat_total_window = 0
         self._sat_seen_window = 0
-        # Opt-in integer taps for the single-layer simulator: when set, the
-        # forward keeps the int64 accumulator word and the per-output
-        # saturation map of the last call (python backend only).
+        # Opt-in taps for the single-layer simulator: when set, the forward
+        # keeps the MX-quantized operands it fed the accumulator (qi, qw: any
+        # backend) and the int64 accumulator word + per-output saturation map
+        # (python backend only) of the last call.
         self._tap_acc = False
+        self._last_qi = None
+        self._last_qw = None
         self._last_acc = None
         self._last_sat = None
 
@@ -303,6 +306,8 @@ class MXConv2dHW(MXConv2d):
             qw = quantize_mx_op(bf_w, sp, elem_format=sp['w_elem_format'], axes=[1])
         if qw.dtype == torch.bfloat16 and qi.dtype != torch.bfloat16:
             qw = qw.to(qi.dtype)
+        if self._tap_acc:
+            self._last_qi, self._last_qw = qi.detach(), qw.detach()
 
         # Calibration short-circuit: observe Ea/Ew, fall back to FP32 blocked
         # path so downstream layers see sensible activations.

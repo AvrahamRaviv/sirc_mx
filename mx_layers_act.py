@@ -121,6 +121,13 @@ class MXActQuant(nn.Module):
         self.n_calls = 0
         self.calibrating = False
         self._obs = {}
+        # Opt-in taps for the single-layer simulator: when set, forward keeps
+        # the quantized inputs, the raw inner result and the quantized output
+        # of the last call.
+        self._tap = False
+        self._last_in = None
+        self._last_pre = None
+        self._last_out = None
 
     # -- construction ------------------------------------------------------
 
@@ -249,7 +256,11 @@ class MXActQuant(nn.Module):
         site = self.site
         qargs = [self.quant_input(a, i, site) for i, a in enumerate(args)]
         self.n_calls += 1
-        return self.quant_output(self.inner(*qargs, **kwargs), site)
+        pre = self.inner(*qargs, **kwargs)
+        out = self.quant_output(pre, site)
+        if self._tap:
+            self._last_in, self._last_pre, self._last_out = qargs, pre, out
+        return out
 
     # -- calibration -------------------------------------------------------
 

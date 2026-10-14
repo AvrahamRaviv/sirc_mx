@@ -47,7 +47,6 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
         sys.path.insert(0, p)
 
 from mx_quantizer import MXQuantizer
-from mx_stats import _quant_operand
 from fixed_point.fxp_quant import fxp_step
 
 import cases as C
@@ -172,7 +171,11 @@ def mx_decode(q, axis, bs=C.BS, mbits=8, scale_bits=8):
 # =============================================================================
 
 def conv(case, cfg, taps):
-    """MXConv2dHW, NPE. Taps: x w | a_int a_exp | w_int w_exp | acc sat | out."""
+    """MXConv2dHW, NPE. Taps: x w | a_int a_exp | w_int w_exp | acc sat | out.
+
+    Every tap is the layer's own value: `_tap_acc` makes its forward keep the
+    quantized operands it fed the accumulator (qi, qw) and the acc word.
+    """
     x, w, p = case["x"], case["w"], case["params"]
     O, Cin, kH, kW = w.shape
     layer = nn.Conv2d(Cin, O, (kH, kW), stride=p["stride"], padding=p["padding"],
@@ -182,31 +185,51 @@ def conv(case, cfg, taps):
         if case["b"] is not None:
             layer.bias.copy_(case["b"])
     mod = quantize(layer, cfg, _entry(cfg, "conv"))
-    mod._tap_acc = True                 # keep the int64 accumulator word
+    mod._tap_acc = True                 # keep qi, qw and the int64 acc word
     sp = mod.mx_specs
-    tap(taps, "x", x)
-    tap(taps, "w", w)
-
-    # activation: blocks along W
-    _, qa = _quant_operand(x, sp, sp["a_elem_format"], [3], "round_output")
-    a_int, a_exp = mx_decode(qa, axis=3, mbits=_mbits(sp["a_elem_format"]))
-    tap(taps, "a_int", a_int)           # [B, Cin, H, W]
-    tap(taps, "a_exp", a_exp)           # [B, Cin, H, ceil(W/bs)]
-
-    # weight: each filter flattened to [Cin*kH*kW] (C-major), blocks along it
-    _, qw = _quant_operand(w.reshape(O, -1), sp, sp["w_elem_format"], [1],
-                           "round_weight")
-    w_int, w_exp = mx_decode(qw, axis=1, mbits=_mbits(sp["w_elem_format"]))
-    tap(taps, "w_int", w_int.reshape(w.shape))   # [O, Cin, kH, kW]
-    tap(taps, "w_exp", w_exp)                    # [O, ceil(Cin*kH*kW/bs)]
 
     with torch.no_grad():
         out = mod(x)
+
+    tap(taps, "x", x)
+    tap(taps, "w", w)
+    # activation: blocks along W
+    a_int, a_exp = mx_decode(mod._last_qi, axis=3,
+                             mbits=_mbits(sp["a_elem_format"]))
+    tap(taps, "a_int", a_int)           # [B, Cin, H, W]
+    tap(taps, "a_exp", a_exp)           # [B, Cin, H, ceil(W/bs)]
+    # weight: each filter flattened to [Cin*kH*kW] (C-major), blocks along it
+    w_int, w_exp = mx_decode(mod._last_qw.reshape(O, -1), axis=1,
+                             mbits=_mbits(sp["w_elem_format"]))
+    tap(taps, "w_int", w_int.reshape(w.shape))   # [O, Cin, kH, kW]
+    tap(taps, "w_exp", w_exp)                    # [O, ceil(Cin*kH*kW/bs)]
     if mod._last_acc is not None:                # python backend only
         tap(taps, "acc", mod._last_acc)          # int64 [B, O, Ho, Wo]
         tap(taps, "sat", mod._last_sat.to(torch.uint8))
     tap(taps, "out", out)                        # acc * 2^e_layer_min
     return out
+
+
+@contextlib.contextmanager
+def _capture_mx(module):
+    """Record every quantize_mx_op output that `module` calls, in call order.
+
+    For layers in microxcaling (upstream, not edited here) whose forward keeps
+    no handle on its quantized operands.
+    """
+    seen = []
+    orig = module.quantize_mx_op
+
+    def rec(*a, **k):
+        q = orig(*a, **k)
+        seen.append(q.detach())
+        return q
+
+    module.quantize_mx_op = rec
+    try:
+        yield seen
+    finally:
+        module.quantize_mx_op = orig
 
 
 def convt(case, cfg, taps):
@@ -216,7 +239,12 @@ def convt(case, cfg, taps):
     blocks along Cin (input axis 1, weight axis 0) - not the NPE layout. HW does
     convT as zero-insert + conv; whether it quantizes before or after the zero
     insert is an open question. Compare `out` as float until that is settled.
+
+    The operands are the layer's own: captured from its quantize_mx_op calls
+    (input first, then weight).
     """
+    from microxcaling.mx import transpose_convolution as TC
+
     x, w, p = case["x"], case["w"], case["params"]
     Cin, O, kH, kW = w.shape
     layer = nn.ConvTranspose2d(Cin, O, (kH, kW), stride=p["stride"],
@@ -229,20 +257,20 @@ def convt(case, cfg, taps):
             layer.bias.copy_(case["b"])
     mod = quantize(layer, cfg, _entry(cfg, "convt"))
     sp = mod.mx_specs
+
+    with torch.no_grad(), _capture_mx(TC) as seen:
+        out = mod(x)
+    assert len(seen) == 2, f"convT forward made {len(seen)} MX quantize calls"
+    qa, qw = seen
+
     tap(taps, "x", x)
     tap(taps, "w", w)
-
-    _, qa = _quant_operand(x, sp, sp["a_elem_format"], [1], "round_output")
     a_int, a_exp = mx_decode(qa, axis=1, mbits=_mbits(sp["a_elem_format"]))
     tap(taps, "a_int", a_int)           # [B, Cin, H, W]
     tap(taps, "a_exp", a_exp)           # [B, ceil(Cin/bs), H, W]
-    _, qw = _quant_operand(w, sp, sp["w_elem_format"], [0], "round_weight")
     w_int, w_exp = mx_decode(qw, axis=0, mbits=_mbits(sp["w_elem_format"]))
     tap(taps, "w_int", w_int)           # [Cin, O, kH, kW]
     tap(taps, "w_exp", w_exp)           # [ceil(Cin/bs), O, kH, kW]
-
-    with torch.no_grad():
-        out = mod(x)
     tap(taps, "out", out)
     return out
 
@@ -253,6 +281,8 @@ def warp(case, cfg, taps):
 
     ref: int8, static scale.  grid: Q8.8 (int16, step 1/256 px).
     out: int8, static scale.  All round half away from zero and saturate.
+    One real forward; `_tap` makes it keep its quantized inputs, the raw
+    bilinear result and the quantized output.
     """
     x, flow, s = case["x"], case["flow"], case["warp"]
     entry = _entry(cfg, "warp")
@@ -264,18 +294,17 @@ def warp(case, cfg, taps):
     grid_cfg = entry["inputs"][1]["fxp"]
     out_cfg = entry["output"]["fxp"]
     mod = quantize(C.Warp(), cfg, entry)
-    tap(taps, "x", x)
-    tap(taps, "flow", flow)
-
-    q_ref = mod.quant_input(x, 0, site=0)
-    q_grid = mod.quant_input(flow, 1, site=0)
-    tap(taps, "ref_code", _code(q_ref, ref_cfg, torch.int8))
-    tap(taps, "grid_code", _code(q_grid, grid_cfg, torch.int16))
+    mod._tap = True
 
     with torch.no_grad():
-        pre = mod.inner(q_ref, q_grid)  # bilinear on the quantized operands
         out = mod(x, flow)
-    tap(taps, "out_pre", pre)
+    q_ref, q_grid = mod._last_in
+
+    tap(taps, "x", x)
+    tap(taps, "flow", flow)
+    tap(taps, "ref_code", _code(q_ref, ref_cfg, torch.int8))
+    tap(taps, "grid_code", _code(q_grid, grid_cfg, torch.int16))
+    tap(taps, "out_pre", mod._last_pre)          # bilinear on quantized operands
     tap(taps, "out_code", _code(out, out_cfg, torch.int8))
     tap(taps, "out", out)
     return out
