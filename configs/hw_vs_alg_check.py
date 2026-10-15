@@ -14,12 +14,26 @@ difference moved. Sections:
   T6 accumulator saturation (sticky vs clamp-and-continue)
   T8 weight observer blocking vs weight quantizer blocking
   T9 4-bit exponent wrap
+  T10 4-bit exponent window: ALG fixed vs HW per-tensor offset
+Both sides run mx_config_npe_e4.json (scale_bits 4, the NPE exponent width).
 """
 import math, os, sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import torch, torch.nn.functional as F
-import cases as C, main_ALG as A, main_HW as H
+import cases as C, main_ALG as _A, main_HW as _H, sim_config as SC
+
+# both sides at the NPE exponent width (4 bits); see mx_config_npe_e4.json
+CFG = SC.load_config("mx_config_npe_e4.json")
+
+
+class A:
+    run = staticmethod(lambda case: _A.run(case, CFG))
+
+
+class H:
+    run = staticmethod(lambda case: _H.run(case, CFG))
+
 from npe_mx_emu import base_mx_quantizer, mx_dequantizer, MXObserver, bcu, pcu_div
 torch.set_printoptions(precision=6)
 
@@ -31,7 +45,8 @@ c = C.build("conv3x3_p0"); x = c["x"]
 a = A.run(c); h = H.run(c)
 cal = int(h["x_cal"])
 # ALG value
-qa = a["a_int"].double() * 2.0 ** (a["a_exp"].double().repeat_interleave(32, -1)[..., :40] - 127 - 6)
+ebias = (1 << (int(CFG["mx_specs"]["scale_bits"]) - 1)) - 1      # code = E + ebias
+qa = a["a_int"].double() * 2.0 ** (a["a_exp"].double().repeat_interleave(32, -1)[..., :40] - ebias - 6)
 # HW value: x = data * 2^(shared - cal)
 hd = h["hw_a_mant"].double().reshape(1, 4, 6, -1)[..., :40]
 he = h["hw_a_exp"].double().repeat_interleave(32, -1)[..., :40]
@@ -126,3 +141,13 @@ hdr("T9 4-bit exponent wrap (block below the anchor)")
 t = torch.zeros(1, 64); t[0, :32] = 64.0; t[0, 32:] = 3.0   # block2 E=2 -> 2-6=-4 -> &0xF=12
 m = base_mx_quantizer(t, calibrate_offset=0)
 print("block shared exps:", m.shared_exp.tolist(), " block2 data:", m.data[0, 1, :4].tolist(), "(true 3.0 -> wiped)")
+
+# ---------------------------------------------------------------- T10 exponent window
+hdr("T10 4-bit exponent window: ALG fixed [-7,7] vs HW per-tensor offset (weights x0.01)")
+c = C.build("conv3x3_p0"); c["w"] = c["w"] * 0.01
+r = F.conv2d(c["x"], c["w"])
+a = A.run(c); h = H.run(c)
+print(f"ALG: w_exp codes [{int(a['w_exp'].min())}..{int(a['w_exp'].max())}] (0 = clamped at E=-7)  "
+      f"w_int max {int(a['w_int'].abs().max())}  max err {float((a['out'] - r).abs().max()):.2e}")
+print(f"HW : w_cal {int(h['w_cal'])} slides the window  "
+      f"w_mant max {int(h['hw_w_mant'].abs().max())}  max err {float((h['out'] - r).abs().max()):.2e}")

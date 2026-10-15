@@ -17,6 +17,8 @@ conv), and **warp**.
 | `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu` (conv). convT and warp are still placeholders |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop |
 | `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their confluence guide, their example notebook (as flattened text) |
+| `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
+| `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width. HW runs only at 4 bits |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
 
 ## Taps
@@ -51,8 +53,8 @@ python main_ALG.py -m convt --layer model.block2.conv1   # use that entry's grou
 python main_ALG.py -m conv3x3 --backend python           # step into the python ref
 python main_ALG.py -m warp           # every warp case
 python main.py -m all                # both sides compared
-python main.py -m conv3x3_p0         # HW conv runs on unpadded cases
-python main.py -m conv3x3_p0 --input both   # float input vs integer input (grid 2^-4)
+python main.py -m conv3x3_p0 --config mx_config_npe_e4.json   # HW conv runs at 4-bit exp
+python main.py -m conv3x3_p0 --config mx_config_npe_e4.json --input both   # float vs integer input
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
 
@@ -74,6 +76,14 @@ training). `--input int --x-frac F` first snaps x to the grid 2^-F, giving an
 integer tensor as the NPE receives it; both sides get the same tensor.
 `--input both` prints HW-ALG for each. Their `round(x * 2^x_cal)` is a no-op on
 integer input while `x_cal >= F` (tap `pre_round_moved`).
+
+Exponent width: `mx_specs.scale_bits` drives both sides. ALG decodes the
+exponent code as `E + 2^(n-1)-1`. HW maps the config to their `mx_type`
+`mx-e{scale_bits}bm{N}` and `block_size`. It refuses a width it can't run:
+their wrap mask is fixed at 4 bits (`mx_format.py:83`), so the 8-bit framework
+configs get "HW not implemented". Use `--config mx_config_npe_e4.json`.
+Widths fixed inside their code (their API has no parameter): acc 46 bits, PCU
+clamp 24 bits (`main_HW.HW_FIXED`).
 
 Their code does not support padding (it raises) or dilation (it has no such
 parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.

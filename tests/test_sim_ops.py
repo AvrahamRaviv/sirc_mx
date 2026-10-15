@@ -17,6 +17,9 @@ for p in (os.path.join(_ROOT, "configs"), _ROOT, os.path.dirname(_ROOT)):
 import cases as C           # noqa: E402
 import main_ALG as ALG      # noqa: E402
 import main_HW as HW        # noqa: E402
+import sim_config as SC     # noqa: E402
+
+E4 = SC.load_config("mx_config_npe_e4.json")   # NPE exponent width (4 bits)
 
 
 def _expand(code, axis, n, bs=C.BS):
@@ -62,7 +65,7 @@ def test_convt_runs(name):
 @pytest.mark.parametrize("name", ["conv1x1", "conv3x3_p0"])
 def test_hw_conv_runs(name):
     """HW team's npe_mx_emu conv, wired in: runs, shapes line up with ALG."""
-    t = HW.run(C.build(name))
+    t = HW.run(C.build(name), E4)
     assert t["out"].shape == ALG.run(C.build(name))["out"].shape
     assert t["hw_acc"].shape == t["out_raw"].shape
 
@@ -70,13 +73,13 @@ def test_hw_conv_runs(name):
 @pytest.mark.parametrize("name", ["conv3x3", "conv3x3_d2"])
 def test_hw_conv_unsupported_raises(name):
     with pytest.raises(NotImplementedError):
-        HW.run(C.build(name))
+        HW.run(C.build(name), E4)
 
 
 @pytest.mark.parametrize("name", ["convt_k3_s2", "warp_int_shift"])
 def test_hw_placeholder(name):
     with pytest.raises(NotImplementedError):
-        HW.run(C.build(name))
+        HW.run(C.build(name), E4)
 
 
 def test_int_input_is_on_grid_and_hw_preround_is_noop():
@@ -85,6 +88,21 @@ def test_int_input_is_on_grid_and_hw_preround_is_noop():
     case = C.build("conv3x3_p0", x_frac=4)
     v = case["x"].double() * 16
     assert bool((v == v.round()).all())
-    t = HW.run(case)
+    t = HW.run(case, E4)
     assert int(t["x_cal"]) >= 4
     assert int(t["pre_round_moved"]) == 0
+
+
+def test_exponent_width_comes_from_config():
+    """scale_bits drives both sides: ALG codes are E + 2^(n-1)-1; HW refuses a
+    width its code can't run (wrap mask fixed at 4 bits) instead of silently
+    running 4."""
+    c = C.build("conv3x3_p0")
+    e8 = ALG.run(c, SC.load_config("mx_config_dof.json"))
+    e4 = ALG.run(c, E4)
+    assert int(e8["a_exp"].min()) > 100          # 8-bit: E + 127
+    assert int(e4["a_exp"].max()) <= 14          # 4-bit: E + 7, in [0, 14]
+    assert bool((e8["a_exp"].long() - 127 == e4["a_exp"].long() - 7).all())
+    with pytest.raises(NotImplementedError, match="wraps the exponent at 4 bits"):
+        HW.run(c, SC.load_config("mx_config_dof.json"))
+    assert HW.hw_format(E4) == ("mx-e4bm8", 32)

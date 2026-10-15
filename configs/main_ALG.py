@@ -56,28 +56,7 @@ from taps import tap, show
 # Config
 # =============================================================================
 
-DEFAULT_CONFIG = os.path.join(_HERE, "mx_config_dof.json")
-
-
-def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
-    """Framework mx_config.json -> sim config dict.
-
-    Returns {"file", "mx_specs", "groups", "entries", "layer", "backend"}.
-    Nothing in the file is changed except what --layer / --backend name.
-    """
-    if not os.path.isabs(path) and not os.path.exists(path):
-        path = os.path.join(_HERE, path)
-    with open(path) as f:
-        raw = json.load(f)
-    entries = {}
-    for e in raw.get("layers", []):
-        e = {"name": e} if isinstance(e, str) else e
-        entries[e["name"]] = e
-    if layer is not None and layer not in entries:
-        raise SystemExit(f"--layer {layer!r} not in {path} layers")
-    return {"file": path, "mx_specs": raw["mx_specs"],
-            "groups": raw.get("groups", {}), "entries": entries,
-            "layer": layer, "backend": backend}
+from sim_config import DEFAULT_CONFIG, load_config   # noqa: E402  (re-exported)
 
 
 def _entry(cfg, op):
@@ -142,7 +121,16 @@ def _mbits(fmt):
     return int(fmt[3:])
 
 
+def _dec(sp, which):
+    """mx_decode widths from the layer's mx_specs: block size, mantissa bits
+    of the a/w format, shared-exponent bits (scale_bits)."""
+    return {"bs": int(sp["block_size"]),
+            "mbits": _mbits(sp[f"{which}_elem_format"]),
+            "scale_bits": int(sp["scale_bits"])}
+
+
 def mx_decode(q, axis, bs=C.BS, mbits=8, scale_bits=8):
+    # callers pass bs, mbits and scale_bits from the layer's mx_specs
     """`q` is already on the MXINT lattice; read its integers back.
     intN: value = mant * 2^(E - (N-2)), mant in [-(2^(N-1)-1), 2^(N-1)-1].
 
@@ -194,13 +182,11 @@ def conv(case, cfg, taps):
     tap(taps, "x", x)
     tap(taps, "w", w)
     # activation: blocks along W
-    a_int, a_exp = mx_decode(mod._last_qi, axis=3,
-                             mbits=_mbits(sp["a_elem_format"]))
+    a_int, a_exp = mx_decode(mod._last_qi, axis=3, **_dec(sp, "a"))
     tap(taps, "a_int", a_int)           # [B, Cin, H, W]
     tap(taps, "a_exp", a_exp)           # [B, Cin, H, ceil(W/bs)]
     # weight: each filter flattened to [Cin*kH*kW] (C-major), blocks along it
-    w_int, w_exp = mx_decode(mod._last_qw.reshape(O, -1), axis=1,
-                             mbits=_mbits(sp["w_elem_format"]))
+    w_int, w_exp = mx_decode(mod._last_qw.reshape(O, -1), axis=1, **_dec(sp, "w"))
     tap(taps, "w_int", w_int.reshape(w.shape))   # [O, Cin, kH, kW]
     tap(taps, "w_exp", w_exp)                    # [O, ceil(Cin*kH*kW/bs)]
     if mod._last_acc is not None:                # python backend only
@@ -265,10 +251,10 @@ def convt(case, cfg, taps):
 
     tap(taps, "x", x)
     tap(taps, "w", w)
-    a_int, a_exp = mx_decode(qa, axis=1, mbits=_mbits(sp["a_elem_format"]))
+    a_int, a_exp = mx_decode(qa, axis=1, **_dec(sp, "a"))
     tap(taps, "a_int", a_int)           # [B, Cin, H, W]
     tap(taps, "a_exp", a_exp)           # [B, ceil(Cin/bs), H, W]
-    w_int, w_exp = mx_decode(qw, axis=0, mbits=_mbits(sp["w_elem_format"]))
+    w_int, w_exp = mx_decode(qw, axis=0, **_dec(sp, "w"))
     tap(taps, "w_int", w_int)           # [Cin, O, kH, kW]
     tap(taps, "w_exp", w_exp)           # [ceil(Cin/bs), O, kH, kW]
     tap(taps, "out", out)

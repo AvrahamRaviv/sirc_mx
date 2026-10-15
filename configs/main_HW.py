@@ -40,11 +40,45 @@ if _HW_DIR not in sys.path:
     sys.path.insert(0, _HW_DIR)
 
 import cases as C
+import sim_config as SC
 from taps import tap, show
 
 # --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
 from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
+from npe_mx_emu import mx_config_factory
 from npe_mx_emu import hw_pipe as _hw_pipe
+
+# Widths fixed inside npe_mx_emu - their API has no parameter for them, so the
+# config can't reach them (listed so a config that disagrees is visible):
+HW_FIXED = {
+    "acc_bits": 46,        # hw_pipe.bcu default; MXConv2D_Loops never passes it
+    "pcu_clamp_bits": 24,  # calib.build_c_struct_arr default; calibrate() never passes it
+    "exp_wrap_mask": 0xF,  # mx_format.base_mx_quantizer:83, ignores exponent_bits
+}
+
+
+def hw_format(cfg):
+    """Config mx_specs -> npe_mx_emu (mx_type, block_size).
+
+    mx_type is their name "mx-e{scale_bits}bm{mantissa bits}". Refused when
+    their code can't run it as configured, rather than silently running
+    something else.
+    """
+    sp = cfg["mx_specs"]
+    a, w = sp["a_elem_format"], sp["w_elem_format"]
+    if a != w or not str(a).startswith("int"):
+        raise NotImplementedError(f"HW: needs a == w == intN, got a={a!r} w={w!r}")
+    ebits, mbits = int(sp["scale_bits"]), int(a[3:])
+    mx_type = f"mx-e{ebits}bm{mbits}"
+    if mx_type not in mx_config_factory:
+        raise NotImplementedError(
+            f"HW: {mx_type} (scale_bits={ebits}, {a}) not in npe_mx_emu "
+            f"mx_config_factory {sorted(mx_config_factory)}")
+    if (1 << ebits) - 1 != HW_FIXED["exp_wrap_mask"]:
+        raise NotImplementedError(
+            f"HW: scale_bits={ebits} but npe_mx_emu wraps the exponent at "
+            f"4 bits (mx_format.py:83 preserve_lsb = 0xf, their own TODO)")
+    return mx_type, int(sp["block_size"])
 
 
 @contextlib.contextmanager
@@ -66,7 +100,7 @@ def _capture_bcu():
         _hw_pipe.bcu = orig
 
 
-def conv(case, taps):
+def conv(case, cfg, taps):
     """MX conv on the HW team's NPE emulator (hw/npe_mx_emu).
 
     Flow exactly as their notebook (mx_conv_npe_emu_example):
@@ -92,12 +126,14 @@ def conv(case, taps):
     O, Cin, kH, kW = w.shape
     if p["dilation"] != 1:
         raise NotImplementedError("HW conv: npe_mx_emu has no dilation")
+    mx_type, bs = hw_format(cfg)
 
     # calibration (theirs)
-    obs_x = MXObserver(mode="mx"); obs_x.update(x)
-    obs_w = MXObserver(mode="mx"); obs_w.update(w)
+    obs_x = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_x.update(x)
+    obs_w = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_w.update(w)
     qp = LayerMXQParams(x_cal=obs_x.calibrate_offset(),
-                        w_cal=obs_w.calibrate_offset())
+                        w_cal=obs_w.calibrate_offset(),
+                        block_size=bs, mx_type=mx_type)
 
     layer = CalibratedMXConv2d(Cin, O, (kH, kW), stride=p["stride"],
                                padding=p["padding"], qparams=qp)
@@ -134,7 +170,7 @@ def conv(case, taps):
     return taps["out"]
 
 
-def convt(case, taps):
+def convt(case, cfg, taps):
     """ConvTranspose as zero-insert + conv.
 
     Steps:
@@ -153,7 +189,7 @@ def convt(case, taps):
     raise NotImplementedError("HW convt")
 
 
-def warp(case, taps):
+def warp(case, cfg, taps):
     """Bilinear backward warp, integer.
 
     Steps:
@@ -174,10 +210,12 @@ def warp(case, taps):
 OPS = {"conv": conv, "convt": convt, "warp": warp}
 
 
-def run(case):
-    """One case -> {tap_name: tensor}."""
+def run(case, cfg=None):
+    """One case -> {tap_name: tensor}. cfg from sim_config.load_config (the
+    same one ALG reads; default file when None)."""
+    cfg = cfg if cfg is not None else SC.load_config()
     taps = {}
-    OPS[case["op"]](case, taps)
+    OPS[case["op"]](case, cfg, taps)
     return taps
 
 
@@ -185,9 +223,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("-m", default="all", help="case name, op (conv/convt/warp) or all")
+    ap.add_argument("--config", default=SC.DEFAULT_CONFIG,
+                    help="framework mx_config.json (same file ALG reads)")
     args = ap.parse_args()
+    cfg = SC.load_config(args.config)
     for name in C.select(args.m):
-        show(run(C.build(name)), f"{name}  HW")
+        show(run(C.build(name), cfg), f"{name}  HW")
 
 
 if __name__ == "__main__":

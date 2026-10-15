@@ -35,6 +35,7 @@ if _HERE not in sys.path:
 import cases as C
 import main_ALG as ALG
 import main_HW as HW
+import sim_config as SC
 from taps import is_int
 
 
@@ -93,7 +94,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("-m", default="all", help="case name, op (conv/convt/warp) or all")
-    ap.add_argument("--config", default=ALG.DEFAULT_CONFIG,
+    ap.add_argument("--config", default=SC.DEFAULT_CONFIG,
                     help="framework mx_config.json (default mx_config_dof.json)")
     ap.add_argument("--layer", default=None,
                     help="entry of the config's layers to use (its group/kind)")
@@ -105,7 +106,7 @@ def main():
                     help="integer input grid: x in units of 2^-x_frac (default 4)")
     args = ap.parse_args()
 
-    cfg = ALG.load_config(args.config, args.layer, args.backend)
+    cfg = SC.load_config(args.config, args.layer, args.backend)
     modes = {"float": [None], "int": [args.x_frac],
              "both": [None, args.x_frac]}[args.input]
     results, outd = {}, {}
@@ -115,7 +116,7 @@ def main():
             case = C.build(name, x_frac=xf)
             alg = ALG.run(case, cfg)
             try:
-                hw = HW.run(case)
+                hw = HW.run(case, cfg)
             except NotImplementedError as e:
                 print(f"\n=== {key} ===\n  HW not implemented: {e}  "
                       f"(ALG: {len(alg)} taps)")
