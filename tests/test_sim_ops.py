@@ -59,6 +59,21 @@ def test_convt_runs(name):
     assert t["out"].shape[2:] == (10, 32)
 
 
-def test_hw_is_placeholder():
+@pytest.mark.parametrize("name", ["conv1x1", "conv3x3_p0"])
+def test_hw_conv_runs(name):
+    """HW team's npe_mx_emu conv, wired in: runs, shapes line up with ALG."""
+    t = HW.run(C.build(name))
+    assert t["out"].shape == ALG.run(C.build(name))["out"].shape
+    assert t["hw_acc"].shape == t["out_raw"].shape
+
+
+@pytest.mark.parametrize("name", ["conv3x3", "conv3x3_d2"])
+def test_hw_conv_unsupported_raises(name):
     with pytest.raises(NotImplementedError):
-        HW.run(C.build("conv1x1"))
+        HW.run(C.build(name))
+
+
+@pytest.mark.parametrize("name", ["convt_k3_s2", "warp_int_shift"])
+def test_hw_placeholder(name):
+    with pytest.raises(NotImplementedError):
+        HW.run(C.build(name))

@@ -63,6 +63,7 @@ CASES = {
     # --- conv -----------------------------------------------------------------
     "conv1x1":      dict(op="conv", x=(1, 4, 3, 32), w=(8, 4, 1, 1)),
     "conv3x3":      dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=1),
+    "conv3x3_p0":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3)),  # HW: no padding yet
     "conv3x3_s2":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=1,
                          stride=2),
     "conv3x3_d2":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=2,

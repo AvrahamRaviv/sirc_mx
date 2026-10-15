@@ -14,7 +14,8 @@ conv), and **warp**.
 | `cases.py` | the case table: one op per case, tiny shapes, fixed seed. Also `Warp`, the float spec of the warp |
 | `taps.py` | `tap(taps, name, t)` logs a value at any point; `show(taps)` prints them in order |
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
-| `main_HW.py` | HW side: **placeholders**, filled by HW. Docstrings give the steps and the taps to emit |
+| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu` (conv). convT and warp are still placeholders |
+| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their confluence guide, their example notebook (as flattened text) |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
 
 ## Taps
@@ -48,9 +49,26 @@ python main_ALG.py -m conv3x3 --config mx_config_dof_npe_int6.json
 python main_ALG.py -m convt --layer model.block2.conv1   # use that entry's group
 python main_ALG.py -m conv3x3 --backend python           # step into the python ref
 python main_ALG.py -m warp           # every warp case
-python main.py -m all                # both sides compared (exit 2 until HW is filled)
+python main.py -m all                # both sides compared
+python main.py -m conv3x3_p0         # HW conv runs on unpadded cases
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
+
+## HW side (npe_mx_emu)
+
+`main_HW.conv` runs their flow as in their notebook:
+1. `MXObserver(mode="mx")` on x and on w gives `x_cal` and `w_cal`.
+2. `LayerMXQParams` → `CalibratedMXConv2d` → `calibrate()` → `forward(x)`.
+3. `out = out_raw * 2^-output_scale_log2`.
+
+Their intermediates are tapped without touching their code: a forward pre-hook
+catches the MX input, and a pass-through wrapper on `bcu` keeps each `p_sum`.
+Their format is not ALG's (e4bm8: per-tensor calibrate offset, ceil log2,
+unsigned 4-bit exponent with wrap, mantissa truncate, 46-bit acc, PCU round,
+24-bit clamp), so their integer taps are `hw_*` and only `out` is compared.
+
+Their code does not support padding (it raises) or dilation (it has no such
+parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.
 
 ## Config
 

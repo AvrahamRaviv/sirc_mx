@@ -10,7 +10,12 @@ Integer taps must match exactly; float taps report max |delta|. Taps are
 compared in ALG order and the first integer tap that differs is named - every
 later stage is downstream of it.
 
-Exit code: 0 all bit-exact, 1 a mismatch, 2 HW side not implemented.
+Verdict per case: bit-exact (every shared tap equal), float-diff (integer taps
+equal, a float tap differs - reported, not failed), MISMATCH (an integer tap or
+a shape differs).
+
+Exit code: 0 all bit-exact, 1 a mismatch, 2 HW side not implemented, 3 only
+float differences.
 """
 
 import argparse
@@ -72,7 +77,10 @@ def report(name, rows, alg, hw):
     bad = [r for r in rows if r[1] in ("MISMATCH", "SHAPE")]
     if bad:
         print(f"  -> first diverging tap: {bad[0][0]}")
-    return not bad
+        return "mismatch"
+    if any(r[1] == "float-diff" for r in rows):
+        return "float-diff"
+    return "bit-exact"
 
 
 def main():
@@ -101,13 +109,15 @@ def main():
             continue
         results[name] = report(name, compare(alg, hw), alg, hw)
 
-    ok = [k for k, v in results.items() if v is True]
-    bad = [k for k, v in results.items() if v is False]
+    ok = [k for k, v in results.items() if v == "bit-exact"]
+    fd = [k for k, v in results.items() if v == "float-diff"]
+    bad = [k for k, v in results.items() if v == "mismatch"]
     skip = [k for k, v in results.items() if v is None]
     print(f"\n{len(ok)}/{len(results)} bit-exact"
+          + (f", float-diff: {', '.join(fd)}" if fd else "")
           + (f", mismatched: {', '.join(bad)}" if bad else "")
           + (f", HW missing: {len(skip)}" if skip else ""))
-    sys.exit(1 if bad else 2 if skip else 0)
+    sys.exit(1 if bad else 2 if skip else 3 if fd else 0)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,13 @@
 """
 main_HW.py - run one case through the HW implementation (the HW side).
 
-PLACEHOLDER. HW fills the three op bodies. Same interface as main_ALG:
+HW code lives in hw/npe_mx_emu/, copied verbatim from the HW team - never
+edited here. This file only wires it in: it builds their layer, calls their
+calibration and forward, and taps what their code produced (via a forward
+pre-hook and a pass-through wrapper on their bcu - no logic of theirs is
+reimplemented). Status, per their guide: conv done; warp, convT not yet.
+
+Same interface as main_ALG:
 
     from main_HW import run
     taps = run(cases.build("conv3x3"))   # {tap_name: tensor}, same names as ALG
@@ -25,28 +31,103 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import contextlib
+
+import torch
+
+_HW_DIR = os.path.join(_HERE, "hw")
+if _HW_DIR not in sys.path:
+    sys.path.insert(0, _HW_DIR)
+
 import cases as C
-from taps import tap, show   # noqa: F401  (HW uses tap in the bodies)
+from taps import tap, show
+
+# --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
+from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
+from npe_mx_emu import hw_pipe as _hw_pipe
+
+
+@contextlib.contextmanager
+def _capture_bcu():
+    """Record every bcu() result (one output line: p_sum[out_width]) in call
+    order. Pass-through: their bcu runs unchanged, we only keep its output."""
+    seen = []
+    orig = _hw_pipe.bcu
+
+    def rec(*a, **k):
+        p = orig(*a, **k)
+        seen.append(p.detach().clone())
+        return p
+
+    _hw_pipe.bcu = rec
+    try:
+        yield seen
+    finally:
+        _hw_pipe.bcu = orig
 
 
 def conv(case, taps):
-    """MX conv on the HW datapath.
+    """MX conv on the HW team's NPE emulator (hw/npe_mx_emu).
 
-    Steps:
-      1. x -> a_int int8 [B,Cin,H,W], a_exp int16 [B,Cin,H,ceil(W/32)]
-         blocks of 32 along W. E = floor(log2 max|block|), code = E + 127,
-         mant = round_half_away(x * 2^(6 - E)), clamp [-127, 127].
-      2. w -> each filter flattened C-major to [Cin*kH*kW], blocks of 32 along it.
-         w_int int8 [O,Cin,kH,kW], w_exp int16 [O, ceil(Cin*kH*kW/32)].
-      3. per output, for c in Cin, for (kh, kw): p = a_int * w_int,
-         shift by (Ea + Ew - 12 - e_layer_min), e_layer_min = -20,
-         add into a 48-bit accumulator, saturate after every product.
-         Zero padding / stride / dilation from case["params"].
-      4. bias: round(b * 2^20) added after the last product, saturate again.
+    Flow exactly as their notebook (mx_conv_npe_emu_example):
+      MXObserver(mode="mx") on x and on w -> x_cal, w_cal
+      LayerMXQParams(x_cal, w_cal) -> CalibratedMXConv2d (weight/bias copied)
+      calibrate() -> forward(x) -> raw int, float = raw * 2^-output_scale_log2
 
-    Taps: a_int a_exp w_int w_exp acc (int64) sat (uint8) out (= acc * 2^-20).
+    Their format differs from ALG by design (e4bm8: per-tensor calibrate
+    offset, ceil log2, unsigned 4-bit exponent with wrap, mantissa truncate,
+    46-bit acc with floor shift, PCU round + 24-bit clamp), so their integer
+    taps carry an `hw_` prefix and are not compared to ALG's; `out` is.
+
+    Not supported by their code: padding (they raise), dilation (they have no
+    such parameter - refused here so it can't run silently as dilation 1),
+    groups.
+
+    Taps: x w | x_cal w_cal | hw_a_mant hw_a_exp | hw_w_mant hw_w_exp |
+          hw_acc | out_raw | out
     """
-    raise NotImplementedError("HW conv")
+    x, w, b, p = case["x"], case["w"], case["b"], case["params"]
+    O, Cin, kH, kW = w.shape
+    if p["dilation"] != 1:
+        raise NotImplementedError("HW conv: npe_mx_emu has no dilation")
+
+    # calibration (theirs)
+    obs_x = MXObserver(mode="mx"); obs_x.update(x)
+    obs_w = MXObserver(mode="mx"); obs_w.update(w)
+    qp = LayerMXQParams(x_cal=obs_x.calibrate_offset(),
+                        w_cal=obs_w.calibrate_offset())
+
+    layer = CalibratedMXConv2d(Cin, O, (kH, kW), stride=p["stride"],
+                               padding=p["padding"], qparams=qp)
+    with torch.no_grad():
+        layer.mx_conv.weight.copy_(w)
+        layer.mx_conv.bias.copy_(b if b is not None else torch.zeros(O))
+    layer.calibrate()
+
+    seen_mx = []
+    hook = layer.mx_conv.register_forward_pre_hook(
+        lambda m, args: seen_mx.append(args[0]))
+    try:
+        with torch.no_grad(), _capture_bcu() as lines:
+            out_raw = layer(x)
+    finally:
+        hook.remove()
+    mx_a, mx_w = seen_mx[0], layer.mx_conv.mx_weight
+
+    B, _, Ho, Wo = out_raw.shape
+    tap(taps, "x", x)
+    tap(taps, "w", w)
+    tap(taps, "x_cal", qp.x_cal)
+    tap(taps, "w_cal", qp.w_cal)
+    tap(taps, "hw_a_mant", mx_a.data)        # [B, Cin, H, nblk, bs] int32
+    tap(taps, "hw_a_exp", mx_a.shared_exp)   # [B, Cin, H, nblk]
+    tap(taps, "hw_w_mant", mx_w.data)        # [O, nblk, bs]
+    tap(taps, "hw_w_exp", mx_w.shared_exp)   # [O, nblk]
+    # bcu is called per (b, oc, oh) in that loop order -> [B, O, Ho, Wo]
+    tap(taps, "hw_acc", torch.stack(lines).reshape(B, O, Ho, Wo))
+    tap(taps, "out_raw", out_raw)
+    tap(taps, "out", out_raw * 2.0 ** -layer.output_scale_log2)
+    return taps["out"]
 
 
 def convt(case, taps):
