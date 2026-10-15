@@ -83,8 +83,10 @@ def conv(case, taps):
     such parameter - refused here so it can't run silently as dilation 1),
     groups.
 
-    Taps: x w | x_cal w_cal | hw_a_mant hw_a_exp | hw_w_mant hw_w_exp |
-          hw_acc | out_raw | out
+    Taps: x w | x_cal w_cal pre_round_moved | hw_a_mant hw_a_exp |
+          hw_w_mant hw_w_exp | hw_acc | out_raw | out
+    pre_round_moved: how many input elements their round(x * 2^x_cal) in
+    CalibratedMXConv2d.forward changed (0 = input already integer there).
     """
     x, w, b, p = case["x"], case["w"], case["b"], case["params"]
     O, Cin, kH, kW = w.shape
@@ -119,6 +121,8 @@ def conv(case, taps):
     tap(taps, "w", w)
     tap(taps, "x_cal", qp.x_cal)
     tap(taps, "w_cal", qp.w_cal)
+    xs = x.double() * 2.0 ** qp.x_cal
+    tap(taps, "pre_round_moved", int((xs != xs.round()).sum()))
     tap(taps, "hw_a_mant", mx_a.data)        # [B, Cin, H, nblk, bs] int32
     tap(taps, "hw_a_exp", mx_a.shared_exp)   # [B, Cin, H, nblk]
     tap(taps, "hw_w_mant", mx_w.data)        # [O, nblk, bs]

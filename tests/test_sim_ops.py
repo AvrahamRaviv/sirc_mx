@@ -77,3 +77,14 @@ def test_hw_conv_unsupported_raises(name):
 def test_hw_placeholder(name):
     with pytest.raises(NotImplementedError):
         HW.run(C.build(name))
+
+
+def test_int_input_is_on_grid_and_hw_preround_is_noop():
+    """--input int: x * 2^x_frac is an exact integer on both sides, and the
+    HW's own round(x * 2^x_cal) changes nothing while x_cal >= x_frac."""
+    case = C.build("conv3x3_p0", x_frac=4)
+    v = case["x"].double() * 16
+    assert bool((v == v.round()).all())
+    t = HW.run(case)
+    assert int(t["x_cal"]) >= 4
+    assert int(t["pre_round_moved"]) == 0

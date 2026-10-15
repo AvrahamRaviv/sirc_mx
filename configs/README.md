@@ -52,6 +52,7 @@ python main_ALG.py -m conv3x3 --backend python           # step into the python 
 python main_ALG.py -m warp           # every warp case
 python main.py -m all                # both sides compared
 python main.py -m conv3x3_p0         # HW conv runs on unpadded cases
+python main.py -m conv3x3_p0 --input both   # float input vs integer input (grid 2^-4)
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
 
@@ -67,6 +68,12 @@ catches the MX input, and a pass-through wrapper on `bcu` keeps each `p_sum`.
 Their format is not ALG's (e4bm8: per-tensor calibrate offset, ceil log2,
 unsigned 4-bit exponent with wrap, mantissa truncate, 46-bit acc, PCU round,
 24-bit clamp), so their integer taps are `hw_*` and only `out` is compared.
+
+Input mode: `--input float` feeds the float tensor (what the MX lib sees in
+training). `--input int --x-frac F` first snaps x to the grid 2^-F, giving an
+integer tensor as the NPE receives it; both sides get the same tensor.
+`--input both` prints HW-ALG for each. Their `round(x * 2^x_cal)` is a no-op on
+integer input while `x_cal >= F` (tap `pre_round_moved`).
 
 Their code does not support padding (it raises) or dilation (it has no such
 parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.

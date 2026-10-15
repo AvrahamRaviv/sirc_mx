@@ -5,6 +5,12 @@ main.py - run a case through both sides and compare tap by tap.
     python main.py -m warp
     python main.py -m all
     python main.py -m conv --config mx_config_dof_npe_int6.json --backend python
+    python main.py -m conv3x3_p0 --input both     # float input vs integer input
+
+--input float : x as is (what the MX lib sees in training)
+--input int   : x snapped to the grid 2^-x_frac first - an integer tensor, as
+                the NPE receives it. Both sides get the same tensor.
+--input both  : run both and print how much of HW-ALG is the input rounding.
 
 Integer taps must match exactly; float taps report max |delta|. Taps are
 compared in ALG order and the first integer tap that differs is named - every
@@ -93,21 +99,43 @@ def main():
                     help="entry of the config's layers to use (its group/kind)")
     ap.add_argument("--backend", default=None,
                     help="override xblock_accum.backend (python / triton)")
+    ap.add_argument("--input", default="float", choices=("float", "int", "both"),
+                    help="float input, integer input (grid 2^-x_frac), or both")
+    ap.add_argument("--x-frac", type=int, default=4,
+                    help="integer input grid: x in units of 2^-x_frac (default 4)")
     args = ap.parse_args()
 
     cfg = ALG.load_config(args.config, args.layer, args.backend)
-    results = {}
+    modes = {"float": [None], "int": [args.x_frac],
+             "both": [None, args.x_frac]}[args.input]
+    results, outd = {}, {}
     for name in C.select(args.m):
-        case = C.build(name)
-        alg = ALG.run(case, cfg)
-        try:
-            hw = HW.run(case)
-        except NotImplementedError as e:
-            print(f"\n=== {name} ===\n  HW not implemented: {e}  "
-                  f"(ALG: {len(alg)} taps)")
-            results[name] = None
-            continue
-        results[name] = report(name, compare(alg, hw), alg, hw)
+        for xf in modes:
+            key = name if xf is None else f"{name} [int 2^-{xf}]"
+            case = C.build(name, x_frac=xf)
+            alg = ALG.run(case, cfg)
+            try:
+                hw = HW.run(case)
+            except NotImplementedError as e:
+                print(f"\n=== {key} ===\n  HW not implemented: {e}  "
+                      f"(ALG: {len(alg)} taps)")
+                results[key] = None
+                continue
+            results[key] = report(key, compare(alg, hw), alg, hw)
+            if "pre_round_moved" in hw:
+                print(f"  HW input pre-round moved {int(hw['pre_round_moved'])}"
+                      f"/{case['x'].numel()} elements")
+            d = (alg["out"].double() - hw["out"].double()).abs()
+            outd.setdefault(name, {})[xf] = (float(d.max()),
+                                             float((d ** 2).mean().sqrt()))
+
+    if args.input == "both" and outd:
+        print(f"\n  HW-ALG out      {'float in':>18} {'int in':>18}")
+        print(f"  {'case':<14} {'max':>8} {'rms':>9} {'max':>8} {'rms':>9}")
+        for n, r in outd.items():
+            if len(r) == 2:
+                (fm, fr), (im, ir) = r[None], r[args.x_frac]
+                print(f"  {n:<14} {fm:>8.4f} {fr:>9.5f} {im:>8.4f} {ir:>9.5f}")
 
     ok = [k for k, v in results.items() if v == "bit-exact"]
     fd = [k for k, v in results.items() if v == "float-diff"]

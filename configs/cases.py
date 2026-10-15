@@ -104,12 +104,25 @@ def _flow(shape, spec, gen):
     raise ValueError(f"flow {kind!r}")
 
 
-def build(name, seed=0):
-    """Case name -> case dict with its tensors filled in."""
+def to_grid(x, frac):
+    """Snap x to the integer grid 2^-frac (round half away from zero).
+    x * 2^frac is then an exact integer: an integer tensor, as HW receives it."""
+    v = x.double() * 2.0 ** frac
+    return (torch.sign(v) * torch.floor(v.abs() + 0.5) / 2.0 ** frac).to(x.dtype)
+
+
+def build(name, seed=0, x_frac=None):
+    """Case name -> case dict with its tensors filled in.
+
+    x_frac=None: float input (what the MX lib sees in training).
+    x_frac=F   : integer input - x snapped to the grid 2^-F, as the NPE gets
+                 it from the previous layer. Both sides get the same tensor.
+    """
     spec = dict(CASES[name])
     gen = torch.Generator().manual_seed(seed)
+    x = torch.randn(spec.pop("x"), generator=gen)
     case = {"name": name, "op": spec.pop("op"),
-            "x": torch.randn(spec.pop("x"), generator=gen),
+            "x": x if x_frac is None else to_grid(x, x_frac), "x_frac": x_frac,
             "w": None, "b": None, "flow": None, "warp": None}
     if case["op"] in ("conv", "convt"):
         w_shape = spec.pop("w")
