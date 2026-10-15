@@ -15,6 +15,7 @@ conv), and **warp**.
 | `taps.py` | `tap(taps, name, t)` logs a value at any point; `show(taps)` prints them in order |
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
 | `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu` (conv). convT and warp are still placeholders |
+| `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop |
 | `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their confluence guide, their example notebook (as flattened text) |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
 
