@@ -11,6 +11,9 @@ Names are the ones in "layers". Per layer:
   win_bits     window magnitude bits, saturation at +-(2^win_bits - 1)
   shift_out    e_qa_out - e_layer_min, the one extraction shift
                (> 0 right shift, < 0 left shift)
+  e_base_a     input shared-exponent base (only with xblock_accum.in_exp_bits):
+               input block exponents limited to [e_base_a, e_base_a + 2^bits - 1]
+  e_base_w     same for the weights
 
 e_layer_min and e_qa_out are required; win_bits and shift_out are derived
 values, written by `export_hw_grids` and checked on load. Calibration runs
@@ -22,7 +25,8 @@ standalone.
 """
 import json
 
-HW_GRID_KEYS = ("e_layer_min", "e_qa_out", "win_bits", "shift_out")
+HW_GRID_KEYS = ("e_layer_min", "e_qa_out", "win_bits", "shift_out",
+                "e_base_a", "e_base_w")
 _REQUIRED = ("e_layer_min", "e_qa_out")
 
 

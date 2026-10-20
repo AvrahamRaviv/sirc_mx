@@ -29,7 +29,8 @@ from microxcaling.mx.mx_ops import quantize_mx_op as _quantize_mx_op_raw
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
-from fixed_point.mx_fixed_point_hw import hw_fxp_conv2d, resolve_out_window_bits
+from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
+                                           clamp_block_exp, floor_log2, in_exp_on)
 
 
 def quantize_mx_op(x, *args, **kwargs):
@@ -230,12 +231,32 @@ class MXConv2dHW(MXConv2d):
       - `xblock_accum.out_window` ('off' | 'infer' | 'always') applies the
         static output window at `e_qa_out` ('infer' = eval mode only). Needs
         `e_qa_out`: run `mx_fixed_point_hw.calibrate_hw_grids(model, loader)`.
+      - `xblock_accum.in_exp_bits` + `in_exp_mode` model the HW a/w
+        shared-exponent register: block exponents limited to
+        [e_base, e_base + 2^in_exp_bits - 1] per tensor (see
+        `clamp_block_exp`). Input base `e_base_a` is calibrated; weight base
+        `e_base_w` comes from the current weights unless the config sets it.
     """
+
+    def weight_exp_base(self):
+        """Weight SE base: config value, else max block exp of the weights
+        minus (2^in_exp_bits - 1). None when in_exp_bits is unset."""
+        if self.e_base_w is not None:
+            return int(self.e_base_w)
+        if self._last_e_base_w is not None:
+            return int(self._last_e_base_w)
+        bits = _get_xblock_cfg(self).get("in_exp_bits")
+        e = floor_log2(float(self.weight.detach().abs().max()))
+        return None if bits is None or e is None else e - ((1 << int(bits)) - 1)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.e_layer_min = None
         self.e_qa_out = None            # output window grid (calibrate_hw_grids)
+        self.e_base_a = None            # input SE base (in_exp_bits; calibrated)
+        self.e_base_w = None            # weight SE base; None = from the weights
+        self._last_e_base_w = None
+        self._in_exp_cut_life = [0, 0]  # a, w elements changed by the SE register
         # Where each grid came from: 'config' (hw_grids / xblock_accum) or
         # 'calib'. A config value is never replaced unless calibration is forced.
         self._grid_src = {"e_layer_min": None, "e_qa_out": None}
@@ -351,6 +372,32 @@ class MXConv2dHW(MXConv2d):
             return out
 
         cfg = _get_xblock_cfg(self)
+        exp_mode = cfg.get('in_exp_mode', 'off')
+        if in_exp_on(cfg) and (exp_mode == 'always'
+                               or (exp_mode == 'infer' and not self.training)):
+            if self.e_base_a is None:
+                raise RuntimeError(
+                    f"MXConv2dHW {self._mx_layer_name or '?'}: in_exp_mode="
+                    f"{exp_mode!r} needs e_base_a. Run `calibrate_hw_grids` "
+                    f"or set hw_grids e_base_a.")
+            exp_bits = int(cfg['in_exp_bits'])
+            if self.e_base_w is None:
+                e_w = floor_log2(float(qw.detach().abs().max()))
+                self._last_e_base_w = (None if e_w is None
+                                       else e_w - ((1 << exp_bits) - 1))
+            base_w = self.e_base_w if self.e_base_w is not None else self._last_e_base_w
+            ca, na = clamp_block_exp(qi.detach(), self.e_base_a, exp_bits, a_fmt)
+            qi = qi + (ca - qi).detach()             # STE: grads unchanged
+            if base_w is not None:
+                cw, nw = clamp_block_exp(qw.detach(), base_w, exp_bits, w_fmt)
+                qw = qw + (cw - qw).detach()
+            else:
+                nw = 0
+            self._in_exp_cut_life[0] += na
+            self._in_exp_cut_life[1] += nw
+            if self._tap_acc:
+                self._last_qi, self._last_qw = qi.detach(), qw.detach()
+
         e_min = self.e_layer_min if self.e_layer_min is not None else cfg.get('e_layer_min')
         if e_min is None:
             raise RuntimeError(

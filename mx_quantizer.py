@@ -189,7 +189,9 @@ class MXQuantizer:
         "layers": [...]
     }
     Names as in "layers". hw_grids[name] beats xblock_accum.e_layer_min /
-    e_qa_out; calibrate_hw_grids fills only what neither sets. Written once
+    e_qa_out; calibrate_hw_grids fills only what neither sets. With
+    xblock_accum.in_exp_bits on, entries also carry e_base_a / e_base_w
+    (input / weight shared-exponent bases). Written once
     offline by save_hw_grids (<stem>_grids.json); see fixed_point/hw_grids.py.
 
     8. Calibrate missing HW grids inside quant() (trainer passes data/forward_fn):
@@ -1387,9 +1389,10 @@ class MXQuantizer:
         if 'win_bits' in entry:
             win_bits = resolve_out_window_bits(xcfg, layer.mx_specs['a_elem_format'])
         check_hw_grid(name, entry, win_bits=win_bits)
-        for key in ("e_layer_min", "e_qa_out"):
-            setattr(layer, key, int(entry[key]))
-            layer._grid_src[key] = "config"
+        for key in ("e_layer_min", "e_qa_out", "e_base_a", "e_base_w"):
+            if key in entry:
+                setattr(layer, key, int(entry[key]))
+                layer._grid_src[key] = "config"
 
     def _check_hw_grids(self, model):
         """Every hw_grids name must be an MXConv2dHW of this model: a typo or a

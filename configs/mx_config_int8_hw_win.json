@@ -13,7 +13,8 @@
       "mode": "hw_fixed_point",
       "sat_mode": "per_product",
       "e_layer_min": null,
-      "out_window": "infer"
+      "out_window": "infer",
+      "acc_headroom_bits": 2
     }
   },
     "layers": [

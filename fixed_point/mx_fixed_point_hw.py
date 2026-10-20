@@ -261,6 +261,36 @@ def e_qa_out_from_absmax(absmax, win_bits, margin_bits=0):
     return (ex - 1) - (int(win_bits) - 1) + int(margin_bits)
 
 
+def floor_log2(x):
+    """floor(log2(x)) for x > 0 - the MX block exponent of a block whose
+    |max| is x. None for x <= 0."""
+    import math
+    if not x > 0:
+        return None
+    return math.frexp(float(x))[1] - 1
+
+
+def clamp_block_exp(q, e_base, exp_bits, fmt='int8'):
+    """Model a `exp_bits`-wide HW shared-exponent register on an MX tensor.
+
+    Allowed block exponents: [e_base, e_base + 2^exp_bits - 1]. A block
+    below e_base is re-rounded (nearest, half away, as microxcaling) to that
+    step, 2^(e_base - mant_bias); a block above the top saturates to
+    +-max_int * 2^(top - mant_bias). Works per element: an in-range block's
+    values are multiples of its own step, which the coarser e_base step
+    divides, so they come back unchanged. (Re-rounding an already rounded
+    value can differ from rounding the float once by one step at a tie.)
+
+    Returns (clamped tensor, number of changed elements).
+    """
+    _, mant_bias, max_val, _ = _int_format_params(fmt)
+    step = 2.0 ** (int(e_base) - mant_bias)
+    hi = max_val * 2.0 ** (int(e_base) + (1 << int(exp_bits)) - 1 - mant_bias)
+    y = torch.sign(q) * torch.floor(q.abs() / step + 0.5) * step
+    y = y.clamp(-hi, hi)
+    return y, int((y != q).sum().item())
+
+
 def _sat(x, lo, hi):
     """Clamp to [lo, hi] and return (clamped, over|under mask)."""
     sat = (x < lo) | (x > hi)
@@ -703,6 +733,7 @@ class _CalibrationState:
         self.min_e_qa_in = None
         self.min_e_qw = None
         self.in_absmax = None
+        self.w_absmax = None
         self.out_absmax = None
 
     def update(self, qi_fp, qw_fp, bs, fmt='int8',
@@ -716,6 +747,8 @@ class _CalibrationState:
         self.min_e_qw = _running(self.min_e_qw, e_w, min)
         self.in_absmax = _running(self.in_absmax,
                                   float(qi_fp.detach().abs().amax().item()), max)
+        self.w_absmax = _running(self.w_absmax,
+                                 float(qw_fp.detach().abs().amax().item()), max)
 
     def update_out(self, out):
         self.out_absmax = _running(self.out_absmax,
@@ -731,6 +764,7 @@ def report_hw_stats(model, reset=False):
     from mx_layers_blocked import MXConv2dHW
     rows = []
     win_sat = {}
+    exp_cut = {}
     for m in model.modules():
         if not isinstance(m, MXConv2dHW):
             continue
@@ -741,7 +775,10 @@ def report_hw_stats(model, reset=False):
         pct = (100.0 * sat / tot) if tot else 0.0
         rows.append((name, fwd, sat, tot, pct))
         win_sat[name] = int(getattr(m, "_win_sat_seen_life", 0))
+        cut = getattr(m, "_in_exp_cut_life", [0, 0])
+        exp_cut[name] = (int(cut[0]), int(cut[1]))
         if reset:
+            m._in_exp_cut_life = [0, 0]
             m._win_sat_seen_life = 0
             m._sat_seen_life = 0
             m._sat_total_life = 0
@@ -752,8 +789,9 @@ def report_hw_stats(model, reset=False):
     rows.sort(key=lambda r: -r[4])   # worst first
     print(f"[MXConv2dHW] saturation report ({len(rows)} layers):")
     for name, fwd, sat, tot, pct in rows[:20]:
+        a_cut, w_cut = exp_cut[name]
         print(f"  {pct:6.3f}%  sat={sat}/{tot}  win_sat={win_sat[name]}  "
-              f"fwd={fwd}  {name}")
+              f"exp_cut a={a_cut} w={w_cut}  fwd={fwd}  {name}")
     if len(rows) > 20:
         print(f"  ... and {len(rows) - 20} more layers (sorted by % desc)")
     return rows
@@ -796,12 +834,41 @@ def _set_grid(m, key, value, src):
     """Set one grid on an MXConv2dHW and record where it came from."""
     setattr(m, key, int(value))
     if getattr(m, "_grid_src", None) is None:
-        m._grid_src = {"e_layer_min": None, "e_qa_out": None}
+        m._grid_src = {}
     m._grid_src[key] = src
 
 
 def _grid_src(m, key):
     return (getattr(m, "_grid_src", None) or {}).get(key)
+
+
+def in_exp_on(cfg):
+    """True when the a/w shared-exponent register is modelled at all."""
+    return cfg.get("in_exp_mode", "off") != "off" and cfg.get("in_exp_bits") is not None
+
+
+def _e_layer_min_floor(st, cfg, fmt, e_base_a, e_base_w):
+    """Lowest accumulator grid the layer may use, or None for no floor.
+
+    - in_exp: no block is below its base, so no product is below
+      (e_base_a - bias) + (e_base_w - bias).
+    - acc_headroom_bits h: |product| < 2^(Ea_max + Ew_max + 2) and
+      |out| < 2^(floor(log2 max|out|) + 1) must fit a signed `bits` word
+      with h spare bits: e >= top - (bits - 1) + h.
+    """
+    _, mant_bias, _, _ = _int_format_params(fmt)
+    floors = []
+    if in_exp_on(cfg) and e_base_a is not None and e_base_w is not None:
+        floors.append(int(e_base_a) + int(e_base_w) - 2 * mant_bias)
+    h = cfg.get("acc_headroom_bits")
+    ea, ew = floor_log2(st.in_absmax or 0), floor_log2(st.w_absmax or 0)
+    if h is not None and ea is not None and ew is not None:
+        top = ea + ew + 2
+        eo = floor_log2(st.out_absmax or 0)
+        if eo is not None:
+            top = max(top, eo + 1)
+        floors.append(top - (int(cfg.get("bits", 48)) - 1) + int(h))
+    return max(floors) if floors else None
 
 
 def calibrate_e_layer_min(model, data_iter, num_batches=8, forward_fn=None,
@@ -889,7 +956,8 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
     all_hw = [m for m in model.modules() if isinstance(m, MXConv2dHW)]
     layers = all_hw if force else [
         m for m in all_hw
-        if m.e_layer_min is None or getattr(m, "e_qa_out", None) is None]
+        if m.e_layer_min is None or getattr(m, "e_qa_out", None) is None
+        or (in_exp_on(_get_xblock_cfg(m)) and m.e_base_a is None)]
     states = {}
     if layers:
         was_training = model.training
@@ -918,8 +986,21 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
         win_bits = resolve_out_window_bits(cfg, m.mx_specs['a_elem_format'])
         margin = (int(cfg.get("out_margin_bits", 0)) if margin_bits is None
                   else int(margin_bits))
+        fmt = m.mx_specs['a_elem_format']
+        _, mant_bias, _, _ = _int_format_params(fmt)
+        span = None
+        if in_exp_on(cfg):
+            span = (1 << int(cfg["in_exp_bits"])) - 1
+            if force or m.e_base_a is None:
+                _set_grid(m, "e_base_a", floor_log2(st.in_absmax) - span, "calib")
+        e_base_w = m.e_base_w
+        if span is not None and e_base_w is None:
+            e_base_w = floor_log2(st.w_absmax) - span   # live in forward
         if force or m.e_layer_min is None:
-            _set_grid(m, "e_layer_min", st.running_min, "calib")
+            floor = _e_layer_min_floor(st, cfg, fmt, m.e_base_a if span is not None
+                                       else None, e_base_w)
+            e_min = st.running_min if floor is None else max(st.running_min, floor)
+            _set_grid(m, "e_layer_min", e_min, "calib")
         if force or m.e_qa_out is None:
             e_out = e_qa_out_from_absmax(st.out_absmax or 0.0, win_bits, margin)
             _set_grid(m, "e_qa_out", m.e_layer_min if e_out is None else e_out,
@@ -929,11 +1010,16 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
         # positive gap means the input spans more than win_bits bits.
         e_in_max = e_qa_out_from_absmax(st.in_absmax or 0.0, win_bits)
         gap = None if e_in_max is None else e_in_max - st.min_e_qa_in
+        # Exponent codes each operand spans (a 4b register holds 16).
+        ea_max, ew_max = floor_log2(st.in_absmax), floor_log2(st.w_absmax)
+        a_codes = None if ea_max is None else ea_max - (st.min_e_qa_in + mant_bias) + 1
+        w_codes = None if ew_max is None else ew_max - (st.min_e_qw + mant_bias) + 1
         result[name] = dict(
             e_layer_min=int(m.e_layer_min), e_qa_out=m.e_qa_out,
             shift_out=m.e_qa_out - int(m.e_layer_min),
             e_qa_in=st.min_e_qa_in, e_qw=st.min_e_qw, in_fill_gap=gap,
-            win_bits=win_bits,
+            win_bits=win_bits, a_codes=a_codes, w_codes=w_codes,
+            e_base_a=m.e_base_a, e_base_w=e_base_w if span is not None else None,
             src={k: _grid_src(m, k) for k in ("e_layer_min", "e_qa_out")},
         )
     if verbose:
@@ -945,7 +1031,10 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
                   f"e_qa_out={r['e_qa_out']}[{src['e_qa_out']}] "
                   f"shift_out={r['shift_out']} "
                   f"win_bits={r['win_bits']} "
-                  f"in_fill_gap={r['in_fill_gap']}")
+                  f"in_fill_gap={r['in_fill_gap']} "
+                  f"codes a={r.get('a_codes')} w={r.get('w_codes')}"
+                  + (f" e_base_a={r['e_base_a']} e_base_w={r['e_base_w']}"
+                     if r.get('e_base_a') is not None else ""))
     return result
 
 
@@ -969,10 +1058,17 @@ def export_hw_grids(model):
             continue
         win_bits = resolve_out_window_bits(_get_xblock_cfg(m),
                                            m.mx_specs['a_elem_format'])
-        grids[name] = check_hw_grid(name, dict(
+        entry = dict(
             e_layer_min=int(m.e_layer_min), e_qa_out=int(m.e_qa_out),
             win_bits=win_bits, shift_out=int(m.e_qa_out) - int(m.e_layer_min),
-        ))
+        )
+        if in_exp_on(_get_xblock_cfg(m)):
+            if m.e_base_a is None:
+                missing.append(name)
+                continue
+            entry["e_base_a"] = int(m.e_base_a)
+            entry["e_base_w"] = int(m.weight_exp_base())
+        grids[name] = check_hw_grid(name, entry)
     if missing:
         raise ValueError(f"export_hw_grids: {len(missing)} layers have no grids "
                          f"(run calibrate_hw_grids first): {missing[:5]}")

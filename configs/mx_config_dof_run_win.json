@@ -13,6 +13,7 @@
       "sat_mode": "per_product",
       "e_layer_min": null,
       "out_window": "infer",
+      "acc_headroom_bits": 2,
       "weight_blockify": "flatten",
       "act_blockify": "xblock",
       "backend": "triton",

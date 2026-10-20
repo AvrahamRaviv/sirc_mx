@@ -10,6 +10,7 @@ _VALID_ACT_BLOCKIFY = ("channel", "xblock")
 _VALID_NPE_TRITON_VARIANTS = ("reuse", "opt")
 _VALID_OUT_WINDOW = ("off", "infer", "always")
 _VALID_OUT_ROUND = ("floor", "nearest")
+_VALID_IN_EXP_MODE = ("off", "infer", "always")
 
 
 def validate_xblock_accum_bits(bits):
@@ -160,6 +161,18 @@ XBLOCK_ACCUM_DEFAULTS = {
     "out_margin_bits": 0,         # headroom added to e_qa_out at calibration
     "e_qa_out": None,             # int; output window grid for every layer of this spec.
                                   # Per-layer values go in the config's "hw_grids".
+    # Accumulator headroom (calibration only): floor e_layer_min so the largest
+    # product and the output fit in `bits` with this many spare bits. None =
+    # pure min block exponent (a wide-range input can then overflow the acc).
+    "acc_headroom_bits": None,
+    # HW shared-exponent register for inputs/weights: per tensor only
+    # 2^in_exp_bits block exponents, [e_base, e_base + 2^in_exp_bits - 1].
+    # Blocks below re-round to the e_base step, above saturate. e_base =
+    # max block exp - (2^in_exp_bits - 1) (anchored at the max); inputs
+    # calibrated (hw_grids e_base_a), weights from the weights (e_base_w).
+    "in_exp_bits": None,          # None = unlimited (microxcaling scale_bits only)
+    "in_exp_mode": "off",         # 'off', 'infer' (eval only) or 'always' (train too;
+                                  # backward stays STE)
 }
 
 
@@ -275,6 +288,30 @@ def normalize_xblock_accum(value):
                 f"xblock_accum.out_exp_bits must be int in [1, 5], "
                 f"got {cfg['out_exp_bits']!r}"
             )
+        if cfg["acc_headroom_bits"] is not None and (
+                isinstance(cfg["acc_headroom_bits"], bool)
+                or not isinstance(cfg["acc_headroom_bits"], int)
+                or cfg["acc_headroom_bits"] < 0):
+            raise ValueError(
+                f"xblock_accum.acc_headroom_bits must be None or a non-negative "
+                f"int, got {cfg['acc_headroom_bits']!r}"
+            )
+        if cfg["in_exp_bits"] is not None and (
+                isinstance(cfg["in_exp_bits"], bool)
+                or not isinstance(cfg["in_exp_bits"], int)
+                or not 1 <= cfg["in_exp_bits"] <= 8):
+            raise ValueError(
+                f"xblock_accum.in_exp_bits must be None or int in [1, 8], "
+                f"got {cfg['in_exp_bits']!r}"
+            )
+        if cfg["in_exp_mode"] not in _VALID_IN_EXP_MODE:
+            raise ValueError(
+                f"xblock_accum.in_exp_mode must be in {_VALID_IN_EXP_MODE}, "
+                f"got {cfg['in_exp_mode']!r}"
+            )
+        if cfg["in_exp_mode"] != "off" and cfg["in_exp_bits"] is None:
+            raise ValueError(
+                "xblock_accum.in_exp_mode is on but in_exp_bits is None")
         if not isinstance(cfg["out_margin_bits"], int) or cfg["out_margin_bits"] < 0:
             raise ValueError(
                 f"xblock_accum.out_margin_bits must be a non-negative int, "
