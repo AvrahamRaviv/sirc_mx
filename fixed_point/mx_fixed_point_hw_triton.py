@@ -9,6 +9,10 @@ K/bs reduction so the HW pipeline is emulated lane-by-lane.
 Operands are promoted to int32 in the launcher so a single kernel
 handles every MXINT format (int8..int16); product math runs in int64.
 
+With APPLY_WIN the static output window (`mx_fixed_point_hw._apply_out_window`)
+runs on the int64 word before the fp32 cast; its constants come from
+`_window_params`, shared with the torch ref.
+
 Importable without Triton (gated on `_TRITON_AVAILABLE`).
 """
 
@@ -51,10 +55,14 @@ if _TRITON_AVAILABLE:
         lo,             # i64
         hi,             # i64
         inv_scale_ref,  # fp32  = 2^e_layer_min
+        win_sat_ptr,    # *i8,  [M, O]  (only written if APPLY_WIN)
+        win_rshift, win_lshift, win_round_add, win_hi, win_pre_hi,  # i64
+        out_scale,      # fp32  = 2^e_qa_out
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         SAT_PER_PRODUCT: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        APPLY_WIN: tl.constexpr,
     ):
         pid_m = tl.program_id(axis=0)
         pid_o = tl.program_id(axis=1)
@@ -133,8 +141,18 @@ if _TRITON_AVAILABLE:
             acc = tl.where(over, hi, acc)
             acc = tl.where(under, lo, acc)
 
-        out = acc.to(tl.float32) * inv_scale_ref
         out_off = offs_m * O + pid_o
+        if APPLY_WIN:
+            v = (acc + win_round_add) >> win_rshift
+            w_over = v > win_pre_hi
+            w_under = v < -win_pre_hi
+            v = v << win_lshift
+            v = tl.where(w_over, win_hi, v)
+            v = tl.where(w_under, -win_hi, v)
+            out = v.to(tl.float32) * out_scale
+            tl.store(win_sat_ptr + out_off, (w_over | w_under).to(tl.int8), mask=mask_m)
+        else:
+            out = acc.to(tl.float32) * inv_scale_ref
         tl.store(out_ptr + out_off, out, mask=mask_m)
         tl.store(sat_ptr + out_off, sat.to(tl.int8), mask=mask_m)
 
@@ -153,9 +171,13 @@ if _TRITON_AVAILABLE:
         lo,             # i64
         hi,             # i64
         inv_scale_ref,  # fp32 = 2^e_layer_min
+        win_sat_ptr,    # *i8,  [M, O]  (only written if APPLY_WIN)
+        win_rshift, win_lshift, win_round_add, win_hi, win_pre_hi,  # i64
+        out_scale,      # fp32  = 2^e_qa_out
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        APPLY_WIN: tl.constexpr,
     ):
         """NPE kernel: independent per-lane exponents (no lane sharing). Loop
         order kb -> j -> kk (cin = kb*BS + j outer, kk inner) reproduces the
@@ -214,10 +236,37 @@ if _TRITON_AVAILABLE:
             acc = tl.where(over, hi, acc)
             acc = tl.where(under, lo, acc)
 
-        out = acc.to(tl.float32) * inv_scale_ref
         out_off = offs_m * O + pid_o
+        if APPLY_WIN:
+            v = (acc + win_round_add) >> win_rshift
+            w_over = v > win_pre_hi
+            w_under = v < -win_pre_hi
+            v = v << win_lshift
+            v = tl.where(w_over, win_hi, v)
+            v = tl.where(w_under, -win_hi, v)
+            out = v.to(tl.float32) * out_scale
+            tl.store(win_sat_ptr + out_off, (w_over | w_under).to(tl.int8), mask=mask_m)
+        else:
+            out = acc.to(tl.float32) * inv_scale_ref
         tl.store(out_ptr + out_off, out, mask=mask_m)
         tl.store(sat_ptr + out_off, sat.to(tl.int8), mask=mask_m)
+
+
+def _window_launch_args(e_layer_min, e_qa_out, win_bits, out_round, M, O, device):
+    """(win_sat buffer, scalar args, APPLY_WIN) for a kernel launch."""
+    from .mx_fixed_point_hw import _window_params
+    if e_qa_out is None:
+        return torch.empty(1, dtype=torch.int8, device=device), (0, 0, 0, 0, 0, 1.0), 0
+    rshift, lshift, round_add, win_hi, pre_hi = _window_params(
+        e_layer_min, e_qa_out, win_bits, out_round)
+    win_sat = torch.zeros((M, O), dtype=torch.int8, device=device)
+    return win_sat, (rshift, lshift, round_add, win_hi, pre_hi,
+                     float(2.0 ** int(e_qa_out))), 1
+
+
+def _fill_win_sink(win_sink, win_sat, B, L, O):
+    if win_sink is not None and win_sat.numel() == B * L * O:
+        win_sink["win_sat"] = win_sat.view(B, L, O).transpose(1, 2).contiguous().to(torch.bool)
 
 
 def _prepare_tensors(qi_i8, qw_i8, Ea, Ew, stride, padding, dilation):
@@ -271,6 +320,7 @@ def _hw_fxp_conv2d_triton(
     bs, bits, sat_mode,
     bias_fp=None,
     mant_bias=6,
+    e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
 ):
     _require_triton_cuda()
     if not qi_i8.is_cuda:
@@ -306,6 +356,9 @@ def _hw_fxp_conv2d_triton(
     else:
         bias_int = torch.empty(O, dtype=torch.int64, device=device)
 
+    win_sat, win_args, apply_win = _window_launch_args(
+        e_layer_min, e_qa_out, win_bits, out_round, M, O, device)
+
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
 
@@ -313,12 +366,14 @@ def _hw_fxp_conv2d_triton(
         qi_flat, qw_flat, Ea_flat, Ew_flat, bias_int, out, sat,
         M, O, nb, kK,
         int(e_layer_min), int(two_bias), int(lo), int(hi), inv_scale_ref,
+        win_sat, *win_args,
         BLOCK_M=BLOCK_M, BS=bs, SAT_PER_PRODUCT=sat_per_product,
-        HAS_BIAS=1 if has_bias else 0,
+        HAS_BIAS=1 if has_bias else 0, APPLY_WIN=apply_win,
     )
 
     # Caller reshapes to [B, O, H_out, W_out]. We return [B, O, L] and sat [B, O, L].
     B = qi_i8.shape[0]
+    _fill_win_sink(win_sink, win_sat, B, L, O)
     out_view = out.view(B, L, O).transpose(1, 2).contiguous()   # [B, O, L]
     sat_view = sat.view(B, L, O).transpose(1, 2).contiguous().to(torch.bool)  # [B, O, L]
     return out_view, sat_view
@@ -381,6 +436,7 @@ def _hw_fxp_conv2d_triton_npe(
     bias_fp=None,
     mant_bias=6,
     BS=32,
+    e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
 ):
     """Dedicated NPE triton path (per-lane exponents, BS-tiled). Bit-identical
     to the torch ref and the bs=1 reuse path; here for cross-verification.
@@ -420,6 +476,9 @@ def _hw_fxp_conv2d_triton_npe(
     else:
         bias_int = torch.empty(O, dtype=torch.int64, device=device)
 
+    win_sat, win_args, apply_win = _window_launch_args(
+        e_layer_min, e_qa_out, win_bits, out_round, M, O, device)
+
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
 
@@ -427,11 +486,13 @@ def _hw_fxp_conv2d_triton_npe(
         qi_flat, qw_flat, Ea_flat, Ew_flat, bias_int, out, sat,
         M, O, nb, kK,
         int(e_layer_min), int(two_bias), int(lo), int(hi), inv_scale_ref,
+        win_sat, *win_args,
         BLOCK_M=BLOCK_M, BS=BS,
-        HAS_BIAS=1 if has_bias else 0,
+        HAS_BIAS=1 if has_bias else 0, APPLY_WIN=apply_win,
     )
 
     B = qi_i8.shape[0]
+    _fill_win_sink(win_sink, win_sat, B, L, O)
     out_view = out.view(B, L, O).transpose(1, 2).contiguous()
     sat_view = sat.view(B, L, O).transpose(1, 2).contiguous().to(torch.bool)
     return out_view, sat_view

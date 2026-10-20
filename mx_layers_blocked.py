@@ -29,7 +29,7 @@ from microxcaling.mx.mx_ops import quantize_mx_op as _quantize_mx_op_raw
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
-from fixed_point.mx_fixed_point_hw import hw_fxp_conv2d
+from fixed_point.mx_fixed_point_hw import hw_fxp_conv2d, resolve_out_window_bits
 
 
 def quantize_mx_op(x, *args, **kwargs):
@@ -193,6 +193,25 @@ class MXConv2dBlocked(MXConv2d):
         return out
 
 
+def _reset_hw_call_counts(root, args):
+    """Forward pre-hook on the quantized root: a new forward starts, every
+    MXConv2dHW in it is uncalled. A module function (not a closure) so the
+    hook survives deepcopy / DataParallel replication of the root."""
+    for m in root.modules():
+        if isinstance(m, MXConv2dHW):
+            m._win_calls = 0
+
+
+def install_hw_call_guard(model):
+    """Make an eval-mode forward fail loudly when an MXConv2dHW with the
+    output window on is called twice: one hw_grids entry holds one grid, and
+    a second call site would silently reuse it. Idempotent. Train mode is not
+    checked, so gradient checkpointing (which re-runs forwards) is safe."""
+    if getattr(model, "_hw_call_guard", None) is None:
+        model._hw_call_guard = model.register_forward_pre_hook(_reset_hw_call_counts)
+    return model
+
+
 class MXConv2dHW(MXConv2d):
     """HW-faithful fixed-point MXConv2d emulation.
 
@@ -208,11 +227,19 @@ class MXConv2dHW(MXConv2d):
         freeze. Alternatively, set via `xblock_accum.e_layer_min` in config.
       - `a_elem_format` / `w_elem_format` must be 'int8' (the HW pipeline is
         integer-only).
+      - `xblock_accum.out_window` ('off' | 'infer' | 'always') applies the
+        static output window at `e_qa_out` ('infer' = eval mode only). Needs
+        `e_qa_out`: run `mx_fixed_point_hw.calibrate_hw_grids(model, loader)`.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.e_layer_min = None
+        self.e_qa_out = None            # output window grid (calibrate_hw_grids)
+        # Where each grid came from: 'config' (hw_grids / xblock_accum) or
+        # 'calib'. A config value is never replaced unless calibration is forced.
+        self._grid_src = {"e_layer_min": None, "e_qa_out": None}
+        self._win_calls = None          # set per root forward by install_hw_call_guard
         self._mx_layer_name = None
         self._hw_logged = False
         self._pad_logged = False
@@ -223,15 +250,19 @@ class MXConv2dHW(MXConv2d):
         # Sampling-window counters (reset every verbose_sample_every forwards).
         self._sat_total_window = 0
         self._sat_seen_window = 0
+        self._win_sat_seen_life = 0     # outputs clipped by the output window
         # Opt-in taps for the single-layer simulator: when set, the forward
         # keeps the MX-quantized operands it fed the accumulator (qi, qw: any
         # backend) and the int64 accumulator word + per-output saturation map
-        # (python backend only) of the last call.
+        # (python backend only) of the last call. With the output window on,
+        # also the int64 window word O (any backend) + its saturation map.
         self._tap_acc = False
         self._last_qi = None
         self._last_qw = None
         self._last_acc = None
         self._last_sat = None
+        self._last_win = None
+        self._last_win_sat = None
 
     def forward(self, x):
         if self.mx_none:
@@ -315,7 +346,9 @@ class MXConv2dHW(MXConv2d):
         if cal is not None:
             cal.update(qi, qw, bs, fmt=a_fmt,
                        act_blockify=act_blockify, weight_blockify=weight_blockify)
-            return self._fp32_blocked_forward(qi, qw, bf_bias, H, W)
+            out = self._fp32_blocked_forward(qi, qw, bf_bias, H, W)
+            cal.update_out(out)
+            return out
 
         cfg = _get_xblock_cfg(self)
         e_min = self.e_layer_min if self.e_layer_min is not None else cfg.get('e_layer_min')
@@ -327,13 +360,31 @@ class MXConv2dHW(MXConv2d):
             )
 
         name = self._mx_layer_name or f"conv-{id(self):x}"
+        win_mode = cfg.get('out_window', 'off')
+        apply_win = (win_mode == 'always'
+                     or (win_mode == 'infer' and not self.training))
+        if apply_win and self.e_qa_out is None:
+            raise RuntimeError(
+                f"MXConv2dHW {name}: out_window={win_mode!r} needs e_qa_out. "
+                f"Run `calibrate_hw_grids(model, loader)` first."
+            )
+        e_qa_out = int(self.e_qa_out) if apply_win else None
+        if apply_win and not self.training and self._win_calls is not None:
+            self._win_calls += 1
+            if self._win_calls > 1:
+                raise RuntimeError(
+                    f"MXConv2dHW {name}: called {self._win_calls} times in one "
+                    f"forward with the output window on. hw_grids holds one "
+                    f"grid per layer; a second call site would reuse it."
+                )
         if verbose >= 2 and not self._hw_logged:
             print(
                 f"[MXConv2dHW {name}] HW path active | "
                 f"in={C} out={qw.shape[0]} k={tuple(self.kernel_size)} "
                 f"stride={tuple(self.stride)} pad={tuple(self.padding)} | "
                 f"bits={cfg['bits']} sat_mode={cfg['sat_mode']} "
-                f"e_layer_min={int(e_min)} backend={cfg['backend']}"
+                f"e_layer_min={int(e_min)} backend={cfg['backend']} "
+                f"out_window={win_mode} e_qa_out={self.e_qa_out}"
             )
             self._hw_logged = True
 
@@ -354,10 +405,16 @@ class MXConv2dHW(MXConv2d):
             act_blockify=act_blockify,
             weight_blockify=weight_blockify,
             npe_triton_variant=cfg.get('npe_triton_variant', 'reuse'),
+            e_qa_out=e_qa_out,
+            win_bits=resolve_out_window_bits(cfg, a_fmt) if apply_win else None,
+            out_round=cfg.get('out_round', 'floor'),
         )
         if self._tap_acc:
             self._last_acc = stats.get('acc')
             self._last_sat = stats.get('sat_map')
+            self._last_win = stats.get('win')
+            self._last_win_sat = stats.get('win_sat_map')
+        self._win_sat_seen_life += int(stats.get('win_sat_count', 0))
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))
         self._fwd_count += 1

@@ -20,11 +20,14 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum
+from fixed_point.mx_fixed_point_hw import export_hw_grids, resolve_out_window_bits
+from fixed_point.hw_grids import check_hw_grid, load_hw_grids
 from fixed_point.fxp_quant import (
     fake_quant_fxp, fxp_clip_stats, fxp_format_str, fxp_stats_value,
     normalize_out_quant,
 )
-from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
+from mx_layers_blocked import (MXConv2dBlocked, MXLinearBlocked, MXConv2dHW,
+                               install_hw_call_guard)
 from mx_layers_act import MXActQuant
 from mx_stats import collect_stats as _collect_stats_impl
 import mx_assign as _mxa
@@ -176,6 +179,18 @@ class MXQuantizer:
     number that matters, since a static scale (unlike MX) can overflow.
     "outputs" (default "all") selects indices when the module returns a tuple.
 
+    7. Static HW grids per layer (MXConv2dHW, xblock_accum.mode hw_fixed_point):
+    {
+        "hw_grids": {
+            "layer1.conv1": {"e_layer_min": -16, "e_qa_out": -20,
+                             "win_bits": 22, "shift_out": -4}
+        },
+        "layers": [...]
+    }
+    Names as in "layers". hw_grids[name] beats xblock_accum.e_layer_min /
+    e_qa_out; calibrate_hw_grids fills only what neither sets. Written once
+    offline by save_hw_grids (<stem>_grids.json); see fixed_point/hw_grids.py.
+
     Priority (highest to lowest): per-layer mx_specs > group > global mx_specs > defaults
     Note: scale_bits is shared between weights and activations (library limitation).
     """
@@ -183,9 +198,11 @@ class MXQuantizer:
     # GPTQ damping factor: fraction of mean diagonal to add for numerical stability
     _GPTQ_DAMPING = 0.01
 
-    def __init__(self, save_dir, log=None):
+    def __init__(self, save_dir, log=None, config_path=None):
         self.save_dir = save_dir
-        self.config_path = os.path.join(save_dir, "mx_config.json")
+        # `config_path` reads a config other than <save_dir>/mx_config.json,
+        # e.g. the <stem>_grids.json written by save_hw_grids.
+        self.config_path = config_path or os.path.join(save_dir, "mx_config.json")
         self.config = self._load_config()
         self._last_plan = None        # set by plan_mixed_precision, read by quant
         if log is not None:
@@ -278,6 +295,7 @@ class MXQuantizer:
             self._replace_layers(model, layer_map=layer_map)
         else:
             self._replace_layers(model)
+        self._check_hw_grids(model)
 
         if data is not None and ptq_enabled:
             self._ptq(model, data, forward_fn, log, ptq_batches)
@@ -1338,11 +1356,66 @@ class MXQuantizer:
 
         if isinstance(new, MXConv2dHW):
             new._mx_layer_name = name
-            cfg_e = getattr(mx_specs, 'xblock_accum', {}).get('e_layer_min')
-            if cfg_e is not None:
-                new.e_layer_min = int(cfg_e)
+            self._load_hw_grid(new, name, getattr(mx_specs, 'xblock_accum', None) or {})
 
         return new
+
+    def _load_hw_grid(self, layer, name, xcfg):
+        """Static grids of one MXConv2dHW from the config. Priority:
+        hw_grids[name] > xblock_accum.e_layer_min / e_qa_out. What is still
+        None after this is left for calibrate_hw_grids (offline)."""
+        for key in ("e_layer_min", "e_qa_out"):
+            if xcfg.get(key) is not None:
+                layer._grid_src[key] = "config"
+                setattr(layer, key, int(xcfg[key]))
+        entry = load_hw_grids(self.config).get(name)
+        if entry is None:
+            return
+        win_bits = None
+        if 'win_bits' in entry:
+            win_bits = resolve_out_window_bits(xcfg, layer.mx_specs['a_elem_format'])
+        check_hw_grid(name, entry, win_bits=win_bits)
+        for key in ("e_layer_min", "e_qa_out"):
+            setattr(layer, key, int(entry[key]))
+            layer._grid_src[key] = "config"
+
+    def _check_hw_grids(self, model):
+        """Every hw_grids name must be an MXConv2dHW of this model: a typo or a
+        layer that fell back to another class would otherwise be ignored.
+        Also arms the one-call-per-forward guard for the output window."""
+        hw_names = {m._mx_layer_name for m in model.modules()
+                    if isinstance(m, MXConv2dHW)}
+        unknown = sorted(set(load_hw_grids(self.config)) - hw_names)
+        if unknown:
+            raise ValueError(
+                f"hw_grids names {unknown[:5]} are not MXConv2dHW layers of this "
+                f"model ({len(unknown)} unknown). Check the names against "
+                f"'layers' and that those layers took the HW path.")
+        if hw_names:
+            install_hw_call_guard(model)
+
+    def save_hw_grids(self, model, path=None, overwrite=False):
+        """Write the loaded config plus a "hw_grids" section holding every
+        MXConv2dHW's grids (see fixed_point.hw_grids). Calibration runs once
+        offline (calibrate_hw_grids); inference and the sim read this file.
+
+        Default path: <source config stem>_grids.json next to the source
+        config. An existing file is kept unless `overwrite=True`. Returns the
+        path written.
+        """
+        if self.config is None:
+            raise ValueError("save_hw_grids: no config loaded")
+        if path is None:
+            path = os.path.splitext(self.config_path)[0] + "_grids.json"
+        if os.path.exists(path) and not overwrite:
+            raise FileExistsError(f"save_hw_grids: {path} exists; pass "
+                                  f"overwrite=True to replace it")
+        out = copy.deepcopy(self.config)
+        out["hw_grids"] = export_hw_grids(model)
+        with open(path, "w") as f:
+            json.dump(out, f, indent=2)
+            f.write("\n")
+        return path
 
     # =========================
     # Replacement logic

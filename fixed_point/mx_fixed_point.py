@@ -8,6 +8,8 @@ _VALID_SAT_MODES = ("per_product", "per_block")
 _VALID_WEIGHT_BLOCKIFY = ("channel", "flatten")
 _VALID_ACT_BLOCKIFY = ("channel", "xblock")
 _VALID_NPE_TRITON_VARIANTS = ("reuse", "opt")
+_VALID_OUT_WINDOW = ("off", "infer", "always")
+_VALID_OUT_ROUND = ("floor", "nearest")
 
 
 def validate_xblock_accum_bits(bits):
@@ -145,6 +147,19 @@ XBLOCK_ACCUM_DEFAULTS = {
                                   # 2 = full per-forward / per-layer logging.
     "verbose_sample_every": 100,  # at verbose=1, emit one saturation summary per N forwards
                                   # per layer (only if non-zero saturation observed).
+    # Static output window (hw_fixed_point only): O = N >> (e_qa_out - e_layer_min),
+    # saturated to +-(2^win_bits - 1). e_qa_out comes from calibrate_hw_grids.
+    "out_window": "off",          # 'off' (fp32 cast of the acc), 'infer' (window in eval mode
+                                  # only), 'always' (train too; backward stays STE either way)
+    "out_window_bits": None,      # magnitude bits kept by the window. None = derive what
+                                  # the output MX block can address: (mbits-1) +
+                                  # (2^out_exp_bits - 1); int8 + 4b exp -> 22
+    "out_exp_bits": 4,            # HW output shared-exponent width (all 2^bits codes usable)
+    "out_round": "floor",         # bits dropped below the window: 'floor' (arithmetic shift)
+                                  # or 'nearest' (round half up)
+    "out_margin_bits": 0,         # headroom added to e_qa_out at calibration
+    "e_qa_out": None,             # int; output window grid for every layer of this spec.
+                                  # Per-layer values go in the config's "hw_grids".
 }
 
 
@@ -231,6 +246,39 @@ def normalize_xblock_accum(value):
             raise ValueError(
                 f"xblock_accum.npe_triton_variant must be in "
                 f"{_VALID_NPE_TRITON_VARIANTS}, got {cfg['npe_triton_variant']!r}"
+            )
+        if cfg["e_qa_out"] is not None and (
+                isinstance(cfg["e_qa_out"], bool) or not isinstance(cfg["e_qa_out"], int)):
+            raise TypeError(
+                f"xblock_accum.e_qa_out must be None or int, "
+                f"got {type(cfg['e_qa_out']).__name__}"
+            )
+        if cfg["out_window"] not in _VALID_OUT_WINDOW:
+            raise ValueError(
+                f"xblock_accum.out_window must be in {_VALID_OUT_WINDOW}, "
+                f"got {cfg['out_window']!r}"
+            )
+        if cfg["out_round"] not in _VALID_OUT_ROUND:
+            raise ValueError(
+                f"xblock_accum.out_round must be in {_VALID_OUT_ROUND}, "
+                f"got {cfg['out_round']!r}"
+            )
+        if cfg["out_window_bits"] is not None and (
+                not isinstance(cfg["out_window_bits"], int)
+                or not 1 <= cfg["out_window_bits"] <= 46):
+            raise ValueError(
+                f"xblock_accum.out_window_bits must be None (derive) or int in "
+                f"[1, 46], got {cfg['out_window_bits']!r}"
+            )
+        if not isinstance(cfg["out_exp_bits"], int) or not 1 <= cfg["out_exp_bits"] <= 5:
+            raise ValueError(
+                f"xblock_accum.out_exp_bits must be int in [1, 5], "
+                f"got {cfg['out_exp_bits']!r}"
+            )
+        if not isinstance(cfg["out_margin_bits"], int) or cfg["out_margin_bits"] < 0:
+            raise ValueError(
+                f"xblock_accum.out_margin_bits must be a non-negative int, "
+                f"got {cfg['out_margin_bits']!r}"
             )
         # Phase 1 supports only the two documented combinations.
         _combo = (cfg["act_blockify"], cfg["weight_blockify"])
