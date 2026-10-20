@@ -39,7 +39,7 @@ class _TwiceNet(_Net):
         return self.c2(torch.relu(self.c1(torch.relu(self.c1(x)))))
 
 
-def _write_cfg(tmp, hw_grids=None, **xblock):
+def _write_cfg(tmp, hw_grids=None, top=None, **xblock):
     xb = {"enabled": True, "mode": "hw_fixed_point", "bits": 48,
           "backend": "python", "sat_mode": "per_product",
           "e_layer_min": None, "out_window": "infer", "verbose": 0}
@@ -50,6 +50,7 @@ def _write_cfg(tmp, hw_grids=None, **xblock):
            "layers": ["c1", "c2"], "ptq": False, "measure_error": False}
     if hw_grids is not None:
         cfg["hw_grids"] = hw_grids
+    cfg.update(top or {})
     with open(os.path.join(tmp, "mx_config.json"), "w") as f:
         json.dump(cfg, f)
     return cfg
@@ -233,6 +234,66 @@ def test_single_call_passes_every_forward():
     model = _quant(tmp)
     for x in _data(3):
         _eval(model, x)                          # counter resets per forward
+
+
+# ---------------------------------------------------------------------------
+# quant() calibration step ("calibrate_hw_grids" config key)
+# ---------------------------------------------------------------------------
+
+CAL = {"calibrate_hw_grids": {"enabled": True, "batches": 2, "verbose": 0}}
+
+
+def test_quant_calibrates_and_saves():
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp, top=CAL)
+    model = MXQuantizer(save_dir=tmp).quant(_Net(), data=_data(),
+                                            forward_fn=lambda m, b: m(b))
+    for m in (model.c1, model.c2):
+        assert m.e_layer_min is not None and m.e_qa_out is not None
+        assert m._grid_src == {"e_layer_min": "calib", "e_qa_out": "calib"}
+    path = os.path.join(tmp, "mx_config_grids.json")
+    assert set(load_hw_grids(path)) == {"c1", "c2"}
+    x = _data(1, seed=9)[0]
+    y = _eval(model, x)
+    # Inference from the saved file: no data, no calibration, same output.
+    model2 = _quant(tmp, config_path=path)
+    assert model2.c1._grid_src == {"e_layer_min": "config", "e_qa_out": "config"}
+    assert torch.equal(_eval(model2, x), y)
+
+
+def test_quant_calibration_keeps_existing_file():
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp, top=CAL)
+    path = os.path.join(tmp, "mx_config_grids.json")
+    with open(path, "w") as f:
+        f.write("{}")
+    MXQuantizer(save_dir=tmp).quant(_Net(), data=_data())
+    with open(path) as f:
+        assert f.read() == "{}"
+
+
+def test_quant_calibration_needs_data():
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp, top=CAL)
+    with pytest.raises(ValueError, match="no data"):
+        _quant(tmp)
+
+
+def test_quant_calibration_noop_when_config_sets_all():
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp, hw_grids={"c1": GRID_C1, "c2": GRID_C1}, top=CAL)
+    model = _quant(tmp)                          # no data needed
+    assert model.c2.e_qa_out == -19
+    assert not os.path.exists(os.path.join(tmp, "mx_config_grids.json"))
+
+
+def test_quant_calibration_off_by_default_and_bad_key():
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp)
+    assert _quant(tmp).c1.e_layer_min is None    # no key -> no calibration
+    _write_cfg(tmp, top={"calibrate_hw_grids": {"batch": 2}})
+    with pytest.raises(ValueError, match="unknown keys"):
+        _quant(tmp)
 
 
 # ---------------------------------------------------------------------------

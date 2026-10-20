@@ -20,7 +20,8 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum
-from fixed_point.mx_fixed_point_hw import export_hw_grids, resolve_out_window_bits
+from fixed_point.mx_fixed_point_hw import (calibrate_hw_grids, export_hw_grids,
+                                           resolve_out_window_bits)
 from fixed_point.hw_grids import check_hw_grid, load_hw_grids
 from fixed_point.fxp_quant import (
     fake_quant_fxp, fxp_clip_stats, fxp_format_str, fxp_stats_value,
@@ -191,6 +192,16 @@ class MXQuantizer:
     e_qa_out; calibrate_hw_grids fills only what neither sets. Written once
     offline by save_hw_grids (<stem>_grids.json); see fixed_point/hw_grids.py.
 
+    8. Calibrate missing HW grids inside quant() (trainer passes data/forward_fn):
+    {
+        "calibrate_hw_grids": {"enabled": true, "batches": 8, "save": true},
+        "layers": [...]
+    }
+    Shorthand: "calibrate_hw_grids": true. Runs after layer replacement,
+    before PTQ, on the data/forward_fn given to quant(). Fills only grids the
+    config left None, then writes <save_dir>/mx_config_grids.json (an
+    existing file is kept). Copy that file over mx_config.json for inference.
+
     Priority (highest to lowest): per-layer mx_specs > group > global mx_specs > defaults
     Note: scale_bits is shared between weights and activations (library limitation).
     """
@@ -296,6 +307,7 @@ class MXQuantizer:
         else:
             self._replace_layers(model)
         self._check_hw_grids(model)
+        self._calibrate_hw_grids(model, data, forward_fn, log)
 
         if data is not None and ptq_enabled:
             self._ptq(model, data, forward_fn, log, ptq_batches)
@@ -1393,6 +1405,51 @@ class MXQuantizer:
                 f"'layers' and that those layers took the HW path.")
         if hw_names:
             install_hw_call_guard(model)
+
+    def _calibrate_hw_grids(self, model, data, forward_fn, log):
+        """The "calibrate_hw_grids" config step of quant(): fill the grids the
+        config left None from `data`, then save them (see save_hw_grids).
+        Needs data when any grid is missing; a config that sets every grid
+        makes this a no-op."""
+        cfg = self.config.get("calibrate_hw_grids", False)
+        if isinstance(cfg, bool):
+            cfg = {"enabled": cfg}
+        if not isinstance(cfg, dict):
+            raise TypeError("calibrate_hw_grids must be a bool or a dict, got "
+                            f"{type(cfg).__name__}")
+        unknown = sorted(set(cfg) - {"enabled", "batches", "save", "verbose"})
+        if unknown:
+            raise ValueError(f"calibrate_hw_grids: unknown keys {unknown}")
+        if not cfg.get("enabled", True):
+            return
+        hw = [m for m in model.modules() if isinstance(m, MXConv2dHW)]
+        missing = [m._mx_layer_name for m in hw
+                   if m.e_layer_min is None or m.e_qa_out is None]
+        if not missing:
+            self._log(log, f"calibrate_hw_grids | all {len(hw)} HW layers set "
+                           f"by config, nothing to calibrate")
+            return
+        if data is None:
+            raise ValueError(
+                f"calibrate_hw_grids: {len(missing)} HW layers have no grids "
+                f"(e.g. {missing[0]}) and quant() got no data. Pass "
+                f"data/forward_fn to quant(), or set hw_grids in the config.")
+        batches = int(cfg.get("batches", 8))
+        self._log(log, f"calibrate_hw_grids | {len(missing)} of {len(hw)} HW "
+                       f"layers, {batches} batches")
+        calibrate_hw_grids(model, data, num_batches=batches,
+                           forward_fn=forward_fn,
+                           verbose=int(cfg.get("verbose", 1)))
+        if not cfg.get("save", True):
+            return
+        path = os.path.join(self.save_dir, "mx_config_grids.json")
+        if os.path.exists(path):
+            self._log(log, f"calibrate_hw_grids | {path} exists, kept "
+                           f"(not overwritten)")
+            return
+        self.save_hw_grids(model, path=path)
+        self._log(log, f"calibrate_hw_grids | wrote {path}; copy it over "
+                       f"mx_config.json for inference")
 
     def save_hw_grids(self, model, path=None, overwrite=False):
         """Write the loaded config plus a "hw_grids" section holding every

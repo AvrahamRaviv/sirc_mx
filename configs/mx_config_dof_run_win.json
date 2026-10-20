@@ -80,5 +80,6 @@
 	 "total_bits": 16, "frac_bits": 8, "signed": true,
 	 "round": "half_away", "saturate": true, "clip_grad": false}
   ],
+  "calibrate_hw_grids": {"enabled": true, "batches": 8},
   "ptq": false
 }

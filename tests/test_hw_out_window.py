@@ -428,8 +428,9 @@ def test_config_defaults_and_validation():
                                   "mx_config_dof_run_win.json"])
 def test_opt_in_configs(name):
     with open(os.path.join(REPO, "configs", name)) as f:
-        spec = json.load(f)["mx_specs"]["xblock_accum"]
-    cfg = normalize_xblock_accum(spec)
+        full = json.load(f)
+    assert full["calibrate_hw_grids"]["enabled"] is True
+    cfg = normalize_xblock_accum(full["mx_specs"]["xblock_accum"])
     assert cfg["e_layer_min"] is None
     assert cfg["out_window"] == "infer"
 
