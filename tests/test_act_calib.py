@@ -263,6 +263,49 @@ def test_measure_error_rejects_unknown_key():
 
 
 # ---------------------------------------------------------------------------
+# call-site guard
+# ---------------------------------------------------------------------------
+
+def _fixed_sites(n):
+    return [{**_FEAT, "calibrate": False, "scale": 0.1 * (i + 1)} for i in range(n)]
+
+
+def test_wrong_call_sites_warns_and_does_not_rotate(capsys):
+    cfg = _cfg(feat=_fixed_sites(3), hw=False)
+    cfg["layers"][1]["call_sites"] = 3                  # Net calls warp twice
+    model = MXQuantizer(save_dir=_write(cfg)).quant(Net())
+    model.eval()
+    seen = []
+    orig = model.warp.quant_input
+
+    def spy(x, idx, site=None):
+        if idx == 0:
+            seen.append(site)
+        return orig(x, idx, site)
+
+    model.warp.quant_input = spy
+    x, flow = _data(1)[0]
+    with torch.no_grad():
+        for _ in range(3):
+            model(x, flow)
+    assert seen == [0, 1] * 3                           # no drift across forwards
+    out = capsys.readouterr().out
+    assert out.count("call_sites=3 but was called 2 times") == 1
+
+
+def test_right_call_sites_is_silent(capsys):
+    model = MXQuantizer(save_dir=_write(_cfg(feat=_fixed_sites(2), hw=False))
+                        ).quant(Net())
+    model.eval()
+    x, flow = _data(1)[0]
+    with torch.no_grad():
+        for _ in range(3):
+            model(x, flow)
+    assert model.warp.n_calls == 2
+    assert "WARNING" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # DOF config
 # ---------------------------------------------------------------------------
 
@@ -277,7 +320,7 @@ def test_dof_cal_config():
     assert cfg["measure_error"] == {"enabled": True, "isolated": True}
     warp = next(l for l in cfg["layers"] if isinstance(l, dict)
                 and l.get("name") == "model.warp")
-    assert warp["call_sites"] == 3
+    assert warp["call_sites"] == 2           # DOF run: warp called twice
     assert warp["inputs"][0]["fxp"]["calibrate"] is True
     assert warp["inputs"][0]["fxp"]["total_bits"] == 8
     convs = [l for l in cfg["layers"] if l != warp]

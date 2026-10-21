@@ -30,7 +30,7 @@ from fixed_point.fxp_quant import (
 )
 from mx_layers_blocked import (MXConv2dBlocked, MXLinearBlocked, MXConv2dHW,
                                _reset_hw_call_counts, install_hw_call_guard)
-from mx_layers_act import MXActQuant
+from mx_layers_act import MXActQuant, install_act_call_guard
 from mx_stats import collect_stats as _collect_stats_impl
 import mx_assign as _mxa
 import mx_sensitivity as _mxs
@@ -1666,6 +1666,8 @@ class MXQuantizer:
         # pass: wrapping inserts an `.inner` level in the module path, which
         # would break name lookup for any conv/linear nested under them.
         n_act = self._wrap_act_layers(model, verbose=verbose)
+        if n_act:
+            install_act_call_guard(model)
 
         # Output fixed-point quant (kind == 'out_quant') goes last. It attaches a
         # forward hook rather than wrapping, so module paths and state_dict keys

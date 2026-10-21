@@ -66,7 +66,7 @@
 	{"name": "model.block3.conv1",           "group": "convT_plain"},
 	{"name": "model.block3.convtranspose_2", "group": "convT_plain"},
 	{"name": "model.block4.conv1",           "group": "convT_plain"},
-	{"name": "model.warp", "kind": "act_quant", "call_sites": 3,
+	{"name": "model.warp", "kind": "act_quant", "call_sites": 2,
 	 "inputs": [
 	   {"fxp": {"total_bits": 8, "signed": true, "calibrate": true,
 	             "round": "half_away", "saturate": true}},

@@ -137,6 +137,7 @@ class MXActQuant(nn.Module):
         # max|x|], device tensors until fxp_summary reads them back. A static
         # scale can clip silently; this is where it shows.
         self._fxp_stats = {}
+        self._call_sites_warned = False
 
     # -- construction ------------------------------------------------------
 
@@ -440,3 +441,34 @@ class MXActQuant(nn.Module):
         if self.call_sites > 1:
             parts.append(f"call_sites={self.call_sites}")
         return ", ".join(parts)
+
+
+def _check_act_call_sites(root, args):
+    """Forward pre-hook on the quantized root: a new forward starts. Each
+    MXActQuant's call-site counter goes back to 0, so a wrong `call_sites`
+    can not rotate the per-site scales across forwards. An eval forward that
+    called a wrapper a different number of times than `call_sites` warns
+    once: its per-site scales are then matched to the wrong calls. A module
+    function (not a closure) so the hook survives deepcopy."""
+    for m in root.modules():
+        if not isinstance(m, MXActQuant):
+            continue
+        n = m.n_calls
+        if (n and n != m.call_sites and not m.training
+                and not m._call_sites_warned):
+            m._call_sites_warned = True
+            name = getattr(m, "_mx_layer_name", type(m.inner).__name__)
+            print(f"[MXActQuant] WARNING: '{name}' is configured "
+                  f"call_sites={m.call_sites} but was called {n} times in one "
+                  f"forward pass; its per-call-site scales do not match the "
+                  f"calls. Set call_sites={n} in the config.")
+        m.n_calls = 0
+
+
+def install_act_call_guard(model):
+    """Restart MXActQuant call-site counters at every forward of `model`
+    (see _check_act_call_sites). Idempotent."""
+    if getattr(model, "_act_call_guard", None) is None:
+        model._act_call_guard = model.register_forward_pre_hook(
+            _check_act_call_sites)
+    return model
