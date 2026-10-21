@@ -1105,16 +1105,30 @@ def calibrate_act_scales(model, data_iter, num_batches=8, forward_fn=None,
     """
     from mx_layers_act import MXActQuant  # local import to avoid a cycle
 
-    layers = [m for m in model.modules() if isinstance(m, MXActQuant)]
-    pending = [m for m in layers
-               if any(c.get("calibrate") and c.get("scale") is None
-                      for grp in list(m.fxp_per_input) + [m.out_fxp]
-                      if grp is not None for c in grp)]
+    pending = [m for m in model.modules()
+               if isinstance(m, MXActQuant) and m.needs_calibration()]
     if not pending:
         return {}
 
     for m in pending:
         m.start_calibration()
+    # HW convs that cannot run yet for lack of a grid (calibrate_hw_grids
+    # runs after this, on the quantized act operands) take their FP32
+    # calibration path meanwhile. The sweep is in eval mode.
+    from mx_layers_blocked import MXConv2dHW, _get_xblock_cfg
+
+    def _needs_grid(m):
+        cfg = _get_xblock_cfg(m)
+        e_min = m.e_layer_min if m.e_layer_min is not None else cfg.get("e_layer_min")
+        win = cfg.get("out_window", "off") in ("infer", "always")
+        return (e_min is None or (win and m.e_qa_out is None)
+                or (in_exp_on(cfg) and m.e_base_a is None))
+
+    hw_open = [m for m in model.modules() if isinstance(m, MXConv2dHW)
+               and getattr(m, "_calibration_state", None) is None
+               and _needs_grid(m)]
+    for m in hw_open:
+        m._calibration_state = _CalibrationState()
 
     was_training = model.training
     model.eval()
@@ -1156,6 +1170,8 @@ def calibrate_act_scales(model, data_iter, num_batches=8, forward_fn=None,
         for m in pending:
             m.calibrating = False
             m.reset_calls()
+        for m in hw_open:
+            delattr(m, "_calibration_state")
         if was_training:
             model.train()
 

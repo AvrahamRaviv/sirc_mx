@@ -61,6 +61,7 @@ scales that differ per level.
 """
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -69,7 +70,11 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from mx_layers_blocked import quantize_mx_op  # STE-wrapped
 from fixed_point.fxp_quant import (  # STE-wrapped fake_quant_fxp
     fake_quant_fxp,
+    fxp_clip_stats,
+    fxp_format_str,
+    fxp_max_abs,
     fxp_scale_for_max_abs,
+    fxp_stats_value,
 )
 
 class MXActQuant(nn.Module):
@@ -128,6 +133,10 @@ class MXActQuant(nn.Module):
         self._last_in = None
         self._last_pre = None
         self._last_out = None
+        # Per fxp operand and call site: [n, n_clipped, sum_sq, sum_sq_err,
+        # max|x|], device tensors until fxp_summary reads them back. A static
+        # scale can clip silently; this is where it shows.
+        self._fxp_stats = {}
 
     # -- construction ------------------------------------------------------
 
@@ -206,13 +215,15 @@ class MXActQuant(nn.Module):
                     f"{obs_key}: fxp operand is marked calibrate=true but has "
                     f"no scale yet. Run calibrate_act_scales(model, loader) "
                     f"before inference.")
-            return fake_quant_fxp(
+            x_q = fake_quant_fxp(
                 x,
                 frac_bits=fxp['frac_bits'], total_bits=fxp['total_bits'],
                 signed=fxp['signed'], round_mode=fxp['round'],
                 saturate=fxp['saturate'], clip_grad=fxp['clip_grad'],
                 scale=fxp.get('scale'),
             )
+            self._record(obs_key, x, x_q, fxp)
+            return x_q
         if spec is None or spec['a_elem_format'] is None:
             return x
         bf = quantize_elemwise_op(x, mx_specs=spec, round=spec['round_output'])
@@ -262,11 +273,58 @@ class MXActQuant(nn.Module):
             self._last_in, self._last_pre, self._last_out = qargs, pre, out
         return out
 
+    # -- stats -------------------------------------------------------------
+
+    @torch.no_grad()
+    def _record(self, key, x, x_q, fxp):
+        n, n_clip, sq, sq_err = fxp_clip_stats(
+            x, x_q, frac_bits=fxp['frac_bits'], total_bits=fxp['total_bits'],
+            signed=fxp['signed'], round_mode=fxp['round'],
+            scale=fxp.get('scale'))
+        mx = x.detach().abs().max().float()
+        st = self._fxp_stats.get(key)
+        if st is None:
+            self._fxp_stats[key] = [n, n_clip, sq, sq_err, mx]
+        else:
+            st[0] += n
+            st[1] = st[1] + n_clip
+            st[2] = st[2] + sq
+            st[3] = st[3] + sq_err
+            st[4] = torch.maximum(st[4], mx)
+
+    def reset_fxp_stats(self):
+        self._fxp_stats = {}
+
+    def fxp_summary(self):
+        """One line per fxp operand and call site seen so far:
+        "in0@1: int8 signed step=0.047 round=half_away | max|x| 7.9 (range 6)
+        | clip 0.31% | SQNR 31.2 dB". Empty before any quantized forward."""
+        lines = []
+        for key in sorted(self._fxp_stats, key=str):
+            n, n_clip, sq, sq_err, mx = self._fxp_stats[key]
+            if not n:
+                continue
+            cfg = self._cfg_for(key)
+            sq_err = fxp_stats_value(sq_err)
+            sqnr = (f"{10.0 * math.log10(fxp_stats_value(sq) / sq_err):.1f} dB"
+                    if sq_err > 0 else "inf")
+            lines.append(
+                f"{self._key_str(key)}: {fxp_format_str(cfg)} | "
+                f"max|x| {fxp_stats_value(mx):.4g} (range {fxp_max_abs(cfg):.4g}) | "
+                f"clip {100.0 * fxp_stats_value(n_clip) / n:.2f}% | SQNR {sqnr}")
+        return lines
+
     # -- calibration -------------------------------------------------------
 
     def _observe(self, key, x):
         m = float(x.detach().abs().max())
         self._obs[key] = max(self._obs.get(key, 0.0), m)
+
+    def needs_calibration(self):
+        """True when some `calibrate: true` fxp operand has no scale yet."""
+        groups = list(self.fxp_per_input) + [self.out_fxp]
+        return any(c.get("calibrate") and c.get("scale") is None
+                   for grp in groups if grp is not None for c in grp)
 
     def start_calibration(self):
         """Observe magnitudes instead of quantizing `calibrate` fxp operands."""

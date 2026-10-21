@@ -20,7 +20,8 @@ from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum
-from fixed_point.mx_fixed_point_hw import (calibrate_hw_grids, export_hw_grids,
+from fixed_point.mx_fixed_point_hw import (calibrate_act_scales,
+                                           calibrate_hw_grids, export_hw_grids,
                                            resolve_out_window_bits)
 from fixed_point.hw_grids import check_hw_grid, load_hw_grids
 from fixed_point.fxp_quant import (
@@ -28,7 +29,7 @@ from fixed_point.fxp_quant import (
     normalize_out_quant,
 )
 from mx_layers_blocked import (MXConv2dBlocked, MXLinearBlocked, MXConv2dHW,
-                               install_hw_call_guard)
+                               _reset_hw_call_counts, install_hw_call_guard)
 from mx_layers_act import MXActQuant
 from mx_stats import collect_stats as _collect_stats_impl
 import mx_assign as _mxa
@@ -204,6 +205,23 @@ class MXQuantizer:
     config left None, then writes <save_dir>/mx_config_grids.json (an
     existing file is kept). Copy that file over mx_config.json for inference.
 
+    9. Calibrate static act_quant scales inside quant() (e.g. the DOF warp):
+    {
+        "calibrate_act_scales": {"enabled": true, "batches": 8, "save": true},
+        "layers": [{"name": "model.warp", "kind": "act_quant", "call_sites": 3,
+                    "inputs": [{"fxp": {"total_bits": 8, "signed": true,
+                                        "calibrate": true}}, ...]}]
+    }
+    Freezes every `calibrate: true` fxp operand per call site from max|x|
+    (calibrate_act_scales), then writes the scales into that operand's entry
+    of <save_dir>/mx_config_grids.json, together with any hw_grids. The
+    summary prints clip % and SQNR per operand and call site ([ActQuant]).
+
+    10. Isolated per-layer error (each layer fed its FP32 twin's input):
+    {"measure_error": {"enabled": true, "isolated": true}}
+    Logs a second table where upstream error is removed, next to the usual
+    propagated one.
+
     Priority (highest to lowest): per-layer mx_specs > group > global mx_specs > defaults
     Note: scale_bits is shared between weights and activations (library limitation).
     """
@@ -309,13 +327,29 @@ class MXQuantizer:
         else:
             self._replace_layers(model)
         self._check_hw_grids(model)
-        self._calibrate_hw_grids(model, data, forward_fn, log)
+        # Act scales first: the HW grids are then measured on the quantized
+        # act operands (e.g. the warped features) that the convs really see.
+        save_act = self._calibrate_act_scales(model, data, forward_fn, log)
+        save_hw = self._calibrate_hw_grids(model, data, forward_fn, log)
+        if save_hw or save_act:
+            self._save_calibration(model, log)
 
         if data is not None and ptq_enabled:
             self._ptq(model, data, forward_fn, log, ptq_batches)
 
         measure_cfg = self.config.get("measure_error", True)
+        if isinstance(measure_cfg, dict):
+            unknown = sorted(set(measure_cfg) - {"enabled", "isolated"})
+            if unknown:
+                raise ValueError(f"measure_error: unknown keys {unknown}")
+            isolated = bool(measure_cfg.get("isolated", False))
+            measure_cfg = measure_cfg.get("enabled", True)
+        else:
+            isolated = False
         if data is not None and measure_cfg:
+            if isolated:
+                model._quant_errors_isolated = self._measure_isolated_error(
+                    fp32_model, model, data, forward_fn, log, ptq_batches)
             errors = self._measure_error(fp32_model, model, data, forward_fn, log, ptq_batches)
             model._quant_errors = errors
 
@@ -1409,29 +1443,35 @@ class MXQuantizer:
         if hw_names:
             install_hw_call_guard(model)
 
-    def _calibrate_hw_grids(self, model, data, forward_fn, log):
-        """The "calibrate_hw_grids" config step of quant(): fill the grids the
-        config left None from `data`, then save them (see save_hw_grids).
-        Needs data when any grid is missing; a config that sets every grid
-        makes this a no-op."""
-        cfg = self.config.get("calibrate_hw_grids", False)
+    def _calib_step_cfg(self, key):
+        """A quant() calibration step's config: bool or {enabled, batches,
+        save, verbose}. None when the step is off."""
+        cfg = self.config.get(key, False)
         if isinstance(cfg, bool):
             cfg = {"enabled": cfg}
         if not isinstance(cfg, dict):
-            raise TypeError("calibrate_hw_grids must be a bool or a dict, got "
+            raise TypeError(f"{key} must be a bool or a dict, got "
                             f"{type(cfg).__name__}")
         unknown = sorted(set(cfg) - {"enabled", "batches", "save", "verbose"})
         if unknown:
-            raise ValueError(f"calibrate_hw_grids: unknown keys {unknown}")
-        if not cfg.get("enabled", True):
-            return
+            raise ValueError(f"{key}: unknown keys {unknown}")
+        return cfg if cfg.get("enabled", True) else None
+
+    def _calibrate_hw_grids(self, model, data, forward_fn, log):
+        """The "calibrate_hw_grids" config step of quant(): fill the grids the
+        config left None from `data`. Needs data when any grid is missing; a
+        config that sets every grid makes this a no-op. Returns True when it
+        calibrated something that should be saved."""
+        cfg = self._calib_step_cfg("calibrate_hw_grids")
+        if cfg is None:
+            return False
         hw = [m for m in model.modules() if isinstance(m, MXConv2dHW)]
         missing = [m._mx_layer_name for m in hw
                    if m.e_layer_min is None or m.e_qa_out is None]
         if not missing:
             self._log(log, f"calibrate_hw_grids | all {len(hw)} HW layers set "
                            f"by config, nothing to calibrate")
-            return
+            return False
         if data is None:
             raise ValueError(
                 f"calibrate_hw_grids: {len(missing)} HW layers have no grids "
@@ -1443,21 +1483,56 @@ class MXQuantizer:
         calibrate_hw_grids(model, data, num_batches=batches,
                            forward_fn=forward_fn,
                            verbose=int(cfg.get("verbose", 1)))
-        if not cfg.get("save", True):
-            return
+        return bool(cfg.get("save", True))
+
+    def _calibrate_act_scales(self, model, data, forward_fn, log):
+        """The "calibrate_act_scales" config step of quant(): freeze the static
+        scale of every act_quant fxp operand marked `calibrate: true`, per call
+        site (calibrate_act_scales). Returns True when it froze something that
+        should be saved."""
+        cfg = self._calib_step_cfg("calibrate_act_scales")
+        if cfg is None:
+            return False
+        pending = [m._mx_layer_name for m in model.modules()
+                   if isinstance(m, MXActQuant) and m.needs_calibration()]
+        if not pending:
+            self._log(log, "calibrate_act_scales | no act_quant operand left "
+                           "to calibrate")
+            return False
+        if data is None:
+            raise ValueError(
+                f"calibrate_act_scales: {pending} have calibrate=true operands "
+                f"without a scale and quant() got no data. Pass "
+                f"data/forward_fn to quant(), or set the scales in the config.")
+        batches = int(cfg.get("batches", 8))
+        self._log(log, f"calibrate_act_scales | {pending}, {batches} batches")
+        frozen = calibrate_act_scales(model, data, num_batches=batches,
+                                      forward_fn=forward_fn,
+                                      verbose=int(cfg.get("verbose", 1)))
+        for name, scales in frozen.items():
+            pretty = ", ".join(f"{k}={v:.6g}" for k, v in scales.items())
+            self._log(log, f"calibrate_act_scales | {name}: {pretty}")
+        return bool(cfg.get("save", True))
+
+    def _save_calibration(self, model, log):
+        """Write what quant() calibrated to <save_dir>/mx_config_grids.json
+        (an existing file is kept). Inference copies it over mx_config.json
+        and never calibrates."""
         path = os.path.join(self.save_dir, "mx_config_grids.json")
         if os.path.exists(path):
-            self._log(log, f"calibrate_hw_grids | {path} exists, kept "
+            self._log(log, f"calibration | {path} exists, kept "
                            f"(not overwritten)")
             return
         self.save_hw_grids(model, path=path)
-        self._log(log, f"calibrate_hw_grids | wrote {path}; copy it over "
+        self._log(log, f"calibration | wrote {path}; copy it over "
                        f"mx_config.json for inference")
 
     def save_hw_grids(self, model, path=None, overwrite=False):
         """Write the loaded config plus a "hw_grids" section holding every
-        MXConv2dHW's grids (see fixed_point.hw_grids). Calibration runs once
-        offline (calibrate_hw_grids); inference and the sim read this file.
+        MXConv2dHW's grids (see fixed_point.hw_grids), with every calibrated
+        act_quant scale written into its operand entry. Calibration runs once
+        offline (calibrate_hw_grids / calibrate_act_scales); inference and the
+        sim read this file.
 
         Default path: <source config stem>_grids.json next to the source
         config. An existing file is kept unless `overwrite=True`. Returns the
@@ -1472,10 +1547,46 @@ class MXQuantizer:
                                   f"overwrite=True to replace it")
         out = copy.deepcopy(self.config)
         out["hw_grids"] = export_hw_grids(model)
+        self._write_act_scales(out, model)
         with open(path, "w") as f:
             json.dump(out, f, indent=2)
             f.write("\n")
         return path
+
+    @staticmethod
+    def _write_act_scales(cfg, model):
+        """Put each MXActQuant's frozen scales into its act_quant entry of
+        `cfg` as a per-call-site fxp list with an explicit `scale`, so a
+        reload needs no calibration. Operands without a scale are left as
+        configured."""
+        acts = {m._mx_layer_name: m for m in model.modules()
+                if isinstance(m, MXActQuant) and hasattr(m, "_mx_layer_name")}
+        for entry in cfg.get("layers", []):
+            if not isinstance(entry, dict) or entry.get("kind") != "act_quant":
+                continue
+            m = acts.get(entry["name"])
+            if m is None:
+                continue
+            ops = [(ent, m.fxp_per_input[i])
+                   for i, ent in enumerate(entry.get("inputs", []))
+                   if ent is not None and i < len(m.fxp_per_input)]
+            if entry.get("output") is not None:
+                ops.append((entry["output"], m.out_fxp))
+            for ent, sites in ops:
+                if "fxp" not in ent or sites is None:
+                    continue
+                if all(c.get("scale") is None for c in sites):
+                    continue
+                user = ent["fxp"]
+                per_site = []
+                for site, c in enumerate(sites):
+                    d = dict(user[site] if isinstance(user, list) else user)
+                    if c.get("scale") is not None:
+                        d.pop("calibrate", None)
+                        d.pop("pow2", None)
+                        d["scale"] = float(c["scale"])
+                    per_site.append(d)
+                ent["fxp"] = per_site
 
     # =========================
     # Replacement logic
@@ -2374,6 +2485,10 @@ class MXQuantizer:
         if not fp32_layer_map:
             self._log(log, "measure_error | WARNING: no matching layers found, skipping.")
             return {}
+        # The [ActQuant] clip/SQNR lines then describe this pass's inputs.
+        for m in quant_model.modules():
+            if isinstance(m, MXActQuant):
+                m.reset_fxp_stats()
 
         accum = {name: dict(signal_sq=0.0, noise_sq=0.0, dot=0.0,
                             quant_sq=0.0, n_elem=0)
@@ -2469,6 +2584,121 @@ class MXQuantizer:
 
         return results
 
+    def _measure_isolated_error(self, fp32_model, quant_model, data,
+                                forward_fn=None, log=None, max_batches=128):
+        """Per-layer error with no upstream error: each quantized layer (and
+        act_quant wrapper) is run on the exact input its FP32 twin got, inside
+        the FP32 forward. `_measure_error` compares two full forwards, so
+        there a layer also carries the error of everything before it; here
+        the number is the layer's own. Only the FP32 model runs end to end.
+
+        Returns {name: {"mse", "cos_sim", "sqnr_db", "zero_output"}}, worst
+        first, and logs the table.
+        """
+        q_map = {n: m for n, m in quant_model.named_modules()
+                 if isinstance(m, (MXConv2d, MXConvTranspose2d, MXLinear,
+                                   MXActQuant))}
+        fp32_layer_map = {n: m for n, m in fp32_model.named_modules()
+                          if n in q_map}
+        if not fp32_layer_map:
+            self._log(log, "measure_error isolated | WARNING: no matching "
+                           "layers found, skipping.")
+            return {}
+
+        accum = {name: dict(signal_sq=0.0, noise_sq=0.0, dot=0.0,
+                            quant_sq=0.0, n_elem=0)
+                 for name in fp32_layer_map}
+
+        def _tensors(y):
+            return list(y) if isinstance(y, (tuple, list)) else [y]
+
+        def make_hook(name):
+            q_mod = q_map[name]
+
+            p = next(q_mod.parameters(), None)
+            dev = None if p is None else p.device
+
+            def _to(a):
+                return a.to(dev) if torch.is_tensor(a) and dev is not None else a
+
+            def hook(mod, args, kwargs, out):
+                q_out = q_mod(*[_to(a) for a in args],
+                              **{k: _to(v) for k, v in kwargs.items()})
+                s = accum[name]
+                for f, q in zip(_tensors(out), _tensors(q_out)):
+                    if not (torch.is_tensor(f) and f.is_floating_point()):
+                        continue
+                    f, q = f.detach().float(), q.detach().float().to(f.device)
+                    s["signal_sq"] += f.pow(2).sum().item()
+                    s["noise_sq"] += (f - q).pow(2).sum().item()
+                    s["dot"] += (f * q).sum().item()
+                    s["quant_sq"] += q.pow(2).sum().item()
+                    s["n_elem"] += f.numel()
+            return hook
+
+        handles = [m.register_forward_hook(make_hook(n), with_kwargs=True)
+                   for n, m in fp32_layer_map.items()]
+        acts = [m for m in q_map.values() if isinstance(m, MXActQuant)]
+        try:
+            with torch.no_grad():
+                for i, batch in enumerate(data):
+                    if max_batches > 0 and i >= max_batches:
+                        break
+                    # The quantized model's own forward never runs, so do what
+                    # its pre-hooks would: restart call-site and HW call counts.
+                    for m in acts:
+                        m.reset_calls()
+                    _reset_hw_call_counts(quant_model, None)
+                    if forward_fn is not None:
+                        forward_fn(fp32_model, batch)
+                    elif isinstance(batch, (list, tuple)):
+                        fp32_model(batch[0])
+                    elif isinstance(batch, dict):
+                        fp32_model(**batch)
+                    else:
+                        fp32_model(batch)
+        finally:
+            for h in handles:
+                h.remove()
+            for m in acts:
+                m.reset_calls()
+
+        results = {}
+        for name, s in accum.items():
+            if s["n_elem"] == 0:
+                continue
+            mse = s["noise_sq"] / s["n_elem"]
+            zero_output = s["signal_sq"] == 0 and s["quant_sq"] == 0
+            denom = (s["signal_sq"] * s["quant_sq"]) ** 0.5
+            if zero_output:
+                cos_sim, sqnr_db = float("nan"), float("nan")
+            else:
+                cos_sim = max(-1.0, min(1.0, s["dot"] / denom)) if denom > 0 else 0.0
+                sqnr_db = (10 * math.log10(s["signal_sq"] / s["noise_sq"])
+                           if s["noise_sq"] > 0 else float("inf"))
+            results[name] = {"mse": mse, "cos_sim": cos_sim, "sqnr_db": sqnr_db,
+                             "zero_output": zero_output}
+        results = dict(sorted(
+            results.items(),
+            key=lambda x: x[1]["sqnr_db"] if not math.isnan(x[1]["sqnr_db"]) else float("inf")
+        ))
+
+        self._log(log, "Isolated quantization error per layer (FP32 input, "
+                       "worst first):")
+        self._log(log, f"  {'Layer':<45} {'MSE':>10} {'Cos Sim':>10} {'SQNR (dB)':>10}")
+        for name, m in results.items():
+            if m["zero_output"]:
+                self._log(log, f"  {name:<45} {'0.00e+00':>10} {'N/A':>10} {'N/A (zero output)':>18}")
+                continue
+            sqnr_str = f"{m['sqnr_db']:>9.1f}" if m["sqnr_db"] != float("inf") else "      inf"
+            self._log(log, f"  {name:<45} {m['mse']:>10.3e} {m['cos_sim']:>10.4f} {sqnr_str}")
+        finite = [m["sqnr_db"] for m in results.values()
+                  if not m["zero_output"] and m["sqnr_db"] != float("inf")]
+        if finite:
+            self._log(log, f"  Overall isolated (mean SQNR): "
+                           f"{sum(finite)/len(finite):.1f} dB")
+        return results
+
     # =========================
     # Debug printing
     # =========================
@@ -2506,6 +2736,8 @@ class MXQuantizer:
 
             if isinstance(module, MXActQuant):
                 self._log(log, f"[ActQuant->MX] {name}: {module.extra_repr()}")
+                for line in module.fxp_summary():
+                    self._log(log, f"[ActQuant] {name} {line}")
                 num_mx_act += 1
             elif isinstance(module, MXConvTranspose2d):
                 tag = self._format_tag(module)
