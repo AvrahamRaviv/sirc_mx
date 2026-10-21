@@ -261,6 +261,7 @@ class MXConv2dHW(MXConv2d):
         # 'calib'. A config value is never replaced unless calibration is forced.
         self._grid_src = {"e_layer_min": None, "e_qa_out": None}
         self._win_calls = None          # set per root forward by install_hw_call_guard
+        self.hw_calls = 1               # window calls allowed per forward (hw_grids "calls")
         self._mx_layer_name = None
         self._hw_logged = False
         self._pad_logged = False
@@ -418,11 +419,15 @@ class MXConv2dHW(MXConv2d):
         e_qa_out = int(self.e_qa_out) if apply_win else None
         if apply_win and not self.training and self._win_calls is not None:
             self._win_calls += 1
-            if self._win_calls > 1:
+            if self._win_calls > self.hw_calls:
                 raise RuntimeError(
                     f"MXConv2dHW {name}: called {self._win_calls} times in one "
-                    f"forward with the output window on. hw_grids holds one "
-                    f"grid per layer; a second call site would reuse it."
+                    f"forward with the output window on, but its grid is for "
+                    f"{self.hw_calls}. hw_grids holds one grid per layer. If "
+                    f"every call sees the same kind of input (e.g. a feature "
+                    f"extractor run on both images), calibrate the grid over "
+                    f"all calls (calibrate_hw_grids does) or set "
+                    f"\"calls\": {self._win_calls} in its hw_grids entry."
                 )
         if verbose >= 2 and not self._hw_logged:
             print(

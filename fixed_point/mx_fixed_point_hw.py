@@ -735,6 +735,8 @@ class _CalibrationState:
         self.in_absmax = None
         self.w_absmax = None
         self.out_absmax = None
+        self.calls_now = 0      # calls in the current forward
+        self.max_calls = 0      # most calls seen in one forward
 
     def update(self, qi_fp, qw_fp, bs, fmt='int8',
                act_blockify='channel', weight_blockify='channel'):
@@ -742,6 +744,7 @@ class _CalibrationState:
             qi_fp, qw_fp, bs, fmt=fmt,
             act_blockify=act_blockify, weight_blockify=weight_blockify,
         )
+        self.calls_now += 1
         self.running_min = _running(self.running_min, e_a + e_w, min)
         self.min_e_qa_in = _running(self.min_e_qa_in, e_a, min)
         self.min_e_qw = _running(self.min_e_qw, e_w, min)
@@ -822,7 +825,11 @@ def _sweep(model, layers, data_iter, num_batches, forward_fn):
             for i, batch in enumerate(data_iter):
                 if i >= num_batches:
                     break
+                for st in states.values():
+                    st.calls_now = 0
                 _feed(model, batch, forward_fn)
+                for st in states.values():
+                    st.max_calls = max(st.max_calls, st.calls_now)
     finally:
         for m in layers:
             if hasattr(m, "_calibration_state"):
@@ -983,6 +990,9 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
                     src={k: _grid_src(m, k) for k in ("e_layer_min", "e_qa_out")},
                 )
             continue
+        # A layer called k times per forward (shared module) gets one grid
+        # pooled over all k calls, and the guard allows k window calls.
+        m.hw_calls = max(1, st.max_calls)
         win_bits = resolve_out_window_bits(cfg, m.mx_specs['a_elem_format'])
         margin = (int(cfg.get("out_margin_bits", 0)) if margin_bits is None
                   else int(margin_bits))
@@ -1018,7 +1028,7 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
             e_layer_min=int(m.e_layer_min), e_qa_out=m.e_qa_out,
             shift_out=m.e_qa_out - int(m.e_layer_min),
             e_qa_in=st.min_e_qa_in, e_qw=st.min_e_qw, in_fill_gap=gap,
-            win_bits=win_bits, a_codes=a_codes, w_codes=w_codes,
+            win_bits=win_bits, a_codes=a_codes, w_codes=w_codes, calls=m.hw_calls,
             e_base_a=m.e_base_a, e_base_w=e_base_w if span is not None else None,
             src={k: _grid_src(m, k) for k in ("e_layer_min", "e_qa_out")},
         )
@@ -1033,6 +1043,8 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
                   f"win_bits={r['win_bits']} "
                   f"in_fill_gap={r['in_fill_gap']} "
                   f"codes a={r.get('a_codes')} w={r.get('w_codes')}"
+                  + (f" calls={r['calls']} (shared grid)"
+                     if r.get('calls', 1) > 1 else "")
                   + (f" e_base_a={r['e_base_a']} e_base_w={r['e_base_w']}"
                      if r.get('e_base_a') is not None else ""))
     return result
@@ -1062,6 +1074,8 @@ def export_hw_grids(model):
             e_layer_min=int(m.e_layer_min), e_qa_out=int(m.e_qa_out),
             win_bits=win_bits, shift_out=int(m.e_qa_out) - int(m.e_layer_min),
         )
+        if getattr(m, "hw_calls", 1) > 1:
+            entry["calls"] = int(m.hw_calls)
         if in_exp_on(_get_xblock_cfg(m)):
             if m.e_base_a is None:
                 missing.append(name)

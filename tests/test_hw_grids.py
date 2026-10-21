@@ -214,10 +214,10 @@ def test_non_int_entry_raises():
 
 
 def test_double_call_with_window_raises_in_eval_only():
+    # Config grid made for one call: a second call in the same forward fails.
     tmp = tempfile.mkdtemp()
-    _write_cfg(tmp)
+    _write_cfg(tmp, hw_grids={"c1": GRID_C1, "c2": GRID_C1})
     model = _quant(tmp, net=_TwiceNet())
-    calibrate_hw_grids(model, _data(), num_batches=2, verbose=0)
     x = _data(1)[0]
     with pytest.raises(RuntimeError, match="c1: called 2 times"):
         _eval(model, x)
@@ -226,6 +226,53 @@ def test_double_call_with_window_raises_in_eval_only():
     # Window off: one grid is not used for extraction, no check.
     model.c1.xblock_accum["out_window"] = "off"
     _eval(model, x)
+
+
+def test_double_call_calibrated_shares_one_grid():
+    """A layer run twice per forward (a feature extractor on both images)
+    gets one grid pooled over both calls, saved with "calls": 2."""
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp)
+    model = _quant(tmp, net=_TwiceNet())
+    res = calibrate_hw_grids(model, _data(), num_batches=2, verbose=0)
+    assert (model.c1.hw_calls, model.c2.hw_calls) == (2, 1)
+    assert res["c1"]["calls"] == 2
+    x = _data(1, seed=7)[0]
+    y = _eval(model, x)
+    grids = export_hw_grids(model)
+    assert grids["c1"]["calls"] == 2 and "calls" not in grids["c2"]
+    tmp2 = tempfile.mkdtemp()
+    _write_cfg(tmp2, hw_grids=grids)
+    model2 = _quant(tmp2, net=_TwiceNet())
+    assert model2.c1.hw_calls == 2
+    assert torch.equal(_eval(model2, x), y)
+
+
+def test_calls_key_validation():
+    check_hw_grid("c1", {**GRID_C1, "calls": 2})
+    with pytest.raises(ValueError, match="calls"):
+        check_hw_grid("c1", {**GRID_C1, "calls": 0})
+    with pytest.raises(TypeError):
+        check_hw_grid("c1", {**GRID_C1, "calls": 2.0})
+
+
+def test_measure_error_runs_in_eval(monkeypatch):
+    """quant()'s error tables are inference numbers (window on) even for a
+    model handed over in train mode; the mode is restored afterwards."""
+    seen = []
+    orig = MXQuantizer._measure_error
+
+    def spy(self, fp32_model, quant_model, *a, **k):
+        seen.append((fp32_model.training, quant_model.training))
+        return orig(self, fp32_model, quant_model, *a, **k)
+
+    monkeypatch.setattr(MXQuantizer, "_measure_error", spy)
+    tmp = tempfile.mkdtemp()
+    _write_cfg(tmp, top={**CAL, "measure_error": True})
+    net = _TwiceNet().train()
+    model = MXQuantizer(save_dir=tmp).quant(net, data=_data())
+    assert seen == [(False, False)]
+    assert model.training
 
 
 def test_single_call_passes_every_forward():

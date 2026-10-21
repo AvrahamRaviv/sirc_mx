@@ -37,6 +37,23 @@ import mx_sensitivity as _mxs
 from mx_sensitivity import clean_name as _clean_name
 
 
+class _eval_mode:
+    """Put models in eval for a block, then restore each one's mode."""
+
+    def __init__(self, *models):
+        self.models = models
+
+    def __enter__(self):
+        self.was = [m.training for m in self.models]
+        for m in self.models:
+            m.eval()
+
+    def __exit__(self, *exc):
+        for m, was in zip(self.models, self.was):
+            m.train(was)
+        return False
+
+
 def _out_quant_tensor(t, state):
     """Quantize one output tensor and fold its error into the running stats."""
     cfg = state["cfg"]
@@ -347,10 +364,14 @@ class MXQuantizer:
         else:
             isolated = False
         if data is not None and measure_cfg:
-            if isolated:
-                model._quant_errors_isolated = self._measure_isolated_error(
-                    fp32_model, model, data, forward_fn, log, ptq_batches)
-            errors = self._measure_error(fp32_model, model, data, forward_fn, log, ptq_batches)
+            # Inference numbers: eval mode, so the output window and the
+            # in_exp register ("infer") are on, as in net_sqnr / deployment.
+            with _eval_mode(fp32_model, model):
+                if isolated:
+                    model._quant_errors_isolated = self._measure_isolated_error(
+                        fp32_model, model, data, forward_fn, log, ptq_batches)
+                errors = self._measure_error(fp32_model, model, data, forward_fn,
+                                             log, ptq_batches)
             model._quant_errors = errors
 
         stats_cfg = self.config.get("collect_stats", False)
@@ -395,8 +416,9 @@ class MXQuantizer:
         stats = _collect_stats_impl(model, data, forward_fn, log=log,
                                     save_path=save_path, **opts)
         if stats and fp32_model is not None and data is not None:
-            propagated = self._measure_error(fp32_model, model, data,
-                                             forward_fn, log, opts["max_batches"])
+            with _eval_mode(fp32_model, model):
+                propagated = self._measure_error(fp32_model, model, data,
+                                                 forward_fn, log, opts["max_batches"])
             for name, metrics in propagated.items():
                 if name in stats["layers"]:
                     stats["layers"][name]["output_error"]["propagated"] = metrics
@@ -1427,6 +1449,7 @@ class MXQuantizer:
             if key in entry:
                 setattr(layer, key, int(entry[key]))
                 layer._grid_src[key] = "config"
+        layer.hw_calls = int(entry.get("calls", 1))
 
     def _check_hw_grids(self, model):
         """Every hw_grids name must be an MXConv2dHW of this model: a typo or a

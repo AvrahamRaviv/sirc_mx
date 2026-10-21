@@ -14,6 +14,9 @@ Names are the ones in "layers". Per layer:
   e_base_a     input shared-exponent base (only with xblock_accum.in_exp_bits):
                input block exponents limited to [e_base_a, e_base_a + 2^bits - 1]
   e_base_w     same for the weights
+  calls        times the layer runs per forward on this one grid (default 1),
+               e.g. 2 for a feature extractor shared by both images;
+               calibration pools all calls, so the grid covers each of them
 
 e_layer_min and e_qa_out are required; win_bits and shift_out are derived
 values, written by `export_hw_grids` and checked on load. Calibration runs
@@ -26,7 +29,7 @@ standalone.
 import json
 
 HW_GRID_KEYS = ("e_layer_min", "e_qa_out", "win_bits", "shift_out",
-                "e_base_a", "e_base_w")
+                "e_base_a", "e_base_w", "calls")
 _REQUIRED = ("e_layer_min", "e_qa_out")
 
 
@@ -49,6 +52,8 @@ def check_hw_grid(name, entry, win_bits=None):
     for k, v in entry.items():
         if isinstance(v, bool) or not isinstance(v, int):
             raise TypeError(f"hw_grids[{name!r}][{k!r}] must be int, got {v!r}")
+    if entry.get("calls", 1) < 1:
+        raise ValueError(f"hw_grids[{name!r}]: calls must be >= 1")
     shift = entry["e_qa_out"] - entry["e_layer_min"]
     if "shift_out" in entry and entry["shift_out"] != shift:
         raise ValueError(
