@@ -31,6 +31,7 @@ from fixed_point.fxp_quant import (
 from mx_layers_blocked import (MXConv2dBlocked, MXLinearBlocked, MXConv2dHW,
                                _reset_hw_call_counts, install_hw_call_guard)
 from mx_layers_act import MXActQuant, install_act_call_guard
+from mx_layers_convT import MXConvTranspose2dHW
 from mx_stats import collect_stats as _collect_stats_impl
 import mx_assign as _mxa
 import mx_sensitivity as _mxs
@@ -1322,11 +1323,29 @@ class MXQuantizer:
         want_hw = want_blocked and mode == 'hw_fixed_point'
         bs = mx_specs.get('block_size', 0) if hasattr(mx_specs, 'get') else mx_specs['block_size']
 
-        if is_convT:
-            # ConvTranspose2d: plain MX only (no HW / blocked variants).
+        convT_hw = (is_convT and want_hw and xblock_cfg.get('convT') == 'hw'
+                    and module.groups == 1)
+        if convT_hw:
+            # Zero-insert conv on the MXConv2dHW path (xblock_accum.convT='hw').
+            new = MXConvTranspose2dHW(
+                module.in_channels,
+                module.out_channels,
+                module.kernel_size,
+                stride=module.stride,
+                padding=module.padding,
+                output_padding=module.output_padding,
+                dilation=module.dilation,
+                bias=module.bias is not None,
+                mx_specs=mx_specs,
+            )
+            _tally('hw', name)
+        elif is_convT:
+            # ConvTranspose2d: plain MX (HW path only via xblock_accum.convT='hw',
+            # groups == 1).
             if want_blocked and verbose >= 1:
                 print(f"[MXQuantizer] xblock_accum ignored for convT "
-                      f"'{name}'; ConvTranspose2d only supports plain MX.")
+                      f"'{name}'; plain MX (set xblock_accum.convT='hw' for "
+                      f"the HW path; grouped convT is plain only).")
             new = MXConvTranspose2d(
                 module.in_channels,
                 module.out_channels,
@@ -2291,15 +2310,16 @@ class MXQuantizer:
         No backward pass required.
         Memory: O(in_dim²) per layer — activations are never stored in full.
 
-        Note: MXConvTranspose2d layers are intentionally excluded — the GPTQ
-        Hessian uses conv im2col (F.unfold), which does not model the transposed
-        conv. Their weights still get MX-quantized on-the-fly in forward.
+        Note: MXConvTranspose2d / MXConvTranspose2dHW layers are intentionally
+        excluded — the GPTQ Hessian uses conv im2col (F.unfold), which does not
+        model the transposed conv. Their weights still get MX-quantized on-the-fly in forward.
         """
         self._log(log, f"PTQ | Phase 1: collecting Hessians ({max_batches} batches) ...")
         hessians = self._collect_activations(model, data, forward_fn, log, max_batches)
 
         mx_layers = [(n, m) for n, m in model.named_modules()
-                     if isinstance(m, (MXConv2d, MXLinear))]
+                     if isinstance(m, (MXConv2d, MXLinear))
+                     and not isinstance(m, MXConvTranspose2dHW)]
         total    = len(mx_layers)
         no_calib = [n for n, _ in mx_layers if n not in hessians]
         if no_calib:
@@ -2370,7 +2390,8 @@ class MXQuantizer:
             return hook
 
         for name, module in model.named_modules():
-            if isinstance(module, (MXConv2d, MXLinear)):
+            if (isinstance(module, (MXConv2d, MXLinear))
+                    and not isinstance(module, MXConvTranspose2dHW)):
                 handles.append(module.register_forward_hook(make_hook(name)))
 
         total_batches = max_batches if max_batches > 0 else len(data) if hasattr(data, '__len__') else None
@@ -2764,7 +2785,7 @@ class MXQuantizer:
                 for line in module.fxp_summary():
                     self._log(log, f"[ActQuant] {name} {line}")
                 num_mx_act += 1
-            elif isinstance(module, MXConvTranspose2d):
+            elif isinstance(module, (MXConvTranspose2d, MXConvTranspose2dHW)):
                 tag = self._format_tag(module)
                 fmt_counts[tag] = fmt_counts.get(tag, 0) + 1
                 self._log(log, f"[ConvTranspose2d->MX] [{tag}] {name}: {module}")

@@ -30,7 +30,8 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
 from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
-                                           clamp_block_exp, floor_log2, in_exp_on)
+                                           clamp_block_exp, floor_log2, in_exp_on,
+                                           dilate_input)
 
 
 def quantize_mx_op(x, *args, **kwargs):
@@ -249,6 +250,19 @@ class MXConv2dHW(MXConv2d):
         e = floor_log2(float(self.weight.detach().abs().max()))
         return None if bits is None or e is None else e - ((1 << int(bits)) - 1)
 
+    def _hw_weight(self):
+        """Weight in conv layout [O, Cin, kH, kW] as the HW path consumes it.
+        A subclass whose parameter is stored in another layout (convT)
+        returns its re-layout here; the weight quant path is the same."""
+        return self.weight
+
+    def _hw_geom(self):
+        """Geometry of the conv the kernel runs: stride, padding, dilation,
+        plus the input zero-insert (in_dil, in_extra) applied after the
+        input is MX-quantized. Plain conv: no zero-insert."""
+        return dict(stride=self.stride, padding=self.padding,
+                    dilation=self.dilation, in_dil=(1, 1), in_extra=(0, 0))
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.e_layer_min = None
@@ -326,7 +340,7 @@ class MXConv2dHW(MXConv2d):
                 )
             pad = bs - (C % bs)
             x = F.pad(x, (0, 0, 0, 0, 0, pad))           # pad C with zeros
-            weight = F.pad(self.weight, (0, 0, 0, 0, 0, pad))
+            weight = F.pad(self._hw_weight(), (0, 0, 0, 0, 0, pad))
             B, C, H, W = x.shape
             if verbose >= 2 and not self._pad_logged:
                 print(
@@ -335,7 +349,7 @@ class MXConv2dHW(MXConv2d):
                 )
                 self._pad_logged = True
         else:
-            weight = self.weight
+            weight = self._hw_weight()
 
         bf_in = quantize_elemwise_op(x, mx_specs=sp, round=sp['round_output'])
         bf_w = quantize_elemwise_op(weight, mx_specs=sp, round=sp['round_weight'])
@@ -441,6 +455,7 @@ class MXConv2dHW(MXConv2d):
             self._hw_logged = True
 
         stats = {"want_acc": True} if self._tap_acc else {}
+        geom = self._hw_geom()
         out = hw_fxp_conv2d(
             qi, qw, bf_bias,
             e_layer_min=int(e_min),
@@ -448,9 +463,11 @@ class MXConv2dHW(MXConv2d):
             bits=cfg['bits'],
             sat_mode=cfg['sat_mode'],
             ste_mask=cfg['ste_mask'],
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
+            stride=geom['stride'],
+            padding=geom['padding'],
+            dilation=geom['dilation'],
+            in_dil=geom['in_dil'],
+            in_extra=geom['in_extra'],
             backend=cfg['backend'],
             stats_sink=stats,
             fmt=a_fmt,
@@ -500,6 +517,9 @@ class MXConv2dHW(MXConv2d):
         """FP32 reference conv used only while calibrating `e_layer_min`."""
         sp = self.mx_specs
         bs = sp['block_size']
+        geom = self._hw_geom()
+        qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])   # exact in fp32
+        H, W = qi.shape[-2:]
         B = qi.shape[0]
         C = qi.shape[1]
         O = qw.shape[0]
@@ -510,23 +530,23 @@ class MXConv2dHW(MXConv2d):
         # not apply; a plain conv is an equivalent FP32 reference for producing
         # downstream activations during calibration.
         if C % bs != 0:
-            out = F.conv2d(qi, qw, bf_bias, self.stride, self.padding,
-                           self.dilation, self.groups)
+            out = F.conv2d(qi, qw, bf_bias, geom['stride'], geom['padding'],
+                           geom['dilation'], self.groups)
             return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
         nb = C // bs
 
         x_unf = F.unfold(qi, (kH, kW),
-                         dilation=self.dilation,
-                         padding=self.padding,
-                         stride=self.stride)
+                         dilation=geom['dilation'],
+                         padding=geom['padding'],
+                         stride=geom['stride'])
         L = x_unf.shape[-1]
         x_b = x_unf.view(B, nb, bs, kK, L)
         w_b = qw.view(O, nb, bs, kK)
         out = torch.einsum('bnkpl,onkp->bol', x_b, w_b)
 
-        sH, sW = self.stride
-        pH, pW = self.padding
-        dH, dW = self.dilation
+        sH, sW = geom['stride']
+        pH, pW = geom['padding']
+        dH, dW = geom['dilation']
         H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
         out = out.view(B, O, H_out, W_out)

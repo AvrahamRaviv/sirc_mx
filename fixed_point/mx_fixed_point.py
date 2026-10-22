@@ -11,6 +11,7 @@ _VALID_NPE_TRITON_VARIANTS = ("reuse", "opt")
 _VALID_OUT_WINDOW = ("off", "infer", "always")
 _VALID_OUT_ROUND = ("floor", "nearest")
 _VALID_IN_EXP_MODE = ("off", "infer", "always")
+_VALID_CONVT = ("plain", "hw")
 
 
 def validate_xblock_accum_bits(bits):
@@ -173,6 +174,10 @@ XBLOCK_ACCUM_DEFAULTS = {
     "in_exp_bits": None,          # None = unlimited (microxcaling scale_bits only)
     "in_exp_mode": "off",         # 'off', 'infer' (eval only) or 'always' (train too;
                                   # backward stays STE)
+    # ConvTranspose2d under hw_fixed_point: 'plain' keeps plain MXConvTranspose2d,
+    # 'hw' builds MXConvTranspose2dHW (zero-insert conv on the MXConv2dHW path).
+    # Grouped convT stays plain either way.
+    "convT": "plain",
 }
 
 
@@ -308,6 +313,10 @@ def normalize_xblock_accum(value):
             raise ValueError(
                 f"xblock_accum.in_exp_mode must be in {_VALID_IN_EXP_MODE}, "
                 f"got {cfg['in_exp_mode']!r}"
+            )
+        if cfg["convT"] not in _VALID_CONVT:
+            raise ValueError(
+                f"xblock_accum.convT must be in {_VALID_CONVT}, got {cfg['convT']!r}"
             )
         if cfg["in_exp_mode"] != "off" and cfg["in_exp_bits"] is None:
             raise ValueError(

@@ -304,8 +304,20 @@ A layer entry that already names a `group` — or carries its own `mx_specs` —
 a decision made by hand, so the ladder does not overrule it: it becomes a **pin**
 and keeps that spec **raw**, without inheriting the deployment `mx_specs`. That
 is the escape hatch for layers the ladder cannot describe. The usual case is a
-`ConvTranspose2d` on the NPE path: it has no HW/blocked variant, so it is pinned
-to a plain-MX group while the ladder rungs keep the accumulator model.
+`ConvTranspose2d` on the NPE path kept on plain MX (the default), pinned to a
+plain-MX group while the ladder rungs keep the accumulator model.
+
+`xblock_accum.convT: "hw"` (default `"plain"`) puts a `ConvTranspose2d` with
+`groups == 1` on the HW path instead: `MXConvTranspose2dHW`
+(`mx_layers_convT.py`), a stride-1 conv over the zero-inserted input with the
+weight transposed and flipped. The input is MX-quantized on the real tensor by
+the normal `MXConv2dHW` path (any act blockify), the kernel inserts the zeros
+after extracting the ints and exponents, and the window, `hw_grids`,
+calibration and stats are the `MXConv2dHW` ones under the layer's name. The
+weight parameter stays in convT layout, so state_dict keys and shapes do not
+change. Grouped (depthwise) convT stays on plain MX; GPTQ skips the layer.
+`configs/mx_config_dof_run_win_cal_convT.json` is the DOF run config with the
+three dense `conv1` layers on this path.
 
 ```json
 "groups": {

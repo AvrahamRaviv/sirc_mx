@@ -291,6 +291,37 @@ def clamp_block_exp(q, e_base, exp_bits, fmt='int8'):
     return y, int((y != q).sum().item())
 
 
+def _pair(v):
+    return tuple(int(t) for t in v) if isinstance(v, (tuple, list)) else (int(v), int(v))
+
+
+def dilate_input(t, in_dil=1, in_extra=0):
+    """Zero-insert on the last two (spatial) dims: in_dil - 1 zeros between
+    neighbours, then in_extra zeros at the bottom/right. This is how a
+    ConvTranspose2d runs as a stride-1 conv (`MXConvTranspose2dHW`).
+
+    Applied to the extracted operand (intN values and their per-position
+    shared exponents), so the blocks were formed on the real tensor by
+    whatever act blockify is set; an inserted zero gives a 0 product, so the
+    exponent it carries (0) never matters. Returns `t` itself when
+    in_dil == 1 and in_extra == 0.
+    """
+    sH, sW = _pair(in_dil)
+    eH, eW = _pair(in_extra)
+    if (sH, sW, eH, eW) == (1, 1, 0, 0):
+        return t
+    *lead, H, W = t.shape
+    out = t.new_zeros(*lead, (H - 1) * sH + 1 + eH, (W - 1) * sW + 1 + eW)
+    out[..., :(H - 1) * sH + 1:sH, :(W - 1) * sW + 1:sW] = t
+    return out
+
+
+def _undilate(t, in_dil, H, W):
+    """Inverse of `dilate_input` on the last two dims (keeps the real H x W)."""
+    sH, sW = _pair(in_dil)
+    return t[..., :(H - 1) * sH + 1:sH, :(W - 1) * sW + 1:sW]
+
+
 def _sat(x, lo, hi):
     """Clamp to [lo, hi] and return (clamped, over|under mask)."""
     sat = (x < lo) | (x > hi)
@@ -464,6 +495,10 @@ class HWFxpConv2dFn(torch.autograd.Function):
 
     `e_qa_out` (None = off) turns on the static output window; see
     `_apply_out_window`.
+
+    `in_dil` / `in_extra` zero-insert the input after extraction (see
+    `dilate_input`): a ConvTranspose2d run as a stride-1 conv. Both backends
+    get the dilated operand, so they need no change. Defaults are a no-op.
     """
 
     @staticmethod
@@ -477,6 +512,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
         act_blockify='channel', weight_blockify='channel',
         npe_triton_variant='reuse',
         e_qa_out=None, win_bits=None, out_round='floor',
+        in_dil=(1, 1), in_extra=(0, 0),
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
         win_sink = {} if e_qa_out is not None else None
@@ -491,13 +527,22 @@ class HWFxpConv2dFn(torch.autograd.Function):
         want_acc = bool(stats_sink is not None and stats_sink.get("want_acc"))
         acc_flat = None
 
+        with torch.no_grad():
+            if npe:
+                qi_i8, Ea = extract_mxint_xblock(qi_fp, bs, fmt=fmt)
+                qw_i8, Ew = extract_mxint_flatten(qw_fp, bs, fmt=fmt)
+            else:
+                qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
+                qw_i8, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
+            # Zero-insert after extraction: blocks are formed on the real
+            # input by any act blockify, then the ints and exps are dilated.
+            qi_i8 = dilate_input(qi_i8, in_dil, in_extra)
+            Ea = dilate_input(Ea, in_dil, in_extra)
+
         if npe:
             # NPE: independent per-element exponents (act X-block, weight
             # flatten-block). GPU via triton ('reuse' = existing kernel at bs=1,
             # or 'opt' = dedicated per-lane kernel); torch ref otherwise.
-            with torch.no_grad():
-                qi_i8, Ea = extract_mxint_xblock(qi_fp, bs, fmt=fmt)
-                qw_i8, Ew = extract_mxint_flatten(qw_fp, bs, fmt=fmt)
             use_triton = (backend == "triton" and qi_fp.is_cuda)
             if use_triton:
                 if sat_mode == "per_block":
@@ -535,10 +580,6 @@ class HWFxpConv2dFn(torch.autograd.Function):
                 out_flat, sat_flat = res[0], res[1]
                 acc_flat = res[2] if want_acc else None
         else:
-            with torch.no_grad():
-                qi_i8, Ea = extract_mxint(qi_fp, bs, axis=1, fmt=fmt)
-                qw_i8, Ew = extract_mxint(qw_fp, bs, axis=1, fmt=fmt)
-
             use_triton = (backend == "triton" and qi_fp.is_cuda)
             if use_triton:
                 from .mx_fixed_point_hw_triton import _hw_fxp_conv2d_triton
@@ -563,7 +604,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
                 out_flat, sat_flat = res[0], res[1]
                 acc_flat = res[2] if want_acc else None
 
-        B, _, H, W = qi_fp.shape
+        B, _, H, W = qi_i8.shape          # dilated size when in_dil > 1
         O, _, kH, kW = qw_fp.shape
         sH, sW = (stride if isinstance(stride, tuple) else (stride, stride))
         pH, pW = (padding if isinstance(padding, tuple) else (padding, padding))
@@ -606,6 +647,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
         ctx.stride = (sH, sW)
         ctx.padding = (pH, pW)
         ctx.dilation = (dH, dW)
+        ctx.in_dil, ctx.in_extra = _pair(in_dil), _pair(in_extra)
         ctx.ste_mask = bool(ste_mask)
         return out
 
@@ -615,26 +657,31 @@ class HWFxpConv2dFn(torch.autograd.Function):
         if ctx.ste_mask and sat.any():
             grad_out = grad_out * (~sat).to(grad_out.dtype)
 
+        # STE on the conv the forward ran: over the dilated input, then back
+        # to the real positions (no-op without in_dil / in_extra).
+        qi_d = dilate_input(qi_fp, ctx.in_dil, ctx.in_extra)
         grad_qi = torch.nn.grad.conv2d_input(
-            qi_fp.shape, qw_fp, grad_out,
+            qi_d.shape, qw_fp, grad_out,
             stride=ctx.stride, padding=ctx.padding, dilation=ctx.dilation, groups=1,
         )
+        grad_qi = _undilate(grad_qi, ctx.in_dil, *qi_fp.shape[-2:])
         grad_qw = torch.nn.grad.conv2d_weight(
-            qi_fp, qw_fp.shape, grad_out,
+            qi_d, qw_fp.shape, grad_out,
             stride=ctx.stride, padding=ctx.padding, dilation=ctx.dilation, groups=1,
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 20 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # forward took 22 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
         # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink,
         # fmt, act_blockify, weight_blockify, npe_triton_variant,
-        # e_qa_out, win_bits, out_round
+        # e_qa_out, win_bits, out_round, in_dil, in_extra
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
             None, None, None, None, None, None,
             None, None, None,
             None, None, None,
+            None, None,
         )
 
 
@@ -648,6 +695,7 @@ def hw_fxp_conv2d(
     npe_triton_variant='reuse',
     e_qa_out=None, win_bits=None, out_round='floor',
     out_exp_bits=OUT_EXP_BITS,
+    in_dil=1, in_extra=0,
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
@@ -664,6 +712,8 @@ def hw_fxp_conv2d(
     +-(2^win_bits - 1), dropped bits rounded per `out_round`. Forward only;
     the backward is the same STE either way. `win_bits=None` derives it from
     `fmt` and `out_exp_bits` (`derive_out_window_bits`).
+    `in_dil` / `in_extra` zero-insert the extracted input (`dilate_input`):
+    `stride`/`padding`/`dilation` then describe the stride-1 conv over it.
     """
     if e_qa_out is not None and win_bits is None:
         win_bits = derive_out_window_bits(fmt, out_exp_bits)
@@ -682,6 +732,7 @@ def hw_fxp_conv2d(
         str(npe_triton_variant),
         None if e_qa_out is None else int(e_qa_out),
         None if win_bits is None else int(win_bits), str(out_round),
+        _pair(in_dil), _pair(in_extra),
     )
 
 

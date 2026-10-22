@@ -52,6 +52,7 @@ from fixed_point.fxp_quant import (fxp_format_str, fxp_stats_value,
                                    fake_quant_fxp, fxp_clip_stats)
 from mx_layers_blocked import MXConv2dBlocked, MXLinearBlocked, MXConv2dHW
 from mx_layers_act import MXActQuant
+from mx_layers_convT import MXConvTranspose2dHW
 from mx_debug import _ascii_hist
 
 _RESERVOIR_CAP = 65536
@@ -68,7 +69,8 @@ def _log(log, msg):
 
 def _layer_type_name(module):
     """Most-derived readable class name (library classes are named Conv2d/Linear)."""
-    for cls, name in ((MXConv2dHW, "MXConv2dHW"),
+    for cls, name in ((MXConvTranspose2dHW, "MXConvTranspose2dHW"),
+                      (MXConv2dHW, "MXConv2dHW"),
                       (MXConv2dBlocked, "MXConv2dBlocked"),
                       (MXLinearBlocked, "MXLinearBlocked"),
                       (MXConvTranspose2d, "MXConvTranspose2d"),
@@ -350,7 +352,9 @@ def _weight_stats(module, detail=False):
     _, wt_axes = _layer_quant_axes(module)
     sink = _TensorStats()
     with torch.no_grad():
-        w = module.weight.data.float()
+        # HW layers: the weight as the HW path quantizes it (conv layout).
+        w = (module._hw_weight() if isinstance(module, MXConv2dHW)
+             else module.weight).detach().float()
         if isinstance(module, MXConv2dHW) and _is_npe(module):
             # NPE flattens each filter [Cin,kH,kW] -> 1D and blocks the flat
             # axis, so a block spans kernel taps as well as channels. Blocking
@@ -366,7 +370,7 @@ def _fp32_functional(mod, x):
     """FP32 reference output of `mod` on input x, using its stored weights."""
     w = mod.weight.to(x.dtype)
     b = mod.bias.to(x.dtype) if mod.bias is not None else None
-    if isinstance(mod, MXConvTranspose2d):
+    if isinstance(mod, (MXConvTranspose2d, MXConvTranspose2dHW)):
         return F.conv_transpose2d(x, w, b, mod.stride, mod.padding,
                                   mod.output_padding, mod.groups, mod.dilation)
     if isinstance(mod, MXConv2d):
@@ -751,8 +755,8 @@ def collect_stats(model, data=None, forward_fn=None, *,
             entry["act_blockify"], entry["weight_blockify"] = act_b, wt_b
             if _is_npe(m):
                 # wt_axes indexes the flattened weight, not the 4D tensor
-                entry["wt_shape_blocked"] = [m.weight.shape[0],
-                                             int(m.weight[0].numel())]
+                w_hw = m._hw_weight()
+                entry["wt_shape_blocked"] = [w_hw.shape[0], int(w_hw[0].numel())]
         if is_act_only:
             entry["inputs"] = [
                 _act_input_entry(m, st, i, isp, sink, histograms)

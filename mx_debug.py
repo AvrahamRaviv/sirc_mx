@@ -165,6 +165,10 @@ def debug_layer(layer, x, *, e_layer_min=-20, out_idx=None, n_blocks=2, n_lanes=
         print("[debug_layer] layer.mx_none is True -> MX disabled; nothing to trace.")
         return {"mx_none": True}
 
+    if getattr(layer, "_hw_geom", None) and layer._hw_geom()["in_dil"] != (1, 1):
+        raise NotImplementedError(
+            "debug_layer traces a plain conv; zero-insert layers "
+            "(MXConvTranspose2dHW) are not supported.")
     is_hw = isinstance(layer, MXConv2dHW)
     is_blk = (not is_hw) and isinstance(layer, MXConv2dBlocked)
     kind = "MXConv2dHW" if is_hw else "MXConv2dBlocked" if is_blk else "MXConv2d"
