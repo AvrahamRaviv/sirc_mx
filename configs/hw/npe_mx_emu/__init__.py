@@ -17,6 +17,7 @@ from npe_mx_emu.mx_format import (
     mx_weight_quantizer,
 )
 from npe_mx_emu.hw_pipe import (
+    SUPPORTED_ACC_WIDTHS,
     Cstruct,
     MXConv2D_Loops,
     align_mx_to_elements,
@@ -27,6 +28,7 @@ from npe_mx_emu.hw_pipe import (
     relux,
     tru_a,
     tru_w,
+    wrap_accumulator,
 )
 from npe_mx_emu.calib import (
     LayerMXQParams,
@@ -47,6 +49,7 @@ __all__ = [
     "MXTensor",
     "MXTensorConfig",
     "SIGN_BIT",
+    "SUPPORTED_ACC_WIDTHS",
     "align_mx_to_elements",
     "base_mx_quantizer",
     "bcu",
@@ -58,6 +61,7 @@ __all__ = [
     "mx_config_factory",
     "mx_dequantizer",
     "mx_weight_quantizer",
+    "wrap_accumulator",
     "pcu",
     "pcu_div",
     "pcu_pla",

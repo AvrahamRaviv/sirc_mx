@@ -6,7 +6,9 @@ only hold values in [0, 15], so calibrate_offset must scale the data such that
 NO block exponent goes negative.  The observer enforces this by construction:
 
   mx mode    : anchor the smallest non-zero block amax so its exponent lands at 0
-               calibrate_offset = mantissa_offset - ceil(log2(a_min))
+               (block exponent extraction is floor(log2) -- HW-confirmed Q1 --
+               so the anchor condition is a*2^cal >= 2^mantissa_offset)
+               calibrate_offset = mantissa_offset - floor(log2(a_min))
   input mode : integer sensor input uses a zero shared exponent and raw ints --
                the scale must make the data fit the signed int8 mantissa range
                calibrate_offset = mantissa_offset - ceil(log2(a_max))
@@ -43,6 +45,12 @@ class MXObserver:
     mode:
         "mx"    - intermediate activations / weights (exponent-anchored rule)
         "input" - first-layer integer sensor input (int8 range-fit rule)
+
+    Blocking follows the HW data-consumption order (HW restriction): activations
+    are blocked along W per channel row; weights are blocked per flattened
+    kernel.  Pass ``per_row_flatten=True`` to update() when observing weights,
+    otherwise the observer's anchor does not match the quantizer's blocks
+    (see algo table item Q9).
     reduction:
         "minmax" - hard global min/max over all update() calls.  Required for
                    the no-negative-exponent guarantee to hold on unseen data.
@@ -74,8 +82,22 @@ class MXObserver:
         self.a_min: Optional[float] = None  # smallest non-zero block amax seen
         self.n_samples = 0
 
-    def update(self, x: torch.Tensor) -> "MXObserver":
-        batch_amax = _block_amax_reduction(x.detach().float(), self.block_size)
+    def update(self, x: torch.Tensor, per_row_flatten: bool = False) -> "MXObserver":
+        """Collect block-amax statistics from one calibration sample.
+
+        Blocking must match the HW data-consumption order of the tensor kind:
+          * activations (default): blocks of ``block_size`` along W, per channel
+            row -- a block never crosses a line.
+          * weights (``per_row_flatten=True``): each output-channel kernel is
+            flattened to ``C*Kh*Kw`` elements and THEN blocked, mirroring
+            ``mx_weight_quantizer`` (HW receives weights as flat per-kernel
+            streams).  For dim <= 2 the tensor is observed as-is, same as the
+            quantizer's shallow branch.
+        """
+        x = x.detach().float()
+        if per_row_flatten and x.dim() > 2:
+            x = x.reshape(x.shape[0], -1)
+        batch_amax = _block_amax_reduction(x, self.block_size)
         b_max = batch_amax.max().item()
         nz = batch_amax[batch_amax > 0]
         b_min = nz.min().item() if nz.numel() > 0 else None
@@ -107,9 +129,11 @@ class MXObserver:
         return int(mx_config_factory[self.mx_type].mantissa_bits - SIGN_BIT - GREATER_THAN_ONE_BIT)
 
     def max_block_exponent(self, calibrate_offset: int) -> int:
-        """Exponent of the largest block after scaling (the 4-bit-register endpoint)."""
+        """Exponent of the largest block after scaling (the exponent-register endpoint).
+
+        Matches the quantizer's floor(log2) extraction (Q1)."""
         a_max, _ = self._stats()
-        return int(math.ceil(math.log2(a_max * 2.0 ** calibrate_offset)) - self.mantissa_offset())
+        return int(math.floor(math.log2(a_max * 2.0 ** calibrate_offset)) - self.mantissa_offset())
 
     def calibrate_offset(self) -> int:
         a_max, a_min = self._stats()
@@ -118,7 +142,8 @@ class MXObserver:
 
         if self.mode == "mx":
             # anchor the smallest non-zero block exponent at 0 -> no negative exponents
-            cal = m_off - math.ceil(math.log2(a_min))
+            # (floor extraction: floor(log2(a*2^cal)) >= m_off <=> a*2^cal >= 2^m_off)
+            cal = m_off - math.floor(math.log2(a_min))
         else:  # "input": raw int storage with zero shared exponent, fit int8 range
             cal = m_off - math.ceil(math.log2(a_max))
 
@@ -127,8 +152,9 @@ class MXObserver:
             if max_exp > sat_val:
                 raise ValueError(
                     f"observer stats (a_min={a_min:.6g}, a_max={a_max:.6g}) exceed the "
-                    f"4-bit exponent window: smallest block would sit at exponent 0 but "
-                    f"the largest block needs exponent {max_exp} > {sat_val}. "
+                    f"{int(mx_config_factory[self.mx_type].exponent_bits)}-bit exponent window: "
+                    f"smallest block would sit at exponent 0 but the largest block needs "
+                    f"exponent {max_exp} > {sat_val}. "
                     f"Per-channel calibration is required for this tensor."
                 )
         return cal

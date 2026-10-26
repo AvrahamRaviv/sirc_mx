@@ -6,13 +6,13 @@ per known arithmetic difference. Prints numbers; changes nothing.
 
 Rerun when HW sends new code: a section whose numbers change means that
 difference moved. Sections:
-  T1 activation quantizer (exp ceil vs floor, truncate vs round, pre-round)
+  T1 activation quantizer (floor exp, truncate vs round, no pre-round)
   T7 their mx_dequantizer vs the value their pipe uses
-  T3 HW accumulator exactness (float32 p_sum)
-  T4 PCU rounding (floor before round)
-  T5 bias projection
-  T6 accumulator saturation (sticky vs clamp-and-continue)
-  T8 weight observer blocking vs weight quantizer blocking
+  T3 HW accumulator exactness (int64 p_sum)
+  T4 PCU rounding (round half up vs floor)
+  T5 bias projection (half up vs half to even)
+  T6 accumulator overflow (two's-complement wrap vs clamp-and-continue)
+  T8 weight observer blocking (per_row_flatten) vs weight quantizer blocking
   T9 4-bit exponent wrap
   T10 4-bit exponent window: ALG fixed vs HW per-tensor offset
 Both sides run mx_config_npe_e4.json (scale_bits 4, the NPE exponent width).
@@ -51,10 +51,11 @@ qa = a["a_int"].double() * 2.0 ** (a["a_exp"].double().repeat_interleave(32, -1)
 hd = h["hw_a_mant"].double().reshape(1, 4, 6, -1)[..., :40]
 he = h["hw_a_exp"].double().repeat_interleave(32, -1)[..., :40]
 qh = hd * 2.0 ** (he - cal)
-# my reading of their rule: trunc(round(x 2^c) / 2^(ceil(log2 amax)-6))
-xi = (x.double() * 2 ** cal).round()
+# my reading of their rule (not an input layer: no pre-round):
+# trunc(x 2^c / 2^(floor(log2 amax)-6))
+xi = x.double() * 2 ** cal
 am = F.pad(xi, (0, 24)).reshape(1, 4, 6, 2, 32).abs().amax(-1)
-E = torch.where(am > 0, torch.log2(am.clamp(min=1e-30)).ceil(), torch.zeros_like(am))
+E = torch.where(am > 0, torch.log2(am.clamp(min=1e-30)).floor(), torch.zeros_like(am))
 mine = torch.trunc(F.pad(xi, (0, 24)).reshape(1, 4, 6, 2, 32) / 2 ** (E - 6).unsqueeze(-1)).reshape(1, 4, 6, 64)[..., :40]
 print("my model of HW rule == their data:", bool((mine == hd).all()))
 print(f"max|mant|  ALG {int(a['a_int'].abs().max())}   HW {int(hd.abs().max())}")
@@ -64,7 +65,7 @@ print(f"HW bias (mean err, trunc->toward 0 of |x|): {float(((qh.abs() - x.abs())
 
 # ---------------------------------------------------------------- T7 dequantizer
 hdr("T7 their mx_dequantizer vs the value their pipe uses")
-mx = base_mx_quantizer((x * 2 ** cal).round(), calibrate_offset=cal)
+mx = base_mx_quantizer(x * 2 ** cal, calibrate_offset=cal)
 dq = mx_dequantizer(mx)
 print(f"mx_dequantizer / true value ratio: {float((dq[x.abs() > 0.1] / qh.float()[x.abs() > 0.1]).median()):.6f}  (1.0 = consistent; 2^-6 = {2**-6:.6f})")
 
@@ -81,13 +82,13 @@ def exact_acc(h, w_shape, x_shape):
         acc[:, o] = ((A_ * wd[o].view(1, -1, 1)) << (AE + we[o].view(1, -1, 1))).sum(1)
     return acc
 
-hdr("T3 HW accumulator exactness (float32 p_sum)")
+hdr("T3 HW accumulator exactness (int64 p_sum)")
 for name in ["conv1x1", "conv3x3_p0"]:
     cc = C.build(name); hh = H.run(cc)
     ex = exact_acc(hh, cc["w"].shape, cc["x"].shape).reshape(hh["hw_acc"].shape)
     print(f"{name}: max|acc| {int(ex.abs().max())} (2^{math.log2(ex.abs().max()):.1f})  hw_acc==exact int: {bool((hh['hw_acc'].double() == ex.double()).all())}")
 # worst case on their bcu directly: a big and a tiny product in one dot
-# product (exps legal 0..15, sum fits 46 bits) - float32 drops the low bits
+# product (exps legal 0..15, sum fits 48 bits) - float32 dropped the low bits
 xd = torch.tensor([[63.0, 1.0]]); xe = torch.tensor([[10.0, 0.0]])
 wd = torch.tensor([63.0, 1.0]); we = torch.tensor([10.0, 0.0])
 exact = 63 * 63 * 2 ** 20 + 1
@@ -95,14 +96,17 @@ got = int(bcu(xd, xe, wd, we).item())
 print(f"bcu 63*63*2^20 + 1: exact {exact}  HW {got}  diff {exact - got}")
 
 # ---------------------------------------------------------------- T4 PCU rounding
-hdr("T4 PCU: floor then round")
-v = torch.tensor([10.0, 11.0, 13.0, -11.0, -13.0])   # /4 -> 2.5 2.75 3.25 -2.75 -3.25
+hdr("T4 PCU rounding: HW round half up (ties to +inf) vs ALG window")
+v = torch.tensor([10, 11, 13, -6, -10, -11])   # /4 -> 2.5 2.75 3.25 -1.5 -2.5 -2.75
 print("in            ", v.tolist(), "shift -2 (x/4)")
 print("pcu_div round ", pcu_div(v, -2, "round").tolist())
-print("true round    ", (v / 4).round().tolist())
+print("half up       ", (v / 4 + 0.5).floor().long().tolist())
+print("ALG floor     ", (v >> 2).tolist(), "  ALG nearest", ((v + 2) >> 2).tolist(),
+      "(xblock_accum.out_round)")
 cc = C.build("conv3x3_p0"); hh = H.run(cc)
 e = 12 - int(hh["x_cal"]) - int(hh["w_cal"])
-print(f"conv3x3_p0: out_raw == floor(acc*2^{e}): {bool((hh['out_raw'] == (hh['hw_acc'] * 2.0 ** e).floor()).all())}")
+print(f"conv3x3_p0: out_raw == floor(acc*2^{e} + 1/2): "
+      f"{bool((hh['out_raw'] == (hh['hw_acc'].double() * 2.0 ** e + 0.5).floor()).all())}")
 
 # ---------------------------------------------------------------- T5 bias
 hdr("T5 bias projection")
@@ -110,29 +114,30 @@ cc = C.build("conv3x3_bias"); cc["params"]["padding"] = 0
 hh = H.run(cc); aa = A.run(cc)
 bc = int(hh["x_cal"]) + int(hh["w_cal"])
 b = cc["b"].double()
-print(f"HW bias = floor(b*2^{bc}) (acc LSB 2^-{bc}), err max {float((b - (b * 2 ** bc).floor() / 2 ** bc).abs().max()):.2e}")
-print(f"ALG bias = round(b*2^20),  err max {float((b - (b * 2 ** 20).round() / 2 ** 20).abs().max()):.2e}")
+print(f"HW bias = floor(b*2^{bc} + 1/2) (acc LSB 2^-{bc}), err max {float((b - (b * 2 ** bc + 0.5).floor() / 2 ** bc).abs().max()):.2e}")
+print(f"ALG bias = round(b*2^20) (torch: half to even),  err max {float((b - (b * 2 ** 20).round() / 2 ** 20).abs().max()):.2e}")
+t = torch.tensor([0.5, 1.5, 2.5, -0.5, -2.5], dtype=torch.float64)
+print(f"ties b*2^k {t.tolist()}: HW {(t + 0.5).floor().long().tolist()}  ALG {t.round().long().tolist()}")
 print(f"with bias end-to-end: max|ALG-fp32| {float((aa['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}  max|HW-fp32| {float((hh['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}")
 
 # ---------------------------------------------------------------- T6 saturation
-hdr("T6 accumulator saturation (bcu, acc_bit_width=8 -> range [-128,127])")
-xd = torch.tensor([[100.0, 100.0, -100.0]]); z = torch.zeros(1, 3)
-wd = torch.tensor([1.0, 1.0, 1.0]); wz = torch.zeros(3)
-print("products +100 +100 -100")
-print("HW bcu:", bcu(xd, z, wd, wz, acc_bit_width=8).tolist(), " (sticky: once at limit, later products dropped)")
-acc = 0
-for p in [100, 100, -100]:
-    acc = max(-128, min(127, acc + p))
-print("ALG per_product clamp-and-continue:", acc)
-print("HW pos limit check uses >= 2^(n-1)-1 -> a sum landing exactly on 127 is also frozen:",
-      bcu(torch.tensor([[127.0, -5.0]]), torch.zeros(1, 2), torch.tensor([1.0, 1.0]), torch.zeros(2), acc_bit_width=8).tolist())
+hdr("T6 accumulator overflow (bcu, acc_bit_width=48 -> range [-2^47, 2^47-1])")
+lo, hi = -2 ** 47, 2 ** 47 - 1
+for signs in ([1, 1, -1], [1, 1, 1]):
+    xd = torch.tensor([signs]); xe = torch.full((1, 3), 46)   # each product = +-2^46
+    wd = torch.ones(3, dtype=torch.long); we = torch.zeros(3, dtype=torch.long)
+    acc = 0
+    for s_ in signs:
+        acc = max(lo, min(hi, acc + s_ * 2 ** 46))
+    print(f"products {['%+d*2^46' % s_ for s_ in signs]}: true {sum(signs) * 2 ** 46}  "
+          f"HW wrap {int(bcu(xd, xe, wd, we, acc_bit_width=48).item())}  ALG clamp {acc}")
 
 # ---------------------------------------------------------------- T8 observer blocking
 hdr("T8 weight observer blocks vs weight quantizer blocks")
 w = C.build("conv3x3_p0")["w"]
 o_theirs = MXObserver(mode="mx"); o_theirs.update(w)
-o_flat = MXObserver(mode="mx"); o_flat.update(w.reshape(w.shape[0], -1))
-print(f"observer on w as given (blocks along kW=3): w_cal {o_theirs.calibrate_offset()}   on flattened filter (= quantizer blocks): {o_flat.calibrate_offset()}")
+o_flat = MXObserver(mode="mx"); o_flat.update(w, per_row_flatten=True)
+print(f"observer default (blocks along kW=3): w_cal {o_theirs.calibrate_offset()}   per_row_flatten=True (= quantizer blocks, main_HW uses it): {o_flat.calibrate_offset()}")
 mxw = H.run(C.build("conv3x3_p0"))["hw_w_exp"]
 print(f"resulting weight block exps used: {mxw.unique().tolist()}  (min 0 = anchored; >0 = headroom spent)")
 

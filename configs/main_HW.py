@@ -45,22 +45,21 @@ from taps import tap, show
 
 # --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
 from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
-from npe_mx_emu import mx_config_factory
+from npe_mx_emu import mx_config_factory, SUPPORTED_ACC_WIDTHS
 from npe_mx_emu import hw_pipe as _hw_pipe
 
 # Widths fixed inside npe_mx_emu - their API has no parameter for them, so the
 # config can't reach them (listed so a config that disagrees is visible):
 HW_FIXED = {
-    "acc_bits": 46,        # hw_pipe.bcu default; MXConv2D_Loops never passes it
     "pcu_clamp_bits": 24,  # calib.build_c_struct_arr default; calibrate() never passes it
-    "exp_wrap_mask": 0xF,  # mx_format.base_mx_quantizer:83, ignores exponent_bits
 }
 
 
 def hw_format(cfg):
     """Config mx_specs -> npe_mx_emu (mx_type, block_size).
 
-    mx_type is their name "mx-e{scale_bits}bm{mantissa bits}". Refused when
+    mx_type is their name "mx-e{scale_bits}bm{mantissa bits}"; the exponent
+    wrap mask comes with it (their MXTensorConfig.overflow_mask). Refused when
     their code can't run it as configured, rather than silently running
     something else.
     """
@@ -74,11 +73,20 @@ def hw_format(cfg):
         raise NotImplementedError(
             f"HW: {mx_type} (scale_bits={ebits}, {a}) not in npe_mx_emu "
             f"mx_config_factory {sorted(mx_config_factory)}")
-    if (1 << ebits) - 1 != HW_FIXED["exp_wrap_mask"]:
-        raise NotImplementedError(
-            f"HW: scale_bits={ebits} but npe_mx_emu wraps the exponent at "
-            f"4 bits (mx_format.py:83 preserve_lsb = 0xf, their own TODO)")
     return mx_type, int(sp["block_size"])
+
+
+def hw_acc_bits(cfg):
+    """Accumulator width: config xblock_accum.bits, refused unless their
+    MXConv2D_Loops supports it (SUPPORTED_ACC_WIDTHS). No xblock_accum -> their
+    default (48)."""
+    xa = cfg["mx_specs"].get("xblock_accum")
+    bits = int(xa.get("bits", 48)) if isinstance(xa, dict) else 48
+    if bits not in SUPPORTED_ACC_WIDTHS:
+        raise NotImplementedError(
+            f"HW: xblock_accum.bits={bits}, npe_mx_emu supports "
+            f"{SUPPORTED_ACC_WIDTHS}")
+    return bits
 
 
 @contextlib.contextmanager
@@ -109,8 +117,8 @@ def conv(case, cfg, taps):
       calibrate() -> forward(x) -> raw int, float = raw * 2^-output_scale_log2
 
     Their format differs from ALG by design (e4bm8: per-tensor calibrate
-    offset, ceil log2, unsigned 4-bit exponent with wrap, mantissa truncate,
-    46-bit acc with floor shift, PCU round + 24-bit clamp), so their integer
+    offset, unsigned exponent with wrap, mantissa truncate, int64 acc with
+    two's-complement wrap, PCU round half up + 24-bit clamp), so their integer
     taps carry an `hw_` prefix and are not compared to ALG's; `out` is.
 
     Not supported by their code: padding (they raise), dilation (they have no
@@ -119,24 +127,30 @@ def conv(case, cfg, taps):
 
     Taps: x w | x_cal w_cal pre_round_moved | hw_a_mant hw_a_exp |
           hw_w_mant hw_w_exp | hw_acc | out_raw | out
-    pre_round_moved: how many input elements their round(x * 2^x_cal) in
-    CalibratedMXConv2d.forward changed (0 = input already integer there).
+    pre_round_moved: how many input elements a round(x * 2^x_cal) would
+    change. Their forward rounds only an input layer (is_input_layer); this
+    layer is not one, so x * 2^x_cal goes to their quantizer unrounded.
     """
     x, w, b, p = case["x"], case["w"], case["b"], case["params"]
     O, Cin, kH, kW = w.shape
     if p["dilation"] != 1:
         raise NotImplementedError("HW conv: npe_mx_emu has no dilation")
     mx_type, bs = hw_format(cfg)
+    acc_bits = hw_acc_bits(cfg)
 
-    # calibration (theirs)
+    # calibration (theirs); weights blocked per flattened kernel, as they say
     obs_x = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_x.update(x)
-    obs_w = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_w.update(w)
+    obs_w = MXObserver(block_size=bs, mx_type=mx_type, mode="mx")
+    obs_w.update(w, per_row_flatten=True)
     qp = LayerMXQParams(x_cal=obs_x.calibrate_offset(),
                         w_cal=obs_w.calibrate_offset(),
                         block_size=bs, mx_type=mx_type)
 
     layer = CalibratedMXConv2d(Cin, O, (kH, kW), stride=p["stride"],
                                padding=p["padding"], qparams=qp)
+    # their CalibratedMXConv2d doesn't forward acc_bit_width; MXConv2D_Loops
+    # keeps it as an attribute and passes it to bcu
+    layer.mx_conv.acc_bit_width = acc_bits
     with torch.no_grad():
         layer.mx_conv.weight.copy_(w)
         layer.mx_conv.bias.copy_(b if b is not None else torch.zeros(O))
@@ -159,6 +173,7 @@ def conv(case, cfg, taps):
     tap(taps, "w_cal", qp.w_cal)
     xs = x.double() * 2.0 ** qp.x_cal
     tap(taps, "pre_round_moved", int((xs != xs.round()).sum()))
+    tap(taps, "acc_bits", acc_bits)
     tap(taps, "hw_a_mant", mx_a.data)        # [B, Cin, H, nblk, bs] int32
     tap(taps, "hw_a_exp", mx_a.shared_exp)   # [B, Cin, H, nblk]
     tap(taps, "hw_w_mant", mx_w.data)        # [O, nblk, bs]

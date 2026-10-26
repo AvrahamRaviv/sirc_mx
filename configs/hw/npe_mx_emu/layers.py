@@ -89,10 +89,19 @@ class CalibratedMXConv2d(nn.Module):
             self.calibrate()
 
         qp = self.qparams
-        x_int = (x * 2.0 ** qp.x_cal).round()
+        x_scaled = x * 2.0 ** qp.x_cal
         if qp.is_input_layer:
-            mx = input_mx_quantizer(x_int, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+            # The round-to-integer of x*2^cal happens exactly ONCE in the
+            # network, at the first layer (HW-confirmed, algo table Q3): the
+            # BCU shifters are unsigned/left-only, so operands must sit at a
+            # scale whose exponents are all non-negative -- i.e. integers.
+            mx = input_mx_quantizer(x_scaled.round(), block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
         else:
-            mx = base_mx_quantizer(x_int, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+            # Intermediate layers: NO pre-round -- the activation arrives in
+            # integer domain from the PCU (its shift_right realigns the scale
+            # between layers), and the MX quantizer's own per-block truncate
+            # is the only integer-ization.  A float boundary tensor therefore
+            # goes straight into the quantizer.
+            mx = base_mx_quantizer(x_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
         out_raw = self.mx_conv(mx)
         return out_raw

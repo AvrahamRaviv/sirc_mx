@@ -144,7 +144,28 @@ Bonus corruption downstream. e_min_layer is garbage too (6 instead of −4 for t
 The observer exists precisely to make the first constraint a guarantee checked at calibration time (exp ≥ 0 for the smallest block + window check ≤ 15 for the largest), rather than a coin flip per layer.
 
 
+#	Topic	Algorithm model	Emulator	What the test showed	Question	HW Answer	
 
+
+	1	Block exponent	floor(log2 max)	ceil(log2 max)	Block with max 0.43: floor stores 110 (step 1/256), ceil stores 55 (step 1/128). With ceil the mantissa never exceeds 64, so half of the int8 range is never used: one bit of precision lost on every block	Your format defines the mantissa as [−2, 2) (1 integer bit + 6 fraction bits, `mantissa_offset = 6`). Floor fills that range; ceil never uses the integer bit. Is ceil intended? (The code comment says "I think it should be ceil but check that".)	FIXED - floor(log₂ amax) (HW). Block-max mantissa fills [64,127] — integer bit is real;
+
+	2	Mantissa rounding	round to nearest	truncate toward zero	Values shrink toward zero on average (mean error −0.019 vs −0.0002)	Truncate or round to nearest? If round, are ties rounded away from zero or to even?	Truncate toward zero — magnitude dropped, sign preserved; sub-LSB negatives → 0, never −1 (HW)
+
+	3	Input scaling	quantized once	every layer first rounds `x · 2^cal` to an integer, then MX-quantizes it	Values are rounded twice: in a block with step 4, 7.4 → 4 but 7.6 → 8, a cutoff of 7.5 (neither truncation nor rounding). The smallest block gets round-to-nearest; larger blocks get this mix. When both sides are given the same integer input, the emulator–model gap drops by about a third	The NPE only receives integers, so some rounding step is real. Does it happen here, on every layer, with the grid picked by this layer's observer? Or only on the sensor input and in the previous layer's requantizer? If the latter, the `round()` in `CalibratedMXConv2d.forward` should apply only when `is_input_layer=True`	Once, at the first layer only (x·2^cal → round). Intermediate layers: no pre-round — PCU drains integers, shift_right (e_min sum) realigns scale; MX quantizer's truncate is the integer-ization. Motivation: BCU shifters unsigned/left-only; PCU shifter bidirectional (HW architect, this session)
+
+	4	Exponent register	signed exponent in a fixed range around 0 (8 bits today; −7..7 with 4 bits)	4-bit unsigned right shift (0..15) on the integer tensor `x · 2^cal`; the per-tensor `cal` moves the range; out-of-range values wrap (`& 0xF`)	(a) Low end: a block [20, −7, 3] next to a block with max 1000 needs a negative shift. The wrap turns it into shift 15 and stores [0, 0, 0]. Clamping to 0 would store it exactly, because small integers already fit in int8. (b) High end: a block max above 2^21 needs shift 16, which wraps to 0, so 2,097,157 reads back as 5. (c) A 24-bit signed word needs shifts 0..16 (23 magnitude bits − 7 mantissa bits): 17 values, while 4 bits give 16	(a) When a block would need a negative shift, does the silicon clamp it to 0 (lossless for integer input), or wrap? (b) Is the top bit of the 24-bit PCU window ever used? If yes, a 4-bit exponent can't reach it: it needs 5 bits, or a 23-bit window. (c) Is `cal` one value per tensor, fixed at PTQ?	(a) wrap-only on negative (unsigned 4-bit, left-only) — calibration must prevent them; (b) 24 bits = 23 magnitude + sign; (c) static per-tensor, fixed from offline PTQ
+
+	5	Accumulator	Fixed point	float32	--	As discussed, the accumulator is fixed point. (Does float32 give exactly the same result when the inputs are integers?) Either way, please switch the emulator to a fixed-point accumulator.	FIXED - int64 fixed-point
+
+	6	Saturation	48 bits, clamp after each add and continue	46 bits; once the limit is hit, later products are ignored	+100, +100, −100 in an 8-bit range gives 27 vs 127	Which width, and which behavior: freeze, or clamp and continue?	FIXED - Two's-complement wrap-and-continue at acc_bit_width ∈ {46,48,54,56}, default 48 (replaces old freeze+clamp)
+
+	7	Output rounding (PCU)	—	set to "round", but the code floors before rounding, so the result is a floor	2.75 → 2	Floor, round half up, or round half to even?	FIXED - Round half up (ties toward +∞, incl. −1.5→−1). Caveat: if silicon means away-from-zero, negative ties flip
+
+	8	Bias	round(b · 2^20)	floor(b · 2^(x_cal + w_cal))	Small error (6e-6 vs 3e-7)	Floor or round when converting the bias to accumulator units?	Offline; SW choice round half up floor(v+0.5), .long() into units 2^(x_cal+w_cal)
+
+	9	Weight calibration	—	the observer splits the weights into blocks differently from the quantizer	w_cal is 11 instead of 9; 2 bits of exponent range are wasted. Harmless for now	Should the observer use the same flattened blocks as the quantizer?	FIXED  - Observer must block weights per flattened kernel (per OC, C·Kh·Kw), mirroring HW consumption order
+
+	10	`mx_dequantizer`	—	result is off by 2^-6 from the values the pipeline actually uses	The helper only; the pipeline itself is consistent	Is a fix planned?	shift = shared_exp − calibrate_offset (old code subtracted m_off twice → ×2⁻⁶); ndim-keyed trim fixes conv-weight reshape crash; conv weights stack [OC,blocks,BS], linear [1,OC,blocks,BS] — both block per OC row
 
 Implemented layers:
 layer	status

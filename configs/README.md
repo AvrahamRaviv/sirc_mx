@@ -16,7 +16,7 @@ conv), and **warp**.
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
 | `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu` (conv). convT and warp are still placeholders |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop |
-| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their confluence guide, their example notebook (as flattened text) |
+| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their confluence guide (with their answers to the review table), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width. HW runs only at 4 bits |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
@@ -61,29 +61,33 @@ pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ## HW side (npe_mx_emu)
 
 `main_HW.conv` runs their flow as in their notebook:
-1. `MXObserver(mode="mx")` on x and on w gives `x_cal` and `w_cal`.
+1. `MXObserver(mode="mx")` on x and on w (`per_row_flatten=True`: blocks
+   per flattened kernel, as their quantizer) gives `x_cal` and `w_cal`.
 2. `LayerMXQParams` → `CalibratedMXConv2d` → `calibrate()` → `forward(x)`.
 3. `out = out_raw * 2^-output_scale_log2`.
 
 Their intermediates are tapped without touching their code: a forward pre-hook
 catches the MX input, and a pass-through wrapper on `bcu` keeps each `p_sum`.
-Their format is not ALG's (e4bm8: per-tensor calibrate offset, ceil log2,
-unsigned 4-bit exponent with wrap, mantissa truncate, 46-bit acc, PCU round,
-24-bit clamp), so their integer taps are `hw_*` and only `out` is compared.
+Their format is not ALG's (e4bm8: per-tensor calibrate offset, floor log2,
+unsigned exponent with wrap, mantissa truncate, int64 acc with two's-complement
+wrap, PCU round half up, 24-bit clamp, output grid 2^-12), so their integer
+taps are `hw_*` and only `out` is compared.
 
 Input mode: `--input float` feeds the float tensor (what the MX lib sees in
 training). `--input int --x-frac F` first snaps x to the grid 2^-F, giving an
 integer tensor as the NPE receives it; both sides get the same tensor.
-`--input both` prints HW-ALG for each. Their `round(x * 2^x_cal)` is a no-op on
-integer input while `x_cal >= F` (tap `pre_round_moved`).
+`--input both` prints HW-ALG for each. Their forward rounds `x * 2^x_cal` only
+for an input layer (`is_input_layer`); the sim's layer is not one, so
+`pre_round_moved` only counts elements off that integer grid.
 
 Exponent width: `mx_specs.scale_bits` drives both sides. ALG decodes the
 exponent code as `E + 2^(n-1)-1`. HW maps the config to their `mx_type`
-`mx-e{scale_bits}bm{N}` and `block_size`. It refuses a width it can't run:
-their wrap mask is fixed at 4 bits (`mx_format.py:83`), so the 8-bit framework
-configs get "HW not implemented". Use `--config mx_config_npe_e4.json`.
-Widths fixed inside their code (their API has no parameter): acc 46 bits, PCU
-clamp 24 bits (`main_HW.HW_FIXED`).
+`mx-e{scale_bits}bm{N}` (e4bm8, e6bm8, e8bm8; the wrap mask comes with the
+type) and `block_size`, and refuses a type they don't have. The NPE width is
+4 bits: `--config mx_config_npe_e4.json`.
+Accumulator width: `xblock_accum.bits`, one of their `SUPPORTED_ACC_WIDTHS`
+(46, 48, 54, 56), else refused. Fixed inside their code (their API has no
+parameter): PCU clamp 24 bits (`main_HW.HW_FIXED`).
 
 Their code does not support padding (it raises) or dilation (it has no such
 parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.

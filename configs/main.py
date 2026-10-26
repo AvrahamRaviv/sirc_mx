@@ -124,8 +124,9 @@ def main():
                 continue
             results[key] = report(key, compare(alg, hw), alg, hw)
             if "pre_round_moved" in hw:
-                print(f"  HW input pre-round moved {int(hw['pre_round_moved'])}"
-                      f"/{case['x'].numel()} elements")
+                print(f"  HW input off its integer grid (x*2^x_cal): "
+                      f"{int(hw['pre_round_moved'])}/{case['x'].numel()} elements"
+                      f" (not rounded: not an input layer)")
             d = (alg["out"].double() - hw["out"].double()).abs()
             outd.setdefault(name, {})[xf] = (float(d.max()),
                                              float((d ** 2).mean().sqrt()))

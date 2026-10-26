@@ -65,10 +65,14 @@ def build_c_struct(
 ) -> Cstruct:
     """Derive the PCU c_struct for one output channel from layer qparams.
 
-    Only place where the bias is rescaled into accumulator units.
+    Only place where the bias is rescaled into accumulator units.  This
+    conversion is done OFFLINE (HW answer, Q8): the rounding is a SW design
+    choice -- round half up (ties toward +inf, matching the PCU convention
+    in pcu_div), error <= 0.5 ULP of accumulator units.  ``.long()`` keeps
+    the whole PCU path integer (pcu_pla -> pcu_div) end to end.
     """
     return Cstruct(
-        bias=(bias_oc.float() * 2.0 ** qparams.b_cal).floor(),
+        bias=(bias_oc.float() * 2.0 ** qparams.b_cal + 0.5).floor().long(),
         scale=1,
         shift=0,
         round_type="round",

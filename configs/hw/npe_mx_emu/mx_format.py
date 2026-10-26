@@ -23,6 +23,13 @@ GREATER_THAN_ONE_BIT = 1
 class MXTensorConfig:
     mantissa_bits: int
     exponent_bits: int
+    overflow_mask: int
+
+
+mx_config_factory = dict()
+mx_config_factory['mx-e4bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(4), overflow_mask=0xF)
+mx_config_factory['mx-e6bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(6), overflow_mask=0x3F)
+mx_config_factory['mx-e8bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(8), overflow_mask=0xFF)
 
 
 @dataclass
@@ -37,8 +44,9 @@ class MXTensor:
 
 
 mx_config_factory = dict()
-mx_config_factory['mx-e4bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(4))
-mx_config_factory['mx-e8bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(8))
+mx_config_factory['mx-e4bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(4), overflow_mask=0xF)
+mx_config_factory['mx-e6bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(6), overflow_mask=0x3F)
+mx_config_factory['mx-e8bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(8), overflow_mask=0xFF)
 
 
 def mantissa_offset(mx_type: str = "mx-e4bm8") -> int:
@@ -47,6 +55,10 @@ def mantissa_offset(mx_type: str = "mx-e4bm8") -> int:
 
 
 def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx-e4bm8", calibrate_offset : int = 0) -> MXTensor:
+    """Mantissa rounding: truncate toward zero (truncate magnitude, preserve
+    sign) -- HW-confirmed (algo table Q2).  The divisor is a power of two so
+    the division is exact; ``.int()`` then realizes the truncation (negative
+    sub-LSB values go to 0, never to -1)."""
 
     x_scaled = x # offset to enssure unsigned exponenet (exponent shifted left)
     # 1. Pad to a multiple of block_size
@@ -68,7 +80,7 @@ def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx
     abs_blocks = blocks.abs()
     mask = abs_blocks > 0
     log2_vals = torch.zeros_like(abs_blocks)
-    log2_vals[mask] = torch.log2(abs_blocks[mask]).ceil()  # i think it should be ceil but check that
+    log2_vals[mask] = torch.log2(abs_blocks[mask]).floor()  # floor: block max mantissa fills [64,127] -- the integer bit is real (HW-confirmed, algo table Q1)
     log2_scale = log2_vals.amax(dim=-1)                                  # [batch, num_blocks]
 
     mantissa_offset = mx_config_factory[mx_type].mantissa_bits - SIGN_BIT - GREATER_THAN_ONE_BIT
@@ -80,8 +92,8 @@ def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx
     shift_sat = log2_scale - mantissa_offset
 
     # warp-around handling
-    preserve_lsb = 0xf
-    shift_sat = shift_sat.int() & preserve_lsb  # keep only unsigned 4-bits
+    preserve_lsb = mx_config_factory[mx_type].overflow_mask
+    shift_sat = shift_sat.int() & preserve_lsb  # keep only the unsigned exponent LSBs
 
     divisor = torch.exp2(shift_sat.unsqueeze(-1).float())
     data = blocks / divisor
@@ -109,6 +121,8 @@ def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx
 
 
 def input_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx-e4bm8", input_type : int = 8, calibrate_offset : int = 6) -> MXTensor:
+    """First-layer integer input quantizer.  Same truncate-toward-zero
+    convention as base_mx_quantizer (HW-confirmed, algo table Q2)."""
 
     x_scaled = x  # offset to enssure unsigned exponenet (exponent shifted left)
     # 1. Pad to a multiple of block_size
@@ -200,8 +214,32 @@ def mx_weight_quantizer(
 
 
 def mx_dequantizer(mx: MXTensor, mx_type: str = "mx-e4bm8") -> torch.Tensor:
-    # real value = mantissa * 2^(shared_exp - mantissa_offset - calibrate_offset)
-    shift = mx.shared_exp - (mx_config_factory[mx_type].mantissa_bits - SIGN_BIT - GREATER_THAN_ONE_BIT) - mx.calibrate_offset
+    """Invert the quantizer (QDQ/fake-quant node for QAT, algo table Q10).
+
+    real value = mantissa * 2^(shared_exp - calibrate_offset)
+
+    ``mantissa_offset`` enters exactly once -- inside ``shared_exp`` -- so it
+    must NOT be subtracted again here (the old code did, shrinking every value
+    by 2^-6).  ``mx_type`` is retained for API compatibility; the format's
+    mantissa offset is already embedded in ``shared_exp``.  Semantics
+    cross-verified against mxpt2e/weight_quant.mx_weight_dequantizer.
+
+    Weight tensors from ``mx_weight_quantizer`` are kernel-flattened per output
+    channel (data [OC, blocks, BS] vs original_shape (OC, C, Kh, Kw)), so the
+    padding trim depends on who blocked the tensor:
+      * activations path (dim grew by one: blocks replaced the last dim) ->
+        trim back to the original last dim;
+      * weight path (stacked per OC) -> trim back to the flattened kernel
+        length C*Kh*Kw (conv) or C (linear).  Conv weights stack one base
+        call per OC -> data [OC, blocks, BS]; linear (2-D) weights stack a
+        single base call over (OC, C) -> data [1, OC, blocks, BS]
+        (blocking is still per OC row; the ndim-keyed trim covers both).
+    """
+    shift = mx.shared_exp - mx.calibrate_offset
     deq = mx.data * torch.exp2(shift.unsqueeze(-1).float())
     flat = deq.reshape(*deq.shape[:-2], -1)
-    return flat[..., : mx.original_shape[-1]].reshape(mx.original_shape)
+    if len(mx.data.shape) == len(mx.original_shape) + 1:
+        flat = flat[..., : mx.original_shape[-1]]
+    else:
+        flat = flat[..., : torch.Size(mx.original_shape[1:]).numel()]
+    return flat.reshape(mx.original_shape)

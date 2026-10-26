@@ -83,8 +83,9 @@ def test_hw_placeholder(name):
 
 
 def test_int_input_is_on_grid_and_hw_preround_is_noop():
-    """--input int: x * 2^x_frac is an exact integer on both sides, and the
-    HW's own round(x * 2^x_cal) changes nothing while x_cal >= x_frac."""
+    """--input int: x * 2^x_frac is an exact integer on both sides, so
+    x * 2^x_cal is already integer while x_cal >= x_frac (HW rounds only an
+    input layer now; either way nothing would move)."""
     case = C.build("conv3x3_p0", x_frac=4)
     v = case["x"].double() * 16
     assert bool((v == v.round()).all())
@@ -94,15 +95,28 @@ def test_int_input_is_on_grid_and_hw_preround_is_noop():
 
 
 def test_exponent_width_comes_from_config():
-    """scale_bits drives both sides: ALG codes are E + 2^(n-1)-1; HW refuses a
-    width its code can't run (wrap mask fixed at 4 bits) instead of silently
-    running 4."""
+    """scale_bits drives both sides: ALG codes are E + 2^(n-1)-1; HW picks its
+    mx_type (and so its wrap mask) from it, and refuses a type it lacks."""
     c = C.build("conv3x3_p0")
-    e8 = ALG.run(c, SC.load_config("mx_config_dof.json"))
+    dof = SC.load_config("mx_config_dof.json")
+    e8 = ALG.run(c, dof)
     e4 = ALG.run(c, E4)
     assert int(e8["a_exp"].min()) > 100          # 8-bit: E + 127
     assert int(e4["a_exp"].max()) <= 14          # 4-bit: E + 7, in [0, 14]
     assert bool((e8["a_exp"].long() - 127 == e4["a_exp"].long() - 7).all())
-    with pytest.raises(NotImplementedError, match="wraps the exponent at 4 bits"):
-        HW.run(c, SC.load_config("mx_config_dof.json"))
     assert HW.hw_format(E4) == ("mx-e4bm8", 32)
+    assert HW.hw_format(dof) == ("mx-e8bm8", 32)
+    e5 = {"mx_specs": dict(E4["mx_specs"], scale_bits=5)}
+    with pytest.raises(NotImplementedError, match="not in npe_mx_emu"):
+        HW.hw_format(e5)
+
+
+def test_hw_acc_width_comes_from_config():
+    """xblock_accum.bits sets their accumulator width; unsupported widths are
+    refused."""
+    assert HW.hw_acc_bits(E4) == 48
+    t = HW.run(C.build("conv1x1"), E4)
+    assert int(t["acc_bits"]) == 48
+    xa = dict(E4["mx_specs"]["xblock_accum"], bits=35)
+    with pytest.raises(NotImplementedError, match="supports"):
+        HW.hw_acc_bits({"mx_specs": dict(E4["mx_specs"], xblock_accum=xa)})

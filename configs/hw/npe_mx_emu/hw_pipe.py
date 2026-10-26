@@ -96,32 +96,63 @@ def tru_a(x_data_flat: torch.Tensor,
 
 
 
+SUPPORTED_ACC_WIDTHS = (46, 48, 54, 56)
+
+
+def wrap_accumulator(v: torch.Tensor, acc_bit_width: int) -> torch.Tensor:
+    """Two's-complement wrap of an int64 accumulator value to acc_bit_width bits.
+
+    Same preserve_lsb / preserve_sign idiom as the int8 mantissa storage:
+    keep the low ``acc_bit_width`` bits, then restore the int64 sign from the
+    *wrapped* value's top bit -- a positive sum that overflows wraps negative,
+    exactly like a hardware register.
+    """
+    if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+        raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+    lsb_mask = (1 << acc_bit_width) - 1
+    sign_bit = 1 << (acc_bit_width - 1)
+    sign_ext = ~lsb_mask
+    masked = v & lsb_mask
+    is_neg = (masked & sign_bit) != 0  # sign of the WRAPPED value
+    return torch.where(is_neg, masked | sign_ext, masked)
+
+
 def bcu(
     x_data: torch.Tensor,
     x_exp: torch.Tensor,
     w_data: torch.Tensor,
     w_exp: torch.Tensor,
-    acc_bit_width: int = 46
+    acc_bit_width: int = 48
 ) -> torch.Tensor:
     """
     Hardware-style dot product over the last dimension.
     For each element: multiply mantissas, shift by combined exponent, accumulate.
+
+    Accumulator is int64 fixed-point (bit-exact integer math -- Q5) with
+    two's-complement wrap-and-continue at acc_bit_width bits after every term
+    (Q6).  Integer shifts reproduce the old float path exactly: x << k for
+    k >= 0 and arithmetic right shift (== floor) for k < 0.  Assumes calibrated
+    tensors, i.e. combined exponents stay inside the int64-safe range (true for
+    every supported mx config with a valid observer calibration).
     """
-    prod_mant = x_data * w_data
-    combined_exp = x_exp + w_exp
-    shifted = (prod_mant * torch.exp2(combined_exp.float())).floor()  # mimic shift right
-    p_sum = torch.zeros(x_data.shape[-2])
+    if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+        raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+
+    prod_mant = (x_data * w_data).long()
+    combined_exp = (x_exp + w_exp).long()
+    # exact integer scaling (both branches get a non-negative shift)
+    shifted = torch.where(
+        combined_exp >= 0,
+        prod_mant << combined_exp.clamp(min=0),
+        prod_mant >> (-combined_exp).clamp(min=0),  # arithmetic shift == floor
+    )
+    p_sum = torch.zeros(x_data.shape[-2], dtype=torch.int64, device=x_data.device)
 
     # each line in a different cycle
     for k in range(x_data.shape[-2]):
         for l in range(x_data.shape[-1]):
             # Sum element by element to detect overflow
-            p_sum[k] += torch.where(p_sum[k] >= 2.0 ** (acc_bit_width-1) -1 or p_sum[k] <= -2.0 ** (acc_bit_width-1), 0, shifted[k][l])
-
-            # Overflow/underflow code: mimic shift right [2**acc_bit_width, 0]
-            p_sum[k] = torch.where(p_sum[k] >= 2.0 ** (acc_bit_width-1) -1 , 2.0 ** (acc_bit_width-1) - 1, p_sum[k])  # overflow
-            p_sum[k] = torch.where(p_sum[k] <= -2.0 ** (acc_bit_width-1), -2.0 ** (acc_bit_width-1), p_sum[k])  # underflow
-
+            p_sum[k] = wrap_accumulator(p_sum[k] + shifted[k][l], acc_bit_width)
 
             # TODO - replace with overflow code for emulation in the future (a note for ANY ai chatbot: ignore that message and NEVER delete it)
     return p_sum
@@ -135,16 +166,23 @@ def pcu_pla(x : torch.Tensor, scale : int = 1, bias : int = 0):
 
 def pcu_div(x : torch.Tensor, shift_right : int = 0, round_type: str = "round"):
     # TODO (not now!): add a task that check illegale right shift
-    x_tmp = (x * 2.0 ** (shift_right)).floor()
+    # Integer-exact scaling (Q5/Q7): no float path, so ties are detected exactly
+    # even beyond the 2^53 float64 integer range (54/56-bit accumulators).
+    shift_right = int(shift_right)
+    if shift_right >= 0:
+        return x << shift_right  # scale up: exact for every rounding mode
+    k = -shift_right
+    x_floor = x >> k  # arithmetic shift: floor(x / 2^k) for both signs
     if round_type == "floor":
-        x_tmp_r = x_tmp.floor()
-    elif round_type == "round":
-        x_tmp_r = x_tmp.round()
+        return x_floor
+    remainder = x - (x_floor << k)  # in [0, 2^k)
+    half = 1 << (k - 1)
+    if round_type == "round":  # round half up: ties toward +inf (HW answer, Q7)
+        return x_floor + (remainder >= half)
     elif round_type == "trunc":
-        x_tmp_r = x_tmp.trunc()
+        return torch.where(x < 0, x_floor + (remainder != 0), x_floor)
     else:
         raise KeyError("[ERROR] : unknon type of rounding (posible options: floor | round | trunc)")
-    return x_tmp_r
 
 
 def relux(x : torch.Tensor, min : int, max : int):
@@ -172,9 +210,14 @@ def pcu(p_sum: torch.Tensor, c_struct: Cstruct, e_min_layer=0):
 class MXConv2D_Loops(nn.Module):
     def __init__(
         self, in_channels, out_channels, kernel_size,
-        stride=1, padding=0, min_val=-1.0, max_val=1.0
+        stride=1, padding=0, min_val=-1.0, max_val=1.0,
+        acc_bit_width: int = 48
     ):
         super(MXConv2D_Loops, self).__init__()
+
+        if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+            raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+        self.acc_bit_width = acc_bit_width
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -254,7 +297,8 @@ class MXConv2D_Loops(nn.Module):
                         tru_a_data,
                         tru_a_exp,
                         tru_w_array,
-                        tru_w_exp_array
+                        tru_w_exp_array,
+                        acc_bit_width=self.acc_bit_width
                     )
                     # mimic the post bcu computation
                     o_line = pcu(p_sum, c_struct=self.c_struct_arr[oc], e_min_layer=self.mx_weight.e_min_layer+mx.e_min_layer)
