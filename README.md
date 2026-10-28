@@ -347,6 +347,15 @@ and wrong for PReLU. The grids file carries `pla_frac`, `pla_m_pos`,
 them as given; a grids file without them still loads.
 `configs/mx_config_dof_run_win_cal_pla.json` is the convT run config with PLA on.
 
+HW-exact switches (all off by default, match the NPE emulator):
+`mant_round: "truncate"`, `overflow: "raise"`, `bias_round: "half_up"`,
+`out_round: "nearest"`, `in_exp_anchor: "min"`, `static_shift_bits: 7`
+(hw_grids `static_shift = -(e_qa_out + 12)`), `in_mode: "int"` (first layer,
+hw_grids `in_scale`). `configs/mx_config_dof_run_hw_exact.json` turns them all
+on. `mant_round: "truncate"` is what HW silicon does today (Q1); it costs ~10 dB
+on a 4-layer DOF-shaped net and is under discussion with HW, so the default
+stays `"nearest"`.
+
 ```json
 "groups": {
   "int4": {"w_elem_format": "int4", "a_elem_format": "int4"},
