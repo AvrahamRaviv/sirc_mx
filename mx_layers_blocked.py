@@ -32,7 +32,7 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
                                            clamp_block_exp, floor_log2, in_exp_on,
-                                           dilate_input, PLAParams, pla_multipliers)
+                                           dilate_input, PLAParams, pla_bins, pla_multipliers)
 
 # Activations PLA can fold into the PCU multiply: two segments split at 0.
 PLA_ACTS = (nn.PReLU, nn.LeakyReLU, nn.ReLU)
@@ -321,6 +321,7 @@ class MXConv2dHW(MXConv2d):
         # multipliers (frac, m_pos, m_neg) when the config gives them.
         self._pla_act = None
         self._pla_grid = None
+        self._pla_bins_grid = None      # hw_grids pla_bin_* (bounds, scales, biases)
         self._pla_last = False          # the last forward applied PLA
 
     def fold_pla(self, act):
@@ -354,9 +355,18 @@ class MXConv2dHW(MXConv2d):
         return (self._pla_act is not None
                 and _get_xblock_cfg(self).get("pla", "off") != "off")
 
-    def pla_params(self):
+    def _hw_bias(self):
+        """The bias as the HW path consumes it (elementwise-quantized)."""
+        if self.bias is None:
+            return None
+        sp = self.mx_specs
+        return quantize_elemwise_op(self.bias, mx_specs=sp, round=sp['round_weight'])
+
+    def pla_params(self, e_acc=None):
         """`PLAParams` of this layer: hw_grids multipliers, else quantized from
-        the folded activation's slopes."""
+        the folded activation's slopes. With pla_bias 'bins' also the bins:
+        hw_grids pla_bin_* if set, else `pla_bins` of the bias on the
+        accumulator grid `e_acc` (default e_layer_min)."""
         cfg = _get_xblock_cfg(self)
         if self._pla_grid is not None:
             frac, m_pos, m_neg = self._pla_grid
@@ -370,7 +380,25 @@ class MXConv2dHW(MXConv2d):
             m_pos, m_neg, frac = pla_multipliers(
                 self.pla_alpha(), int(cfg.get("pla_mult_bits", 8)),
                 cfg.get("pla_frac_bits"))
-        return PLAParams(m_pos, m_neg, int(frac), cfg.get("pla_bias", "pre"))
+        mode = cfg.get("pla_bias", "bins")
+        if mode != "bins":
+            return PLAParams(m_pos, m_neg, int(frac), mode)
+        if self._pla_bins_grid is not None:
+            lists = self._pla_bins_grid
+            if len({len(v) for v in lists[1]}) != 1:
+                raise ValueError(f"hw_grids[{self._mx_layer_name!r}]: PLA bins "
+                                 f"must have one bin count per layer")
+            bounds, scales, biases = (torch.tensor(v, dtype=torch.int64).view(len(v), -1)
+                                      for v in lists)
+            if scales.shape[0] != self.out_channels:
+                raise ValueError(
+                    f"hw_grids[{self._mx_layer_name!r}]: {scales.shape[0]} PLA "
+                    f"bins for {self.out_channels} channels")
+        else:
+            e = self.e_layer_min if e_acc is None else e_acc
+            bounds, scales, biases = pla_bins(m_pos, m_neg, self._hw_bias(), int(e), int(frac))
+        return PLAParams(m_pos, m_neg, int(frac), mode, bounds, scales, biases,
+                         cfg.get("pla_bin_tie", "upper"))
 
     def _pla_float(self, z):
         """The folded activation in float (calibration / error references)."""
@@ -565,7 +593,7 @@ class MXConv2dHW(MXConv2d):
             e_qa_out=e_qa_out,
             win_bits=resolve_out_window_bits(cfg, a_fmt) if apply_win else None,
             out_round=cfg.get('out_round', 'floor'),
-            pla=self.pla_params() if apply_pla else None,
+            pla=self.pla_params(int(e_min)) if apply_pla else None,
         )
         if self._tap_acc:
             self._last_acc = stats.get('acc')

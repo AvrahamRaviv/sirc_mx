@@ -21,6 +21,12 @@ Names are the ones in "layers". Per layer:
   pla_m_pos    per output channel (list of int): multiplier for a word >= 0
   pla_m_neg    per output channel (list of int): multiplier for a word < 0
                (the folded activation slope, alpha * 2^pla_frac quantized)
+  pla_bin_bounds  only with xblock_accum.pla_bias 'bins', per output channel
+               (list of list of int, nbins - 1 each, ascending): bin
+               boundaries on the bias-free accumulator word
+  pla_bin_scales  per channel, nbins int: signed scale S_k (pla_frac bits)
+  pla_bin_biases  per channel, nbins int: bias B_k on the grid
+               2^(e_layer_min - pla_frac), P = S_k * acc + B_k
 
 e_layer_min and e_qa_out are required; win_bits and shift_out are derived
 values, written by `export_hw_grids` and checked on load. Calibration runs
@@ -34,10 +40,12 @@ import json
 
 HW_GRID_KEYS = ("e_layer_min", "e_qa_out", "win_bits", "shift_out",
                 "e_base_a", "e_base_w", "calls",
-                "pla_frac", "pla_m_pos", "pla_m_neg")
+                "pla_frac", "pla_m_pos", "pla_m_neg",
+                "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases")
 _REQUIRED = ("e_layer_min", "e_qa_out")
 _PLA_KEYS = ("pla_frac", "pla_m_pos", "pla_m_neg")
 _LIST_KEYS = ("pla_m_pos", "pla_m_neg")
+_BIN_KEYS = ("pla_bin_bounds", "pla_bin_scales", "pla_bin_biases")
 
 
 def _is_int(v):
@@ -65,6 +73,11 @@ def check_hw_grid(name, entry, win_bits=None):
             if not (isinstance(v, list) and v and all(_is_int(t) for t in v)):
                 raise TypeError(f"hw_grids[{name!r}][{k!r}] must be a non-empty "
                                 f"list of int, got {v!r}")
+        elif k in _BIN_KEYS:
+            if not (isinstance(v, list) and v and all(
+                    isinstance(c, list) and all(_is_int(t) for t in c) for c in v)):
+                raise TypeError(f"hw_grids[{name!r}][{k!r}] must be a non-empty "
+                                f"list (per channel) of lists of int, got {v!r}")
         elif not _is_int(v):
             raise TypeError(f"hw_grids[{name!r}][{k!r}] must be int, got {v!r}")
     pla = [k for k in _PLA_KEYS if k in entry]
@@ -77,6 +90,22 @@ def check_hw_grid(name, entry, win_bits=None):
                              f"lengths differ")
         if entry["pla_frac"] < 0:
             raise ValueError(f"hw_grids[{name!r}]: pla_frac must be >= 0")
+    bins = [k for k in _BIN_KEYS if k in entry]
+    if bins and (len(bins) != len(_BIN_KEYS) or not pla):
+        raise ValueError(f"hw_grids[{name!r}]: PLA bins need all of "
+                         f"{list(_PLA_KEYS + _BIN_KEYS)}, got {pla + bins}")
+    if bins:
+        bnd, scl, bb = (entry[k] for k in _BIN_KEYS)
+        if not len(bnd) == len(scl) == len(bb) == len(entry["pla_m_pos"]):
+            raise ValueError(f"hw_grids[{name!r}]: pla_bin_* need one entry per "
+                             f"channel ({len(entry['pla_m_pos'])})")
+        for c, (t, sk, bk) in enumerate(zip(bnd, scl, bb)):
+            if not (sk and len(bk) == len(sk) and len(t) == len(sk) - 1):
+                raise ValueError(f"hw_grids[{name!r}]: channel {c} needs nbins "
+                                 f">= 1 scales and biases, nbins - 1 bounds")
+            if any(a > b for a, b in zip(t, t[1:])):
+                raise ValueError(f"hw_grids[{name!r}]: channel {c} bounds must "
+                                 f"ascend, got {t}")
     if entry.get("calls", 1) < 1:
         raise ValueError(f"hw_grids[{name!r}]: calls must be >= 1")
     shift = entry["e_qa_out"] - entry["e_layer_min"]

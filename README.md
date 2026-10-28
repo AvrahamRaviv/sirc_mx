@@ -324,16 +324,27 @@ three dense `conv1` layers on this path.
 an `nn.Sequential` into the PCU multiply in front of the output window: per
 output channel two signed `pla_mult_bits` (8) multipliers, `m_pos = 2^frac`
 and `m_neg = floor(alpha * 2^frac + 0.5)`, are picked by the sign of the
-accumulator word (bias in, `pla_bias: "pre"`), and the window extracts from
+accumulator word (with the bias), and the window extracts from
 `N * m` (48 + 8 = 56 bits) on the grid `2^(e_layer_min - frac)`. `frac`
 (`pla_frac_bits`, null = largest that fits: 6 for 8b) and the slopes come from
 the module offline; `e_qa_out` is calibrated on the activated output by the
 same `calibrate_hw_grids`. The activation module stays in the model (state_dict
 unchanged) and passes a PLA output through; train mode runs it as before.
-`pla_bias: "post"` is the emulator's `pcu_pla` order (bias after the multiply,
-segment by the bias-free word), kept for the HW comparison. The grids file
-carries `pla_frac`, `pla_m_pos`, `pla_m_neg` per layer, and the sim/inference
-use them as given; a grids file without them still loads.
+`pla_bias: "bins"` (the default with PLA on) is the HW form: per channel the
+bias-free accumulator is split into bins by boundaries, each bin with its own
+int8 scale `S_k` and bias `B_k`, `P = S_k * N + B_k`. PReLU is two bins:
+boundary `-floor(b * 2^-e_layer_min + 0.5)`, `S = m_neg | m_pos`,
+`B_k = floor(S_k * b * 2^-e_layer_min + 0.5)` on the grid of `P`, offline. A word
+equal to a boundary goes to the bin above (`pla_bin_tie: "upper"`, or
+`"lower"`). It picks the same segment as `"pre"` and differs from it only by the
+bias rounding (`S_k * b_acc` vs `q(S_k * b)`, at most `S_k / 2 + 1/2` on that
+grid). `pla_bias: "pre"` adds the bias into the accumulator before one
+multiply. `pla_bias: "post"` is the emulator's single-bin `pcu_pla` order (bias
+after the multiply, segment by the bias-free word), kept for the HW comparison
+and wrong for PReLU. The grids file carries `pla_frac`, `pla_m_pos`,
+`pla_m_neg` per layer, plus `pla_bin_bounds` / `pla_bin_scales` /
+`pla_bin_biases` (per channel lists) with `"bins"`, and the sim/inference use
+them as given; a grids file without them still loads.
 `configs/mx_config_dof_run_win_cal_pla.json` is the convT run config with PLA on.
 
 ```json

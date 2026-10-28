@@ -1473,6 +1473,15 @@ class MXQuantizer:
         if "pla_frac" in entry:
             layer._pla_grid = (int(entry["pla_frac"]), list(entry["pla_m_pos"]),
                                list(entry["pla_m_neg"]))
+        if "pla_bin_scales" in entry:
+            mode = _get_xblock_cfg(layer).get("pla_bias")
+            if mode != "bins":
+                raise ValueError(
+                    f"hw_grids[{name!r}]: pla_bin_* keys need xblock_accum."
+                    f"pla_bias 'bins', got {mode!r}")
+            layer._pla_bins_grid = tuple(
+                [list(v) for v in entry[k]]
+                for k in ("pla_bin_bounds", "pla_bin_scales", "pla_bin_biases"))
 
     def _check_hw_grids(self, model):
         """Every hw_grids name must be an MXConv2dHW of this model: a typo or a

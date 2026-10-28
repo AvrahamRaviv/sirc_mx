@@ -12,7 +12,8 @@ handles every MXINT format (int8..int16); product math runs in int64.
 With APPLY_WIN the static output window (`mx_fixed_point_hw._apply_out_window`)
 runs on the int64 word before the fp32 cast; its constants come from
 `_window_params`, shared with the torch ref. APPLY_PLA multiplies the word by
-the per-channel PLA multiplier first (`mx_fixed_point_hw._apply_pla`).
+the per-channel PLA multiplier first, or with PLA_BINS by its bin's scale plus
+bias (`mx_fixed_point_hw._apply_pla`).
 
 Importable without Triton (gated on `_TRITON_AVAILABLE`).
 """
@@ -62,6 +63,9 @@ if _TRITON_AVAILABLE:
         pla_pos_ptr,    # *i64, [O]   (only read if APPLY_PLA)
         pla_neg_ptr,    # *i64, [O]
         pla_bias_ptr,   # *i64, [O]   (only read if PLA_POST_BIAS)
+        pla_bnd_ptr,    # *i64, [O, PLA_BINS - 1]  (only read if PLA_BINS)
+        pla_scl_ptr,    # *i64, [O, PLA_BINS]
+        pla_bb_ptr,     # *i64, [O, PLA_BINS]
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         SAT_PER_PRODUCT: tl.constexpr,
@@ -69,6 +73,8 @@ if _TRITON_AVAILABLE:
         APPLY_WIN: tl.constexpr,
         APPLY_PLA: tl.constexpr,
         PLA_POST_BIAS: tl.constexpr,
+        PLA_BINS: tl.constexpr,         # 0 = m_pos/m_neg form, else bins per channel
+        PLA_TIE_UPPER: tl.constexpr,
     ):
         pid_m = tl.program_id(axis=0)
         pid_o = tl.program_id(axis=1)
@@ -148,11 +154,24 @@ if _TRITON_AVAILABLE:
             acc = tl.where(under, lo, acc)
 
         if APPLY_PLA:
-            m_pos = tl.load(pla_pos_ptr + pid_o).to(tl.int64)
-            m_neg = tl.load(pla_neg_ptr + pid_o).to(tl.int64)
-            acc = acc * tl.where(acc < 0, m_neg, m_pos)
-            if PLA_POST_BIAS:
-                acc = acc + tl.load(pla_bias_ptr + pid_o).to(tl.int64)
+            if PLA_BINS > 0:
+                s_k = tl.zeros_like(acc) + tl.load(pla_scl_ptr + pid_o * PLA_BINS).to(tl.int64)
+                b_k = tl.zeros_like(acc) + tl.load(pla_bb_ptr + pid_o * PLA_BINS).to(tl.int64)
+                for k in tl.static_range(1, PLA_BINS):
+                    t = tl.load(pla_bnd_ptr + pid_o * (PLA_BINS - 1) + (k - 1)).to(tl.int64)
+                    if PLA_TIE_UPPER:
+                        sel = acc >= t
+                    else:
+                        sel = acc > t
+                    s_k = tl.where(sel, tl.load(pla_scl_ptr + pid_o * PLA_BINS + k).to(tl.int64), s_k)
+                    b_k = tl.where(sel, tl.load(pla_bb_ptr + pid_o * PLA_BINS + k).to(tl.int64), b_k)
+                acc = acc * s_k + b_k
+            else:
+                m_pos = tl.load(pla_pos_ptr + pid_o).to(tl.int64)
+                m_neg = tl.load(pla_neg_ptr + pid_o).to(tl.int64)
+                acc = acc * tl.where(acc < 0, m_neg, m_pos)
+                if PLA_POST_BIAS:
+                    acc = acc + tl.load(pla_bias_ptr + pid_o).to(tl.int64)
 
         out_off = offs_m * O + pid_o
         if APPLY_WIN:
@@ -190,12 +209,17 @@ if _TRITON_AVAILABLE:
         pla_pos_ptr,    # *i64, [O]   (only read if APPLY_PLA)
         pla_neg_ptr,    # *i64, [O]
         pla_bias_ptr,   # *i64, [O]   (only read if PLA_POST_BIAS)
+        pla_bnd_ptr,    # *i64, [O, PLA_BINS - 1]  (only read if PLA_BINS)
+        pla_scl_ptr,    # *i64, [O, PLA_BINS]
+        pla_bb_ptr,     # *i64, [O, PLA_BINS]
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         APPLY_WIN: tl.constexpr,
         APPLY_PLA: tl.constexpr,
         PLA_POST_BIAS: tl.constexpr,
+        PLA_BINS: tl.constexpr,         # 0 = m_pos/m_neg form, else bins per channel
+        PLA_TIE_UPPER: tl.constexpr,
     ):
         """NPE kernel: independent per-lane exponents (no lane sharing). Loop
         order kb -> j -> kk (cin = kb*BS + j outer, kk inner) reproduces the
@@ -255,11 +279,24 @@ if _TRITON_AVAILABLE:
             acc = tl.where(under, lo, acc)
 
         if APPLY_PLA:
-            m_pos = tl.load(pla_pos_ptr + pid_o).to(tl.int64)
-            m_neg = tl.load(pla_neg_ptr + pid_o).to(tl.int64)
-            acc = acc * tl.where(acc < 0, m_neg, m_pos)
-            if PLA_POST_BIAS:
-                acc = acc + tl.load(pla_bias_ptr + pid_o).to(tl.int64)
+            if PLA_BINS > 0:
+                s_k = tl.zeros_like(acc) + tl.load(pla_scl_ptr + pid_o * PLA_BINS).to(tl.int64)
+                b_k = tl.zeros_like(acc) + tl.load(pla_bb_ptr + pid_o * PLA_BINS).to(tl.int64)
+                for k in tl.static_range(1, PLA_BINS):
+                    t = tl.load(pla_bnd_ptr + pid_o * (PLA_BINS - 1) + (k - 1)).to(tl.int64)
+                    if PLA_TIE_UPPER:
+                        sel = acc >= t
+                    else:
+                        sel = acc > t
+                    s_k = tl.where(sel, tl.load(pla_scl_ptr + pid_o * PLA_BINS + k).to(tl.int64), s_k)
+                    b_k = tl.where(sel, tl.load(pla_bb_ptr + pid_o * PLA_BINS + k).to(tl.int64), b_k)
+                acc = acc * s_k + b_k
+            else:
+                m_pos = tl.load(pla_pos_ptr + pid_o).to(tl.int64)
+                m_neg = tl.load(pla_neg_ptr + pid_o).to(tl.int64)
+                acc = acc * tl.where(acc < 0, m_neg, m_pos)
+                if PLA_POST_BIAS:
+                    acc = acc + tl.load(pla_bias_ptr + pid_o).to(tl.int64)
 
         out_off = offs_m * O + pid_o
         if APPLY_WIN:
@@ -290,26 +327,37 @@ def _window_launch_args(e_layer_min, e_qa_out, win_bits, out_round, M, O, device
 
 
 def _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device):
-    """(bias_int, HAS_BIAS, e_win, pla tensors, APPLY_PLA, PLA_POST_BIAS).
+    """(bias_int, HAS_BIAS, e_win, pla tensors, pla constexprs).
 
     The accumulator bias is round(b * 2^-e_layer_min), half up with PLA; in
     the PLA 'post' order it goes after the multiply instead, on the grid
-    e_win = e_layer_min - frac the window then extracts from."""
+    e_win = e_layer_min - frac the window then extracts from. 'bins' has no
+    accumulator bias: each bin carries its own (`mx_fixed_point_hw.pla_bins`)."""
     from .mx_fixed_point_hw import _bias_to_grid
     dummy = torch.empty(1, dtype=torch.int64, device=device)
     post = pla is not None and pla.bias == "post"
-    has_bias = bias_fp is not None and not post
+    bins = pla is not None and pla.bias == "bins"
+    has_bias = bias_fp is not None and not post and not bins
     bias_int = (_bias_to_grid(bias_fp, e_layer_min, pla is not None, device).contiguous()
                 if has_bias else torch.empty(O, dtype=torch.int64, device=device))
+    flags = dict(APPLY_PLA=0, PLA_POST_BIAS=0, PLA_BINS=0, PLA_TIE_UPPER=1)
     if pla is None:
-        return bias_int, has_bias, int(e_layer_min), (dummy, dummy, dummy), 0, 0
+        return bias_int, has_bias, int(e_layer_min), (dummy,) * 6, flags
     e_win = int(e_layer_min) - int(pla.frac)
     b_post = (_bias_to_grid(bias_fp, e_win, True, device).contiguous()
               if post and bias_fp is not None else dummy)
     pos = pla.m_pos.to(device=device, dtype=torch.int64).contiguous()
     neg = pla.m_neg.to(device=device, dtype=torch.int64).contiguous()
-    return (bias_int, has_bias, e_win, (pos, neg, b_post), 1,
-            1 if (post and bias_fp is not None) else 0)
+    bnd = scl = bb = dummy
+    if bins:
+        bnd, scl, bb = (t.to(device=device, dtype=torch.int64).contiguous()
+                        for t in (pla.bounds, pla.scales, pla.biases))
+        if bnd.numel() == 0:
+            bnd = dummy
+    flags.update(APPLY_PLA=1, PLA_POST_BIAS=1 if (post and bias_fp is not None) else 0,
+                 PLA_BINS=int(pla.scales.shape[1]) if bins else 0,
+                 PLA_TIE_UPPER=1 if pla.tie == "upper" else 0)
+    return bias_int, has_bias, e_win, (pos, neg, b_post, bnd, scl, bb), flags
 
 
 def _fill_win_sink(win_sink, win_sat, B, L, O):
@@ -397,7 +445,7 @@ def _hw_fxp_conv2d_triton(
 
     # Bias onto the accumulator's fixed-point grid: acc represents
     # value * 2^(-e_layer_min), so bias_int = round(b * 2^(-e_layer_min)).
-    bias_int, has_bias, e_win, pla_args, apply_pla, pla_post = \
+    bias_int, has_bias, e_win, pla_args, pla_flags = \
         _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device)
 
     win_sat, win_args, apply_win = _window_launch_args(
@@ -413,7 +461,7 @@ def _hw_fxp_conv2d_triton(
         win_sat, *win_args, *pla_args,
         BLOCK_M=BLOCK_M, BS=bs, SAT_PER_PRODUCT=sat_per_product,
         HAS_BIAS=1 if has_bias else 0, APPLY_WIN=apply_win,
-        APPLY_PLA=apply_pla, PLA_POST_BIAS=pla_post,
+        **pla_flags,
     )
 
     # Caller reshapes to [B, O, H_out, W_out]. We return [B, O, L] and sat [B, O, L].
@@ -514,7 +562,7 @@ def _hw_fxp_conv2d_triton_npe(
     two_bias = 2 * int(mant_bias)
     inv_scale_ref = float(2.0 ** int(e_layer_min))
 
-    bias_int, has_bias, e_win, pla_args, apply_pla, pla_post = \
+    bias_int, has_bias, e_win, pla_args, pla_flags = \
         _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device)
 
     win_sat, win_args, apply_win = _window_launch_args(
@@ -530,7 +578,7 @@ def _hw_fxp_conv2d_triton_npe(
         win_sat, *win_args, *pla_args,
         BLOCK_M=BLOCK_M, BS=BS,
         HAS_BIAS=1 if has_bias else 0, APPLY_WIN=apply_win,
-        APPLY_PLA=apply_pla, PLA_POST_BIAS=pla_post,
+        **pla_flags,
     )
 
     B = qi_i8.shape[0]

@@ -1,6 +1,6 @@
 """PLA (xblock_accum.pla): the PReLU / LeakyReLU / ReLU after an MXConv2dHW
 folded into the PCU multiply before the output window. Integer reference
-for both bias orders, ReLU fold bit-exact, quantizer fold + hw_grids round
+for every bias order (HW bins, pre, post), bins vs pre, ReLU fold bit-exact, quantizer fold + hw_grids round
 trip, post-PLA calibration, train mode untouched, convT, triton == python."""
 import json
 import os
@@ -19,8 +19,8 @@ sys.path.insert(0, "/home/avrahamra/PycharmProjects")
 from microxcaling.mx import MxSpecs
 from fixed_point.hw_grids import check_hw_grid, load_hw_grids
 from fixed_point.mx_fixed_point import normalize_xblock_accum
-from fixed_point.mx_fixed_point_hw import (calibrate_hw_grids, export_hw_grids,
-                                           pla_multipliers)
+from fixed_point.mx_fixed_point_hw import (PLAParams, _apply_pla, calibrate_hw_grids,
+                                           export_hw_grids, pla_bins, pla_multipliers)
 from mx_layers_blocked import MXConv2dHW
 from mx_layers_convT import MXConvTranspose2dHW
 from mx_quantizer import MXQuantizer
@@ -131,6 +131,9 @@ def test_config_validation():
         _xb(pla_bias="mid")
     with pytest.raises(ValueError):
         _xb(pla_frac_bits=7)            # 2^7 does not fit signed 8b
+    with pytest.raises(ValueError):
+        _xb(pla_bin_tie="mid")
+    assert _xb()["pla_bias"] == "bins" and _xb()["pla_bin_tie"] == "upper"
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +143,7 @@ def test_config_validation():
 @pytest.mark.parametrize("convT", [False, True])
 @pytest.mark.parametrize("out_round", ["floor", "nearest"])
 def test_prelu_pre_matches_int_reference(convT, out_round):
-    seq = _block(_prelu(), convT=convT, out_round=out_round)
+    seq = _block(_prelu(), convT=convT, out_round=out_round, pla_bias="pre")
     conv = seq[0]
     y, acc, word = _run(seq, _data(1, seed=7)[0])
     pla = conv.pla_params()
@@ -163,12 +166,12 @@ def test_post_bias_matches_emulator_order():
     want = _win(acc * m + b.view(1, -1, 1, 1), e_p, conv.e_qa_out, "floor")
     assert torch.equal(word, want)
     # The two orders differ where N and N + bias have other signs.
-    seq_pre = _block(_prelu(), bias=2.0)
+    seq_pre = _block(_prelu(), bias=2.0, pla_bias="pre")
     assert not torch.equal(_run(seq_pre, _data(1, seed=7)[0])[2], word)
 
 
 def test_bias_rounds_half_up_with_pla():
-    seq = _block(nn.ReLU())
+    seq = _block(nn.ReLU(), pla_bias="pre")
     conv = seq[0]
     x = _data(1, seed=7)[0]
     with torch.no_grad():
@@ -183,13 +186,93 @@ def test_bias_rounds_half_up_with_pla():
 
 @pytest.mark.parametrize("out_round", ["floor", "nearest"])
 def test_relu_fold_bit_exact(out_round):
-    seq = _block(nn.ReLU(), out_round=out_round)
+    seq = _block(nn.ReLU(), out_round=out_round, pla_bias="pre")
     x = _data(1, seed=7)[0]
     y = _run(seq, x)[0]
     seq[0].xblock_accum = _xb(pla="off", out_round=out_round)
     seq[0]._pla_act = None
     y_off = _run(seq, x)[0]                     # window, then float ReLU
     assert torch.equal(y, y_off) and (y_off == 0).any()
+
+
+# ---------------------------------------------------------------------------
+# HW bin form (pla_bias 'bins')
+# ---------------------------------------------------------------------------
+
+def test_bins_hand_vector():
+    """m_pos 64, m_neg 16 (alpha 1/4), frac 6, bias 2.3 accumulator LSBs:
+    b_acc = 2, boundary -2, B_neg = floor(16 * 2.3 + .5) = 37, B_pos =
+    floor(64 * 2.3 + .5) = 147."""
+    e = -10
+    bnd, scl, bb = pla_bins(torch.tensor([64]), torch.tensor([16]),
+                            torch.tensor([2.3 * 2.0 ** e]), e, 6)
+    assert bnd.tolist() == [[-2]] and scl.tolist() == [[16, 64]]
+    assert bb.tolist() == [[37, 147]]
+    acc = torch.tensor([-3, -2, 5]).view(1, 1, 3)
+
+    def run(tie, bounds=bnd, scales=scl, biases=bb):
+        pla = PLAParams(scales[:, 1], scales[:, 0], 6, "bins", bounds, scales, biases, tie)
+        return _apply_pla(acc, pla).view(-1).tolist()
+    assert run("upper") == [-48 + 37, -128 + 147, 320 + 147]
+    assert run("lower") == [-48 + 37, -32 + 37, 320 + 147]    # tie -> bin below
+    pre = PLAParams(torch.tensor([64]), torch.tensor([16]), 6, "pre")
+    assert _apply_pla(acc + 2, pre).view(-1).tolist() == [-16, 0, 448]
+    # Generic N: three bins, boundaries -2 and 4.
+    acc = torch.tensor([-3, -2, 3, 4, 9]).view(1, 1, 5)
+    three = (torch.tensor([[-2, 4]]), torch.tensor([[16, 64, 32]]), torch.tensor([[0, 1, 2]]))
+    assert run("upper", *three) == [-48, -127, 193, 130, 290]
+    assert run("lower", *three) == [-48, -32, 193, 257, 290]
+    # Bin bias tie rounds half up: 1 * 2.5 -> 3 (half-even would give 2).
+    assert pla_bins(torch.tensor([64]), torch.tensor([1]), torch.tensor([2.5 * 2.0 ** e]),
+                    e, 6)[2].tolist() == [[3, 160]]
+
+
+def test_bins_layer_tie_and_shape_checked():
+    seq = _block(_prelu(), pla_bin_tie="lower")
+    conv = seq[0]
+    assert conv.pla_params().tie == "lower"
+    p = conv.pla_params()
+    bad = p._replace(bounds=p.bounds.view(-1)[:4].view(4, 1))
+    conv.pla_params = lambda e_acc=None: bad
+    with pytest.raises(ValueError, match="PLA bins need"):
+        _run(seq, _data(1, seed=7)[0])
+
+
+@pytest.mark.parametrize("convT", [False, True])
+@pytest.mark.parametrize("out_round", ["floor", "nearest"])
+@pytest.mark.parametrize("act", ["prelu", "relu"])
+def test_bins_int_reference_and_vs_pre(convT, out_round, act):
+    """bins: P = S_k * N + B_k on the bias-free N. Same segment as 'pre'; the
+    words differ only by the bias rounding (m_k * b_acc vs q(m_k * b)), at
+    most 1 LSB on this grid (DOF shapes: up to 7 when e_qa_out is below the
+    accumulator LSB), and not at all with the bias on the accumulator grid."""
+    mk = (lambda: _prelu()) if act == "prelu" else nn.ReLU
+    x = _data(1, seed=7)[0]
+    seq = _block(mk(), convT=convT, out_round=out_round, bias=2.0)
+    conv = seq[0]
+    y, acc, word = _run(seq, x)                         # acc: no bias
+    pla = conv.pla_params()
+    sh = (1, -1, 1, 1)
+    upper = acc >= pla.bounds[:, 0].view(sh)
+    S = torch.where(upper, pla.scales[:, 1].view(sh), pla.scales[:, 0].view(sh))
+    B = torch.where(upper, pla.biases[:, 1].view(sh), pla.biases[:, 0].view(sh))
+    want = _win(acc * S + B, conv.e_layer_min - pla.frac, conv.e_qa_out, out_round)
+    assert torch.equal(word, want)
+    assert torch.equal(y, want.float() * 2.0 ** conv.e_qa_out)
+    assert (~upper).any() and upper.any()
+
+    conv.xblock_accum = _xb(out_round=out_round, pla_bias="pre")
+    _, acc_pre, w_pre = _run(seq, x)
+    assert torch.equal(acc_pre >= 0, upper)             # same segment
+    d = (word - w_pre).abs()
+    assert int(d.max()) <= 1 and bool((d > 0).any())
+
+    with torch.no_grad():                               # bias on the acc grid
+        conv.bias.copy_(torch.round(conv.bias * 2.0 ** -conv.e_layer_min)
+                        * 2.0 ** conv.e_layer_min)
+    w_pre = _run(seq, x)[2]
+    conv.xblock_accum = _xb(out_round=out_round)
+    assert torch.equal(_run(seq, x)[2], w_pre)
 
 
 # ---------------------------------------------------------------------------
@@ -302,11 +385,23 @@ def test_quantizer_round_trip_and_state_dict():
     p = model.b[0].pla_params()
     assert grids["b.0"]["pla_m_neg"] == p.m_neg.tolist()
     assert grids["b.0"]["pla_frac"] == 6 and "pla_frac" not in grids["c2"]
+    assert grids["b.0"]["pla_bin_biases"] == p.biases.tolist()
+    assert grids["b.0"]["pla_bin_bounds"] == p.bounds.tolist()
 
     model2 = MXQuantizer(config_path=path, save_dir=tmp).quant(_Net())
     with torch.no_grad():
         model2.b[1].weight.fill_(0.9)       # the sim reads the config only
+        model2.b[0].bias.add_(1.0)
     assert torch.equal(_eval(model2, x), y)
+    assert model2.b[0].pla_params().m_neg.tolist() == grids["b.0"]["pla_m_neg"]
+    # Bin keys with another bias order: refuse.
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["mx_specs"]["xblock_accum"]["pla_bias"] = "pre"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    with pytest.raises(ValueError, match="pla_bias 'bins'"):
+        MXQuantizer(config_path=path, save_dir=tmp).quant(_Net())
 
 
 def test_old_grids_load_and_pla_off_ignores_nothing():
@@ -337,6 +432,26 @@ def test_hw_grid_pla_keys_checked():
         check_hw_grid("c", dict(base, pla_frac=6, pla_m_pos=64, pla_m_neg=[1]))
     with pytest.raises(ValueError, match="lengths"):
         check_hw_grid("c", dict(base, pla_frac=6, pla_m_pos=[64, 64], pla_m_neg=[1]))
+    pla = dict(base, pla_frac=6, pla_m_pos=[64, 64], pla_m_neg=[16, 0])
+    bins = dict(pla_bin_bounds=[[-2], [5]], pla_bin_scales=[[16, 64], [0, 64]],
+                pla_bin_biases=[[37, 147], [0, -320]])
+    check_hw_grid("c", dict(pla, **bins))
+    check_hw_grid("c", dict(pla, pla_bin_bounds=[[], []], pla_bin_scales=[[64], [64]],
+                            pla_bin_biases=[[1], [2]]))           # one bin
+    with pytest.raises(ValueError, match="need all"):
+        check_hw_grid("c", dict(base, **bins))                     # no multipliers
+    with pytest.raises(ValueError, match="need all"):
+        check_hw_grid("c", dict(pla, pla_bin_scales=bins["pla_bin_scales"]))
+    with pytest.raises(TypeError):
+        check_hw_grid("c", dict(pla, **dict(bins, pla_bin_biases=[[37, 147.5], [0, 1]])))
+    with pytest.raises(ValueError, match="per channel"):
+        check_hw_grid("c", dict(pla, **dict(bins, pla_bin_bounds=[[-2]])))
+    with pytest.raises(ValueError, match="channel 1"):
+        check_hw_grid("c", dict(pla, **dict(bins, pla_bin_biases=[[37, 147], [0]])))
+    with pytest.raises(ValueError, match="ascend"):
+        check_hw_grid("c", dict(pla, **dict(bins, pla_bin_bounds=[[-2, -3], [5, 6]],
+                                            pla_bin_scales=[[1, 2, 3]] * 2,
+                                            pla_bin_biases=[[1, 2, 3]] * 2)))
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +461,7 @@ def test_hw_grid_pla_keys_checked():
 @pytest.mark.skipif(not _GPU, reason="needs triton + CUDA")
 @pytest.mark.parametrize("mode,variant", [("channel", "reuse"), ("xblock", "reuse"),
                                           ("xblock", "opt")])
-@pytest.mark.parametrize("bias_order", ["pre", "post"])
+@pytest.mark.parametrize("bias_order", ["bins", "pre", "post"])
 @pytest.mark.parametrize("convT", [False, True])
 def test_triton_matches_python(mode, variant, bias_order, convT):
     outs = []
@@ -356,4 +471,28 @@ def test_triton_matches_python(mode, variant, bias_order, convT):
         seq = seq.cuda().eval()
         with torch.no_grad():
             outs.append(seq(_data(1, seed=7)[0].cuda()).cpu())
+    assert torch.equal(outs[0], outs[1])
+
+
+@pytest.mark.skipif(not _GPU, reason="needs triton + CUDA")
+@pytest.mark.parametrize("mode", ["channel", "xblock"])
+@pytest.mark.parametrize("tie", ["upper", "lower"])
+def test_triton_matches_python_three_bins(mode, tie):
+    """Generic bin count: 3 bins per channel, boundaries at the accumulator
+    median +- a spread, so every bin and both tie rules are exercised."""
+    outs = []
+    for backend in ("python", "triton"):
+        seq = _block(_prelu(), mode=mode, backend=backend, bias=2.0, pla_bin_tie=tie)
+        conv = seq[0].cuda().eval()
+        x = _data(1, seed=7)[0].cuda()
+        p = conv.pla_params()
+        O = conv.out_channels
+        g = torch.Generator().manual_seed(4)
+        scales = torch.randint(-128, 128, (O, 3), generator=g)
+        biases = torch.randint(-2 ** 20, 2 ** 20, (O, 3), generator=g)
+        bounds = torch.tensor([[-2 ** 12, 2 ** 12]] * O)
+        three = PLAParams(p.m_pos, p.m_neg, p.frac, "bins", bounds, scales, biases, tie)
+        conv.pla_params = lambda e_acc=None, three=three: three
+        with torch.no_grad():
+            outs.append(seq.cuda()(x).cpu())
     assert torch.equal(outs[0], outs[1])

@@ -13,7 +13,8 @@ _VALID_OUT_ROUND = ("floor", "nearest")
 _VALID_IN_EXP_MODE = ("off", "infer", "always")
 _VALID_CONVT = ("plain", "hw")
 _VALID_PLA = ("off", "infer")
-_VALID_PLA_BIAS = ("pre", "post")
+_VALID_PLA_BIAS = ("bins", "pre", "post")
+_VALID_PLA_TIE = ("upper", "lower")
 
 
 def validate_xblock_accum_bits(bits):
@@ -187,8 +188,11 @@ XBLOCK_ACCUM_DEFAULTS = {
     "pla": "off",
     "pla_mult_bits": 8,           # signed width of the combined multiplier
     "pla_frac_bits": None,        # its fraction bits; None = largest that fits
-    "pla_bias": "pre",            # 'pre' (bias in acc, PReLU order) or 'post'
-                                  # (emulator pcu_pla order: after the multiply)
+    "pla_bias": "bins",           # 'bins' (HW form: per-bin scale + bias on the
+                                  # bias-free acc), 'pre' (bias in acc, then one
+                                  # multiplier) or 'post' (emulator single-bin
+                                  # pcu_pla order; wrong for PReLU)
+    "pla_bin_tie": "upper",       # 'bins': acc == boundary goes to the bin above
 }
 
 
@@ -344,6 +348,10 @@ def normalize_xblock_accum(value):
             raise ValueError(
                 f"xblock_accum.pla_bias must be in {_VALID_PLA_BIAS}, "
                 f"got {cfg['pla_bias']!r}")
+        if cfg["pla_bin_tie"] not in _VALID_PLA_TIE:
+            raise ValueError(
+                f"xblock_accum.pla_bin_tie must be in {_VALID_PLA_TIE}, "
+                f"got {cfg['pla_bin_tie']!r}")
         mb = cfg["pla_mult_bits"]
         if isinstance(mb, bool) or not isinstance(mb, int) or not 2 <= mb <= 16:
             raise ValueError(

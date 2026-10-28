@@ -35,12 +35,15 @@ the accumulator and the window folds the activation that follows the conv
 (PReLU / LeakyReLU / ReLU). Per output channel two signed `pla_mult_bits`
 multipliers, m_pos = 2^frac and m_neg = q(alpha * 2^frac), are picked by the
 sign of the word, P = N * m (48 + 8 = 56b), and the unchanged window extracts
-O from P on the grid 2^(e_layer_min - frac). See `PLAParams`.
+O from P on the grid 2^(e_layer_min - frac). See `PLAParams`. pla_bias='bins'
+is the HW form: per channel bins split by boundaries on the bias-free
+accumulator, each with its own int8 scale S_k and bias B_k, P = S_k * N + B_k
+(`pla_bins`).
 
 Only MXINT formats are supported. FP8/MXFP paths are rejected.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -266,15 +269,28 @@ class PLAParams(NamedTuple):
     frac         : fraction bits of both; P sits on the grid 2^(e_acc - frac)
     bias         : 'pre'  - bias in the accumulator, so the segment follows
                             the sign of acc + bias (what PReLU(conv) needs)
-                   'post' - emulator order (pcu_pla): P = N * m + bias * m_pos,
-                            segment by the sign of the bias-free N. Equals
-                            'pre' only for m_neg == m_pos; with a fold it
-                            differs where N and N + bias have other signs
+                   'post' - emulator single-bin order (pcu_pla): P = N * m +
+                            bias * m_pos, segment by the sign of the bias-free
+                            N. Equals 'pre' only for m_neg == m_pos; with a
+                            fold it differs where N and N + bias have other
+                            signs
+                   'bins' - HW bin form: bias-free N, bin k where
+                            bounds[k-1] <= N < bounds[k] ('upper' tie: N equal
+                            to a boundary goes to the bin above), P = scales[k]
+                            * N + biases[k]. See `pla_bins`
+    bounds       : int64 [O, nbins - 1] ascending, on the accumulator grid
+    scales       : int64 [O, nbins] signed, frac fraction bits
+    biases       : int64 [O, nbins] on the grid 2^(e_acc - frac)
+    tie          : 'upper' | 'lower', bin of N == boundary
     """
     m_pos: torch.Tensor
     m_neg: torch.Tensor
     frac: int
     bias: str = "pre"
+    bounds: Optional[torch.Tensor] = None
+    scales: Optional[torch.Tensor] = None
+    biases: Optional[torch.Tensor] = None
+    tie: str = "upper"
 
 
 def pla_multipliers(alpha, mult_bits=8, frac_bits=None):
@@ -313,10 +329,42 @@ def _bias_to_grid(bias_fp, e_grid, half_up, device):
     return ((v + 0.5).floor() if half_up else v.round()).to(torch.int64)
 
 
+def pla_bins(m_pos, m_neg, bias_fp, e_acc, frac):
+    """(bounds, scales, biases) of the two-bin HW form of y = z (z >= 0),
+    alpha * z (z < 0) on z = N * 2^e_acc + b (PReLU / LeakyReLU / ReLU).
+
+    Bin 0 (N < -b_acc): S = m_neg, bin 1: S = m_pos, with b_acc = floor(b *
+    2^-e_acc + 0.5) the accumulator bias of 'pre', so both pick the same
+    segment. B_k = floor(m_k * b * 2^-e_acc + 0.5) on the grid 2^(e_acc -
+    frac), offline, round half up as the HW bias. 'pre' instead has m_k *
+    b_acc; the two differ by at most m_k / 2 + 1/2 there."""
+    m_pos = m_pos.to(torch.int64).cpu()
+    m_neg = m_neg.to(torch.int64).cpu()
+    scales = torch.stack([m_neg, m_pos], 1)
+    if bias_fp is None:
+        z = torch.zeros_like(m_pos)
+        return z.view(-1, 1), scales, torch.zeros_like(scales)
+    v = bias_fp.detach().to(torch.float64).cpu().flatten() * float(2.0 ** (-int(e_acc)))
+    b_acc = (v + 0.5).floor().to(torch.int64)
+    biases = (scales.to(torch.float64) * v.view(-1, 1) + 0.5).floor().to(torch.int64)
+    return (-b_acc).view(-1, 1), scales, biases
+
+
 def _apply_pla(acc, pla, bias_post=None):
     """P = acc * (m_neg if acc < 0 else m_pos) [+ bias_post], per output
-    channel (dim 1). int64 exact: |acc| < 2^(bits-1), |m| <= 2^(mult_bits-1)."""
+    channel (dim 1); 'bins': P = scales[k] * acc + biases[k] of acc's bin.
+    int64 exact: |acc| < 2^(bits-1), |m| <= 2^(mult_bits-1)."""
     shape = (1, acc.shape[1]) + (1,) * (acc.dim() - 2)
+    if pla.bias == "bins":
+        sc, bi = pla.scales.to(acc.device), pla.biases.to(acc.device)
+        bd = pla.bounds.to(acc.device)
+        s, b = sc[:, 0].view(shape), bi[:, 0].view(shape)
+        for k in range(1, sc.shape[1]):
+            t = bd[:, k - 1].view(shape)
+            sel = acc >= t if pla.tie == "upper" else acc > t
+            s = torch.where(sel, sc[:, k].view(shape), s)
+            b = torch.where(sel, bi[:, k].view(shape), b)
+        return acc * s + b
     m = torch.where(acc < 0, pla.m_neg.to(acc.device).view(shape),
                     pla.m_pos.to(acc.device).view(shape))
     p = acc * m
@@ -510,7 +558,8 @@ def _hw_fxp_conv2d_ref(
     if bias_fp is not None and pla is not None and pla.bias == "post":
         # Emulator order: the bias joins after the PCU multiply, on its grid.
         bias_post = _bias_to_grid(bias_fp, e_min - pla.frac, True, device).view(1, O, 1)
-    elif bias_fp is not None:
+    elif bias_fp is not None and not (pla is not None and pla.bias == "bins"):
+        # 'bins' carries its biases per bin (`pla_bins`), after the multiply.
         # Project bias onto acc grid: bias_int = round(b * 2^(-e_layer_min)).
         bias_int = _bias_to_grid(bias_fp, e_min, pla is not None, device).view(1, O, 1)
         acc = acc + bias_int
@@ -806,6 +855,15 @@ def hw_fxp_conv2d(
     """
     if pla is not None and e_qa_out is None:
         raise ValueError("hw_fxp_conv2d: pla needs the output window (e_qa_out)")
+    if pla is not None and pla.bias == "bins":
+        O, nb = qw_fp.shape[0], pla.scales.shape[-1]
+        if (pla.scales.shape != (O, nb) or pla.biases.shape != (O, nb)
+                or pla.bounds.shape != (O, nb - 1) or pla.tie not in ("upper", "lower")):
+            raise ValueError(
+                f"hw_fxp_conv2d: PLA bins need scales/biases [{O}, n], bounds "
+                f"[{O}, n - 1] and tie 'upper'|'lower', got "
+                f"{tuple(pla.scales.shape)}/{tuple(pla.biases.shape)}/"
+                f"{tuple(pla.bounds.shape)}, {pla.tie!r}")
     if e_qa_out is not None and win_bits is None:
         win_bits = derive_out_window_bits(fmt, out_exp_bits)
     if e_layer_min is None:
@@ -1196,7 +1254,8 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
 def export_hw_grids(model):
     """{layer name: {e_layer_min, e_qa_out, win_bits, shift_out}} for every
     `MXConv2dHW` in `model` - the config's "hw_grids" section (see
-    `fixed_point.hw_grids`), plus pla_frac / pla_m_pos / pla_m_neg for a
+    `fixed_point.hw_grids`), plus pla_frac / pla_m_pos / pla_m_neg (and the
+    pla_bin_* lists with pla_bias 'bins') for a
     layer with PLA folded. Raises if a layer has no grid yet."""
     from mx_layers_blocked import MXConv2dHW, _get_xblock_cfg
     from .hw_grids import check_hw_grid
@@ -1231,6 +1290,10 @@ def export_hw_grids(model):
             entry.update(pla_frac=int(pla.frac),
                          pla_m_pos=[int(v) for v in pla.m_pos.tolist()],
                          pla_m_neg=[int(v) for v in pla.m_neg.tolist()])
+            if pla.bias == "bins":
+                entry.update(pla_bin_bounds=pla.bounds.tolist(),
+                             pla_bin_scales=pla.scales.tolist(),
+                             pla_bin_biases=pla.biases.tolist())
         grids[name] = check_hw_grid(name, entry)
     if missing:
         raise ValueError(f"export_hw_grids: {len(missing)} layers have no grids "
