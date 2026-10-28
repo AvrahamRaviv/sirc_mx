@@ -15,6 +15,12 @@ _VALID_CONVT = ("plain", "hw")
 _VALID_PLA = ("off", "infer")
 _VALID_PLA_BIAS = ("bins", "pre", "post")
 _VALID_PLA_TIE = ("upper", "lower")
+_VALID_MANT_ROUND = ("nearest", "truncate")
+_VALID_OVERFLOW = ("clamp", "raise")
+_VALID_BIAS_ROUND = ("even", "half_up")
+_VALID_IN_EXP_ANCHOR = ("max", "min")
+_VALID_IN_MODE = ("mx", "int")
+_VALID_IN_INT_SCALE = ("free", "pot")
 
 
 def validate_xblock_accum_bits(bits):
@@ -193,6 +199,26 @@ XBLOCK_ACCUM_DEFAULTS = {
                                   # multiplier) or 'post' (emulator single-bin
                                   # pcu_pla order; wrong for PReLU)
     "pla_bin_tie": "upper",       # 'bins': acc == boundary goes to the bin above
+    # HW-exact switches (hw_fixed_point only; defaults keep the ALG behaviour).
+    "mant_round": "nearest",      # a/w MX mantissas: 'nearest' (microxcaling) or
+                                  # 'truncate' (toward zero, the HW block-mode emit)
+    "overflow": "clamp",          # accumulator / output window out of range: 'clamp'
+                                  # or 'raise' (eval only; HW wraps, a PTQ contract
+                                  # violation). Train always clamps
+    "bias_round": "even",         # bias onto the acc grid: 'even' (round half to
+                                  # even) or 'half_up' (floor(v + 0.5), the HW)
+    "in_exp_anchor": "max",       # in_exp register base: 'max' (max block exp -
+                                  # (2^bits - 1), graceful) or 'min' (the HW: min
+                                  # non-zero block exp; eval checks the top, train
+                                  # stays max-anchored)
+    "static_shift_bits": None,    # None, or the signed width of the HW PCU static
+                                  # shift (7): checks -(e_qa_out + 2*mant_bias) fits,
+                                  # exported as hw_grids static_shift
+    "in_mode": "mx",              # 'mx', or 'int': per-tensor int8 input, no block
+                                  # exponent (the HW first layer); scale in hw_grids
+                                  # in_scale (calibrated)
+    "in_int_scale": "free",       # in_mode 'int' calibration: 'free' (max|x| / 127)
+                                  # or 'pot' (smallest 2^k with max|x| / 2^k <= 127)
 }
 
 
@@ -370,6 +396,20 @@ def normalize_xblock_accum(value):
                 raise ValueError(
                     f"xblock_accum: bits + pla_mult_bits = {cfg['bits'] + mb} "
                     f"does not fit the int64 emulation (max 62)")
+        for key, valid in (("mant_round", _VALID_MANT_ROUND),
+                           ("overflow", _VALID_OVERFLOW),
+                           ("bias_round", _VALID_BIAS_ROUND),
+                           ("in_exp_anchor", _VALID_IN_EXP_ANCHOR),
+                           ("in_mode", _VALID_IN_MODE),
+                           ("in_int_scale", _VALID_IN_INT_SCALE)):
+            if cfg[key] not in valid:
+                raise ValueError(f"xblock_accum.{key} must be in {valid}, "
+                                 f"got {cfg[key]!r}")
+        ssb = cfg["static_shift_bits"]
+        if ssb is not None and (isinstance(ssb, bool) or not isinstance(ssb, int)
+                                or not 2 <= ssb <= 16):
+            raise ValueError(f"xblock_accum.static_shift_bits must be None or int "
+                             f"in [2, 16], got {ssb!r}")
         # Phase 1 supports only the two documented combinations.
         _combo = (cfg["act_blockify"], cfg["weight_blockify"])
         if _combo not in (("channel", "channel"), ("xblock", "flatten")):

@@ -32,7 +32,9 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
                                            clamp_block_exp, floor_log2, in_exp_on,
-                                           dilate_input, PLAParams, pla_bins, pla_multipliers)
+                                           dilate_input, PLAParams, pla_bins, pla_multipliers,
+                                           block_exp_range, check_block_exp,
+                                           check_static_shift, int_input)
 
 # Activations PLA can fold into the PCU multiply: two segments split at 0.
 PLA_ACTS = (nn.PReLU, nn.LeakyReLU, nn.ReLU)
@@ -254,6 +256,15 @@ class MXConv2dHW(MXConv2d):
         window, in eval mode. The activation module stays in place (state_dict
         unchanged) and passes a PLA output through; train mode runs it as
         before. Multipliers: hw_grids pla_* if set, else from its slope.
+      - HW-exact switches, all off by default (`xblock_accum`):
+        `mant_round` 'truncate' (a/w mantissas toward zero), `overflow`
+        'raise' (eval: accumulator / window / exponent register / int input
+        out of range raise instead of clamping), `bias_round` 'half_up',
+        `in_exp_anchor` 'min' (register base at the min non-zero block, eval
+        only; train stays max-anchored), `static_shift_bits` (range check of
+        the PCU static shift), `in_mode` 'int' (per-tensor int8 input, the
+        first layer: q = round(x / in_scale), the scale folded into the
+        weights, conv(q, W * s) == conv(q * s, W)).
     """
 
     def weight_exp_base(self):
@@ -263,9 +274,28 @@ class MXConv2dHW(MXConv2d):
             return int(self.e_base_w)
         if self._last_e_base_w is not None:
             return int(self._last_e_base_w)
-        bits = _get_xblock_cfg(self).get("in_exp_bits")
+        cfg = _get_xblock_cfg(self)
+        bits = cfg.get("in_exp_bits")
+        if bits is not None and cfg.get("in_exp_anchor", "max") == "min":
+            w = self._hw_weight() * self._in_weight_scale()
+            return block_exp_range(w, self.mx_specs['block_size'],
+                                   cfg.get("weight_blockify", "channel"))[0]
         e = floor_log2(float(self.weight.detach().abs().max()))
         return None if bits is None or e is None else e - ((1 << int(bits)) - 1)
+
+    def _in_weight_scale(self):
+        """in_mode 'int' folds the input scale into the weights; else 1."""
+        if (_get_xblock_cfg(self).get("in_mode", "mx") == "int"
+                and self.in_scale is not None):
+            return float(self.in_scale)
+        return 1.0
+
+    def _mant_round(self):
+        """quantize_mx_op round= kwargs for the a/w mantissas: {} keeps the
+        microxcaling default (nearest); 'truncate' is its 'floor' (toward zero)."""
+        if _get_xblock_cfg(self).get("mant_round", "nearest") == "truncate":
+            return {"round": "floor"}
+        return {}
 
     def _hw_weight(self):
         """Weight in conv layout [O, Cin, kH, kW] as the HW path consumes it.
@@ -286,6 +316,7 @@ class MXConv2dHW(MXConv2d):
         self.e_qa_out = None            # output window grid (calibrate_hw_grids)
         self.e_base_a = None            # input SE base (in_exp_bits; calibrated)
         self.e_base_w = None            # weight SE base; None = from the weights
+        self.in_scale = None            # in_mode 'int': input scale (calibrated)
         self._last_e_base_w = None
         self._in_exp_cut_life = [0, 0]  # a, w elements changed by the SE register
         # Where each grid came from: 'config' (hw_grids / xblock_accum) or
@@ -434,6 +465,26 @@ class MXConv2dHW(MXConv2d):
             )
 
         cfg_early = _get_xblock_cfg(self)
+        name = self._mx_layer_name or f"conv-{id(self):x}"
+        hw_eval = not self.training
+        raise_over = cfg_early.get('overflow', 'clamp') == 'raise' and hw_eval
+        int_in = cfg_early.get('in_mode', 'mx') == 'int'
+        if int_in:
+            obs = getattr(self, '_in_scale_obs', None)
+            if obs is not None:
+                # in_scale pre-sweep: observe the raw input, run a float conv.
+                obs[0] = max(obs[0], float(x.detach().abs().max()))
+                g = self._hw_geom()
+                return F.conv2d(dilate_input(x, g['in_dil'], g['in_extra']),
+                                self._hw_weight(), self.bias, g['stride'],
+                                g['padding'], g['dilation'])
+            if self.in_scale is not None:
+                x = int_input(x, self.in_scale, check=raise_over, what=f"MXConv2dHW {name}")
+            elif getattr(self, '_calibration_state', None) is None:
+                raise RuntimeError(
+                    f"MXConv2dHW {name}: in_mode 'int' needs in_scale. Run "
+                    f"`calibrate_hw_grids` or set hw_grids in_scale.")
+        w_scale = self._in_weight_scale()
         pad_channels = bool(cfg_early.get('pad_channels', True))
         verbose = int(cfg_early.get('verbose', 1))
         # NPE blockify: weight per-filter flatten + activation X-block. Needs no
@@ -451,6 +502,8 @@ class MXConv2dHW(MXConv2d):
             pad = bs - (C % bs)
             x = F.pad(x, (0, 0, 0, 0, 0, pad))           # pad C with zeros
             weight = F.pad(self._hw_weight(), (0, 0, 0, 0, 0, pad))
+            if w_scale != 1.0:
+                weight = weight * w_scale
             B, C, H, W = x.shape
             if verbose >= 2 and not self._pad_logged:
                 print(
@@ -460,6 +513,8 @@ class MXConv2dHW(MXConv2d):
                 self._pad_logged = True
         else:
             weight = self._hw_weight()
+            if w_scale != 1.0:
+                weight = weight * w_scale
 
         bf_in = quantize_elemwise_op(x, mx_specs=sp, round=sp['round_output'])
         bf_w = quantize_elemwise_op(weight, mx_specs=sp, round=sp['round_weight'])
@@ -468,19 +523,20 @@ class MXConv2dHW(MXConv2d):
         else:
             bf_bias = None
 
+        mr = self._mant_round()   # an int input is on the int8 lattice: exact either way
         if npe:
             # Fake-quant with the NPE blockings so extract_mxint_{xblock,flatten}
             # recover a consistent lattice (and STE grads flow). Activation blocks
             # along W (axis=3); weight flattens each filter [Cin,kH,kW]->1D.
             qi = quantize_mx_op(bf_in, sp, elem_format=sp['a_elem_format'],
-                                axes=[3], block_size=bs)
+                                axes=[3], block_size=bs, **mr)
             flat = bf_w.reshape(bf_w.shape[0], -1)
             flat = quantize_mx_op(flat, sp, elem_format=sp['w_elem_format'],
-                                  axes=[1], block_size=bs)
+                                  axes=[1], block_size=bs, **mr)
             qw = flat.reshape(bf_w.shape)
         else:
-            qi = quantize_mx_op(bf_in, sp, elem_format=sp['a_elem_format'], axes=[1])
-            qw = quantize_mx_op(bf_w, sp, elem_format=sp['w_elem_format'], axes=[1])
+            qi = quantize_mx_op(bf_in, sp, elem_format=sp['a_elem_format'], axes=[1], **mr)
+            qw = quantize_mx_op(bf_w, sp, elem_format=sp['w_elem_format'], axes=[1], **mr)
         if qw.dtype == torch.bfloat16 and qi.dtype != torch.bfloat16:
             qw = qw.to(qi.dtype)
         if self._tap_acc:
@@ -507,15 +563,41 @@ class MXConv2dHW(MXConv2d):
                     f"{exp_mode!r} needs e_base_a. Run `calibrate_hw_grids` "
                     f"or set hw_grids e_base_a.")
             exp_bits = int(cfg['in_exp_bits'])
+            span = (1 << exp_bits) - 1
+            # 'min' (HW) anchors at the min non-zero block in eval; train and
+            # 'max' keep the graceful max-anchored register.
+            hw_anchor = cfg.get('in_exp_anchor', 'max') == 'min' and hw_eval
+            w_blk = weight_blockify if npe else 'channel'
+            a_blk = act_blockify if npe else 'channel'
             if self.e_base_w is None:
-                e_w = floor_log2(float(qw.detach().abs().max()))
-                self._last_e_base_w = (None if e_w is None
-                                       else e_w - ((1 << exp_bits) - 1))
+                if hw_anchor:
+                    self._last_e_base_w = block_exp_range(qw, bs, w_blk)[0]
+                else:
+                    e_w = floor_log2(float(qw.detach().abs().max()))
+                    self._last_e_base_w = (None if e_w is None else e_w - span)
             base_w = self.e_base_w if self.e_base_w is not None else self._last_e_base_w
-            ca, na = clamp_block_exp(qi.detach(), self.e_base_a, exp_bits, a_fmt)
-            qi = qi + (ca - qi).detach()             # STE: grads unchanged
+            if hw_anchor:
+                base_a = self.e_base_a
+            elif cfg.get('in_exp_anchor', 'max') == 'min':
+                e_a = floor_log2(float(qi.detach().abs().max()))   # train: live max anchor
+                base_a = self.e_base_a if e_a is None else e_a - span
+            else:
+                base_a = self.e_base_a
+            rnd = 'truncate' if mr else 'nearest'
+            if hw_anchor and raise_over:
+                if not int_in:
+                    check_block_exp(qi, bs, a_blk, base_a, exp_bits,
+                                    f"MXConv2dHW {name} input")
+                if base_w is not None:
+                    check_block_exp(qw, bs, w_blk, base_w, exp_bits,
+                                    f"MXConv2dHW {name} weight")
+            if int_in:
+                na = 0                               # HW int input: no block exponent
+            else:
+                ca, na = clamp_block_exp(qi.detach(), base_a, exp_bits, a_fmt, rnd)
+                qi = qi + (ca - qi).detach()         # STE: grads unchanged
             if base_w is not None:
-                cw, nw = clamp_block_exp(qw.detach(), base_w, exp_bits, w_fmt)
+                cw, nw = clamp_block_exp(qw.detach(), base_w, exp_bits, w_fmt, rnd)
                 qw = qw + (cw - qw).detach()
             else:
                 nw = 0
@@ -542,6 +624,8 @@ class MXConv2dHW(MXConv2d):
                 f"Run `calibrate_hw_grids(model, loader)` first."
             )
         e_qa_out = int(self.e_qa_out) if apply_win else None
+        if apply_win and cfg.get('static_shift_bits') is not None:
+            check_static_shift(e_qa_out, cfg['static_shift_bits'], a_fmt, f"MXConv2dHW {name}")
         apply_pla = (self.pla_on() and cfg.get('pla') == 'infer'
                      and not self.training)
         if apply_pla and not apply_win:
@@ -594,6 +678,7 @@ class MXConv2dHW(MXConv2d):
             win_bits=resolve_out_window_bits(cfg, a_fmt) if apply_win else None,
             out_round=cfg.get('out_round', 'floor'),
             pla=self.pla_params(int(e_min)) if apply_pla else None,
+            bias_round=cfg.get('bias_round', 'even'),
         )
         if self._tap_acc:
             self._last_acc = stats.get('acc')
@@ -603,6 +688,18 @@ class MXConv2dHW(MXConv2d):
         self._win_sat_seen_life += int(stats.get('win_sat_count', 0))
         sat_count = int(stats.get('sat_count', 0))
         total = int(stats.get('total', 0))
+        if raise_over and sat_count:
+            raise RuntimeError(
+                f"MXConv2dHW {name}: {sat_count}/{total} outputs overflowed the "
+                f"{cfg['bits']}b accumulator (e_layer_min={int(e_min)}). HW wraps "
+                f"(PTQ contract violation, xblock_accum.overflow 'raise').")
+        if raise_over and stats.get('win_sat_count', 0):
+            raise RuntimeError(
+                f"MXConv2dHW {name}: {int(stats['win_sat_count'])}/{total} outputs "
+                f"outside the {resolve_out_window_bits(cfg, a_fmt)}b output window "
+                f"(e_qa_out={e_qa_out}): |value| >= 2^win_bits is impossible in HW "
+                f"(PTQ contract violation, xblock_accum.overflow 'raise'). "
+                f"Recalibrate or raise out_margin_bits.")
         self._fwd_count += 1
         self._sat_total_life += total
         self._sat_seen_life += sat_count

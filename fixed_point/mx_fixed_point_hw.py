@@ -324,7 +324,8 @@ def pla_multipliers(alpha, mult_bits=8, frac_bits=None):
 
 def _bias_to_grid(bias_fp, e_grid, half_up, device):
     """Bias on the integer grid 2^e_grid: round half to even, or with
-    `half_up` floor(v + 0.5), the HW's offline rounding (used with PLA)."""
+    `half_up` floor(v + 0.5), ties toward +inf, the HW's offline rounding
+    (PLA, xblock_accum.bias_round 'half_up'). The one bias rounding helper."""
     v = bias_fp.detach().to(torch.float64).to(device) * float(2.0 ** (-int(e_grid)))
     return ((v + 0.5).floor() if half_up else v.round()).to(torch.int64)
 
@@ -391,7 +392,7 @@ def floor_log2(x):
     return math.frexp(float(x))[1] - 1
 
 
-def clamp_block_exp(q, e_base, exp_bits, fmt='int8'):
+def clamp_block_exp(q, e_base, exp_bits, fmt='int8', round='nearest'):
     """Model a `exp_bits`-wide HW shared-exponent register on an MX tensor.
 
     Allowed block exponents: [e_base, e_base + 2^exp_bits - 1]. A block
@@ -401,15 +402,109 @@ def clamp_block_exp(q, e_base, exp_bits, fmt='int8'):
     values are multiples of its own step, which the coarser e_base step
     divides, so they come back unchanged. (Re-rounding an already rounded
     value can differ from rounding the float once by one step at a tie.)
+    `round='truncate'` drops the bits instead (toward zero, the HW emit).
 
     Returns (clamped tensor, number of changed elements).
     """
     _, mant_bias, max_val, _ = _int_format_params(fmt)
     step = 2.0 ** (int(e_base) - mant_bias)
     hi = max_val * 2.0 ** (int(e_base) + (1 << int(exp_bits)) - 1 - mant_bias)
-    y = torch.sign(q) * torch.floor(q.abs() / step + 0.5) * step
+    hi = min(hi, torch.finfo(q.dtype).max)     # a wide register tops out above fp
+    half = 0.0 if round == "truncate" else 0.5
+    y = torch.sign(q) * torch.floor(q.abs() / step + half) * step
     y = y.clamp(-hi, hi)
     return y, int((y != q).sum().item())
+
+
+def block_absmax(x, bs, blockify):
+    """Per-block |max| of `x` under one blockify: 'channel' (dim 1), 'xblock'
+    (last dim, W) or 'flatten' (each filter [Cin, kH, kW] as one stream). A
+    partial tail block is zero-padded (zeros never change a block max)."""
+    x = x.detach().to(torch.float32)
+    if blockify == "flatten":
+        x = x.reshape(x.shape[0], -1)
+    elif blockify == "channel":
+        x = x.movedim(1, -1)
+    n = x.shape[-1]
+    nb = (n + bs - 1) // bs
+    if nb * bs != n:
+        x = F.pad(x, (0, nb * bs - n))
+    return x.reshape(*x.shape[:-1], nb, bs).abs().amax(dim=-1)
+
+
+def block_exp_range(x, bs, blockify):
+    """(min, max) MX block exponent floor(log2(block |max|)) over the non-zero
+    blocks of `x`; (None, None) when every block is zero."""
+    amax = block_absmax(x, bs, blockify)
+    nz = amax[amax > 0]
+    if nz.numel() == 0:
+        return None, None
+    _, ex = torch.frexp(torch.stack([nz.min(), nz.max()]))
+    return int(ex[0]) - 1, int(ex[1]) - 1
+
+
+def check_block_exp(x, bs, blockify, e_base, exp_bits, what):
+    """The HW shared-exponent register (min-anchored, wrap-only): raise when a
+    non-zero block exponent of `x` is outside [e_base, e_base + 2^exp_bits - 1].
+    HW would wrap it; that is a PTQ contract violation, so it is not emulated."""
+    lo_e, hi_e = block_exp_range(x, bs, blockify)
+    top = int(e_base) + (1 << int(exp_bits)) - 1
+    if lo_e is not None and (lo_e < int(e_base) or hi_e > top):
+        raise RuntimeError(
+            f"{what}: block exponents {lo_e}..{hi_e} are outside the "
+            f"{int(exp_bits)}b exponent register [{int(e_base)}, {top}]. HW "
+            f"wraps them (PTQ contract violation, xblock_accum.overflow 'raise').")
+
+
+def static_shift_of(e_qa_out, fmt='int8'):
+    """HW PCU static shift of an output grid. The PCU writes its output on the
+    fixed grid 2^-(2*mant_bias) (2^-12 for int8) after shifting the word by
+    s + 2*mant_bias + E_acc, positive = left (`pcu_div`), so the output grid
+    is 2^-(2*mant_bias + s): s = -(e_qa_out + 2*mant_bias)."""
+    _, mant_bias, _, _ = _int_format_params(fmt)
+    return -(int(e_qa_out) + 2 * mant_bias)
+
+
+def check_static_shift(e_qa_out, bits, fmt='int8', what="layer"):
+    """`static_shift_of(e_qa_out)` if it fits a signed `bits` field, else raise."""
+    sh = static_shift_of(e_qa_out, fmt)
+    lo, hi = -(1 << (int(bits) - 1)), (1 << (int(bits) - 1)) - 1
+    if not lo <= sh <= hi:
+        raise ValueError(
+            f"{what}: e_qa_out={int(e_qa_out)} needs PCU static shift {sh}, outside "
+            f"the {int(bits)}b signed range [{lo}, {hi}]")
+    return sh
+
+
+IN_INT_LO, IN_INT_HI = -128, 127   # first-layer int8 input (HW stores 8 bits)
+
+
+def in_int_scale_from_absmax(absmax, mode="free"):
+    """Per-tensor scale of the first-layer int8 input: 'free' max|x| / 127
+    (non-POT, HW allows any), 'pot' the smallest 2^k with max|x| / 2^k <= 127.
+    1.0 for an all-zero input."""
+    import math
+    if not absmax > 0:
+        return 1.0
+    s = float(absmax) / IN_INT_HI
+    return s if mode == "free" else 2.0 ** math.ceil(math.log2(s))
+
+
+def int_input(x, scale, check=False, what="layer"):
+    """q = round(x / scale) (torch.round, as the emulator), the per-tensor int8
+    first-layer input. Out of [-128, 127] raises with `check` (HW keeps 8 bits:
+    a wrap), else clamps. STE: gradient of x / scale."""
+    xs = x / float(scale)
+    with torch.no_grad():
+        q = torch.round(xs)
+        bad = (q < IN_INT_LO) | (q > IN_INT_HI)
+        if check and bool(bad.any()):
+            raise RuntimeError(
+                f"{what}: {int(bad.sum())} input values outside int8 at scale "
+                f"{float(scale):.6g} (max |x| {float(x.abs().max()):.6g}); HW "
+                f"wraps (PTQ contract violation).")
+        q = q.clamp(IN_INT_LO, IN_INT_HI)
+    return xs + (q - xs).detach()
 
 
 def _pair(v):
@@ -457,7 +552,7 @@ def _hw_fxp_conv2d_ref(
     mant_bias=MANTISSA_BIAS,
     return_acc=False,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None,
+    pla=None, bias_round="even",
 ):
     """Pure-torch reference for the HW fixed-point conv2d kernel.
 
@@ -484,7 +579,8 @@ def _hw_fxp_conv2d_ref(
     fp32 cast (see `_apply_out_window`); `win_sink`, if given, receives the
     window saturation map as 'win_sat' and the window word as 'win'.
     `pla` (a `PLAParams`, needs `e_qa_out`) multiplies the word before the
-    window; `acc` stays the accumulator word.
+    window; `acc` stays the accumulator word. `bias_round` 'even' | 'half_up'
+    rounds the bias onto the accumulator grid (PLA always rounds half up).
     """
     if pla is not None and e_qa_out is None:
         raise ValueError("PLA needs the output window (e_qa_out)")
@@ -561,7 +657,8 @@ def _hw_fxp_conv2d_ref(
     elif bias_fp is not None and not (pla is not None and pla.bias == "bins"):
         # 'bins' carries its biases per bin (`pla_bins`), after the multiply.
         # Project bias onto acc grid: bias_int = round(b * 2^(-e_layer_min)).
-        bias_int = _bias_to_grid(bias_fp, e_min, pla is not None, device).view(1, O, 1)
+        bias_int = _bias_to_grid(bias_fp, e_min, pla is not None or bias_round == "half_up",
+                                 device).view(1, O, 1)
         acc = acc + bias_int
         acc, sat_step = _sat(acc, lo, hi)
         sat = sat | sat_step
@@ -588,7 +685,7 @@ def _hw_fxp_conv2d_ref_npe(
     bits, sat_mode,
     bias_fp=None, mant_bias=MANTISSA_BIAS, return_acc=False,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None,
+    pla=None, bias_round="even",
 ):
     """NPE reference: the two operands carry independent, full-resolution
     per-element shared exponents (weight = flatten-block, act = X-block). This
@@ -611,7 +708,7 @@ def _hw_fxp_conv2d_ref_npe(
         bs=1, bits=bits, sat_mode=sat_mode,
         bias_fp=bias_fp, mant_bias=mant_bias, return_acc=return_acc,
         e_qa_out=e_qa_out, win_bits=win_bits, out_round=out_round,
-        win_sink=win_sink, pla=pla,
+        win_sink=win_sink, pla=pla, bias_round=bias_round,
     )
 
 
@@ -646,7 +743,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
         npe_triton_variant='reuse',
         e_qa_out=None, win_bits=None, out_round='floor',
         in_dil=(1, 1), in_extra=(0, 0),
-        pla=None,
+        pla=None, bias_round='even',
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
         win_sink = {} if e_qa_out is not None else None
@@ -654,6 +751,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
             e_qa_out=None if e_qa_out is None else int(e_qa_out),
             win_bits=None if win_bits is None else int(win_bits),
             out_round=str(out_round), win_sink=win_sink, pla=pla,
+            bias_round=str(bias_round),
         )
         npe = (act_blockify == "xblock" and weight_blockify == "flatten")
         # A caller that taps the integer accumulator sets `want_acc` in the
@@ -805,17 +903,17 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 23 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # forward took 24 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
         # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink,
         # fmt, act_blockify, weight_blockify, npe_triton_variant,
-        # e_qa_out, win_bits, out_round, in_dil, in_extra, pla
+        # e_qa_out, win_bits, out_round, in_dil, in_extra, pla, bias_round
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
             None, None, None, None, None, None,
             None, None, None,
             None, None, None,
-            None, None, None,
+            None, None, None, None,
         )
 
 
@@ -830,7 +928,7 @@ def hw_fxp_conv2d(
     e_qa_out=None, win_bits=None, out_round='floor',
     out_exp_bits=OUT_EXP_BITS,
     in_dil=1, in_extra=0,
-    pla=None,
+    pla=None, bias_round='even',
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
@@ -851,7 +949,8 @@ def hw_fxp_conv2d(
     `stride`/`padding`/`dilation` then describe the stride-1 conv over it.
     `pla` (`PLAParams`, None = off) runs the PCU multiply before the window
     (forward only, needs `e_qa_out`); the caller applies the float activation
-    to the gradient path itself.
+    to the gradient path itself. `bias_round` 'even' (default) | 'half_up'
+    (floor(v + 0.5), the HW's offline bias rounding).
     """
     if pla is not None and e_qa_out is None:
         raise ValueError("hw_fxp_conv2d: pla needs the output window (e_qa_out)")
@@ -864,6 +963,9 @@ def hw_fxp_conv2d(
                 f"[{O}, n - 1] and tie 'upper'|'lower', got "
                 f"{tuple(pla.scales.shape)}/{tuple(pla.biases.shape)}/"
                 f"{tuple(pla.bounds.shape)}, {pla.tie!r}")
+    if bias_round not in ("even", "half_up"):
+        raise ValueError(f"hw_fxp_conv2d: bias_round must be 'even' or 'half_up', "
+                         f"got {bias_round!r}")
     if e_qa_out is not None and win_bits is None:
         win_bits = derive_out_window_bits(fmt, out_exp_bits)
     if e_layer_min is None:
@@ -882,7 +984,7 @@ def hw_fxp_conv2d(
         None if e_qa_out is None else int(e_qa_out),
         None if win_bits is None else int(win_bits), str(out_round),
         _pair(in_dil), _pair(in_extra),
-        pla,
+        pla, str(bias_round),
     )
 
 
@@ -938,6 +1040,8 @@ class _CalibrationState:
         self.out_absmax = None
         self.calls_now = 0      # calls in the current forward
         self.max_calls = 0      # most calls seen in one forward
+        self.min_nz_ea = None   # min non-zero block exp of the input (HW anchor)
+        self.min_nz_ew = None   # same, weights
 
     def update(self, qi_fp, qw_fp, bs, fmt='int8',
                act_blockify='channel', weight_blockify='channel'):
@@ -953,6 +1057,12 @@ class _CalibrationState:
                                   float(qi_fp.detach().abs().amax().item()), max)
         self.w_absmax = _running(self.w_absmax,
                                  float(qw_fp.detach().abs().amax().item()), max)
+        lo_a, _ = block_exp_range(qi_fp, bs, act_blockify)
+        lo_w, _ = block_exp_range(qw_fp, bs, weight_blockify)
+        if lo_a is not None:
+            self.min_nz_ea = _running(self.min_nz_ea, lo_a, min)
+        if lo_w is not None:
+            self.min_nz_ew = _running(self.min_nz_ew, lo_w, min)
 
     def update_out(self, out):
         self.out_absmax = _running(self.out_absmax,
@@ -1036,6 +1146,43 @@ def _sweep(model, layers, data_iter, num_batches, forward_fn):
             if hasattr(m, "_calibration_state"):
                 delattr(m, "_calibration_state")
     return states
+
+
+def _sweep_in_scale(model, layers, data_iter, num_batches, forward_fn, force):
+    """Pre-sweep for in_mode 'int' layers: observe max|x| of the raw input
+    (the layers run a float conv meanwhile) and freeze `in_scale`, so the grid
+    sweep after it sees the int input. Config values win unless `force`. The
+    other HW layers take their FP32 calibration path meanwhile."""
+    from mx_layers_blocked import MXConv2dHW, _get_xblock_cfg
+    todo = [m for m in layers if force or m.in_scale is None]
+    if not todo:
+        return
+    others = [m for m in model.modules() if isinstance(m, MXConv2dHW)
+              and m not in todo and getattr(m, "_calibration_state", None) is None]
+    for m in todo:
+        m._in_scale_obs = [0.0]
+    for m in others:
+        m._calibration_state = _CalibrationState()
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for i, batch in enumerate(data_iter):
+                if i >= num_batches:
+                    break
+                _feed(model, batch, forward_fn)
+        for m in todo:
+            mode = _get_xblock_cfg(m).get("in_int_scale", "free")
+            m.in_scale = in_int_scale_from_absmax(m._in_scale_obs[0], mode)
+            m._grid_src["in_scale"] = "calib"
+    finally:
+        for m in todo:
+            if hasattr(m, "_in_scale_obs"):
+                delattr(m, "_in_scale_obs")
+        for m in others:
+            delattr(m, "_calibration_state")
+        if was_training:
+            model.train()
 
 
 def _set_grid(m, key, value, src):
@@ -1162,6 +1309,9 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
     from mx_layers_blocked import MXConv2dHW, _get_xblock_cfg
 
     all_hw = [m for m in model.modules() if isinstance(m, MXConv2dHW)]
+    int_in = [m for m in all_hw if _get_xblock_cfg(m).get("in_mode", "mx") == "int"]
+    if int_in:
+        _sweep_in_scale(model, int_in, data_iter, num_batches, forward_fn, force)
     layers = all_hw if force else [
         m for m in all_hw
         if m.e_layer_min is None or getattr(m, "e_qa_out", None) is None
@@ -1175,7 +1325,7 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
             if was_training:
                 model.train()
 
-    result = {}
+    result, contract = {}, []
     for m in all_hw:
         cfg = _get_xblock_cfg(m)
         name = m._mx_layer_name or f"conv-{id(m):x}"
@@ -1200,13 +1350,18 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
         fmt = m.mx_specs['a_elem_format']
         _, mant_bias, _, _ = _int_format_params(fmt)
         span = None
+        min_anchor = cfg.get("in_exp_anchor", "max") == "min"
         if in_exp_on(cfg):
             span = (1 << int(cfg["in_exp_bits"])) - 1
             if force or m.e_base_a is None:
-                _set_grid(m, "e_base_a", floor_log2(st.in_absmax) - span, "calib")
+                # HW anchors the register at the min non-zero block ('min').
+                base_a = (st.min_nz_ea if min_anchor
+                          else floor_log2(st.in_absmax) - span)
+                _set_grid(m, "e_base_a", base_a, "calib")
         e_base_w = m.e_base_w
         if span is not None and e_base_w is None:
-            e_base_w = floor_log2(st.w_absmax) - span   # live in forward
+            # live in forward
+            e_base_w = st.min_nz_ew if min_anchor else floor_log2(st.w_absmax) - span
         if force or m.e_layer_min is None:
             floor = _e_layer_min_floor(st, cfg, fmt, m.e_base_a if span is not None
                                        else None, e_base_w)
@@ -1216,6 +1371,21 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
             e_out = e_qa_out_from_absmax(st.out_absmax or 0.0, win_bits, margin)
             _set_grid(m, "e_qa_out", m.e_layer_min if e_out is None else e_out,
                       "calib")
+        if cfg.get("static_shift_bits") is not None:
+            check_static_shift(m.e_qa_out, cfg["static_shift_bits"], fmt, name)
+        if (span is not None and min_anchor and cfg.get("overflow") == "raise"
+                and st.in_absmax):
+            # The HW observer's check: from the min-anchored base the largest
+            # block must still fit the register, else HW wraps it.
+            a_top = floor_log2(st.in_absmax)
+            w_top = floor_log2(st.w_absmax) if st.w_absmax else None
+            if cfg.get("in_mode", "mx") != "int" and a_top - m.e_base_a > span:
+                contract.append(f"{name}: input block exps {m.e_base_a}..{a_top} "
+                                f"> {span + 1} codes")
+            if (w_top is not None and e_base_w is not None
+                    and w_top - e_base_w > span):
+                contract.append(f"{name}: weight block exps {e_base_w}..{w_top} "
+                                f"> {span + 1} codes")
         # Window-fill check: E_q from the max equals min block exp - bias
         # only when the input fills its window. A
         # positive gap means the input spans more than win_bits bits.
@@ -1233,6 +1403,12 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
             e_base_a=m.e_base_a, e_base_w=e_base_w if span is not None else None,
             src={k: _grid_src(m, k) for k in ("e_layer_min", "e_qa_out")},
         )
+    if contract:
+        raise ValueError(
+            f"calibrate_hw_grids: {len(contract)} tensors span more than the "
+            f"exponent register from the min-anchored base (in_exp_anchor 'min', overflow 'raise'); "
+            f"HW would wrap them. Widen in_exp_bits (e6/e8) or calibrate per "
+            f"channel: " + "; ".join(contract))
     if verbose:
         for name, r in result.items():
             src = r["src"]
@@ -1254,7 +1430,8 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
 def export_hw_grids(model):
     """{layer name: {e_layer_min, e_qa_out, win_bits, shift_out}} for every
     `MXConv2dHW` in `model` - the config's "hw_grids" section (see
-    `fixed_point.hw_grids`), plus pla_frac / pla_m_pos / pla_m_neg (and the
+    `fixed_point.hw_grids`), plus static_shift (xblock_accum.static_shift_bits),
+    in_scale (in_mode 'int'), pla_frac / pla_m_pos / pla_m_neg (and the
     pla_bin_* lists with pla_bias 'bins') for a
     layer with PLA folded. Raises if a layer has no grid yet."""
     from mx_layers_blocked import MXConv2dHW, _get_xblock_cfg
@@ -1279,6 +1456,15 @@ def export_hw_grids(model):
         )
         if getattr(m, "hw_calls", 1) > 1:
             entry["calls"] = int(m.hw_calls)
+        xcfg = _get_xblock_cfg(m)
+        if xcfg.get("static_shift_bits") is not None:
+            entry["static_shift"] = check_static_shift(
+                m.e_qa_out, xcfg["static_shift_bits"], m.mx_specs['a_elem_format'], name)
+        if xcfg.get("in_mode", "mx") == "int":
+            if m.in_scale is None:
+                missing.append(name)
+                continue
+            entry["in_scale"] = float(m.in_scale)
         if in_exp_on(_get_xblock_cfg(m)):
             if m.e_base_a is None:
                 missing.append(name)

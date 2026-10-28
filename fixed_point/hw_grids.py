@@ -17,6 +17,12 @@ Names are the ones in "layers". Per layer:
   calls        times the layer runs per forward on this one grid (default 1),
                e.g. 2 for a feature extractor shared by both images;
                calibration pools all calls, so the grid covers each of them
+  static_shift only with xblock_accum.static_shift_bits: the HW PCU static
+               shift, -(e_qa_out + 2*mant_bias) (output grid vs the fixed
+               2^-12 of int8; > 0 left shift). Derived, checked on load
+  in_scale     only with xblock_accum.in_mode 'int' (float > 0): the
+               per-tensor scale of the int8 first-layer input, q = round(x /
+               in_scale); non-POT allowed
   pla_frac     only with xblock_accum.pla: fraction bits of the PLA multipliers
   pla_m_pos    per output channel (list of int): multiplier for a word >= 0
   pla_m_neg    per output channel (list of int): multiplier for a word < 0
@@ -39,7 +45,7 @@ standalone.
 import json
 
 HW_GRID_KEYS = ("e_layer_min", "e_qa_out", "win_bits", "shift_out",
-                "e_base_a", "e_base_w", "calls",
+                "e_base_a", "e_base_w", "calls", "static_shift", "in_scale",
                 "pla_frac", "pla_m_pos", "pla_m_neg",
                 "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases")
 _REQUIRED = ("e_layer_min", "e_qa_out")
@@ -78,6 +84,10 @@ def check_hw_grid(name, entry, win_bits=None):
                     isinstance(c, list) and all(_is_int(t) for t in c) for c in v)):
                 raise TypeError(f"hw_grids[{name!r}][{k!r}] must be a non-empty "
                                 f"list (per channel) of lists of int, got {v!r}")
+        elif k == "in_scale":
+            if not (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0):
+                raise TypeError(f"hw_grids[{name!r}]['in_scale'] must be a "
+                                f"number > 0, got {v!r}")
         elif not _is_int(v):
             raise TypeError(f"hw_grids[{name!r}][{k!r}] must be int, got {v!r}")
     pla = [k for k in _PLA_KEYS if k in entry]

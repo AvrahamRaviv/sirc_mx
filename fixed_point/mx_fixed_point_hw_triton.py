@@ -326,10 +326,11 @@ def _window_launch_args(e_layer_min, e_qa_out, win_bits, out_round, M, O, device
                      float(2.0 ** int(e_qa_out))), 1
 
 
-def _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device):
+def _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device, bias_round="even"):
     """(bias_int, HAS_BIAS, e_win, pla tensors, pla constexprs).
 
-    The accumulator bias is round(b * 2^-e_layer_min), half up with PLA; in
+    The accumulator bias is round(b * 2^-e_layer_min): half to even, half up
+    with PLA or bias_round 'half_up' (`mx_fixed_point_hw._bias_to_grid`); in
     the PLA 'post' order it goes after the multiply instead, on the grid
     e_win = e_layer_min - frac the window then extracts from. 'bins' has no
     accumulator bias: each bin carries its own (`mx_fixed_point_hw.pla_bins`)."""
@@ -338,7 +339,8 @@ def _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device):
     post = pla is not None and pla.bias == "post"
     bins = pla is not None and pla.bias == "bins"
     has_bias = bias_fp is not None and not post and not bins
-    bias_int = (_bias_to_grid(bias_fp, e_layer_min, pla is not None, device).contiguous()
+    half_up = pla is not None or bias_round == "half_up"
+    bias_int = (_bias_to_grid(bias_fp, e_layer_min, half_up, device).contiguous()
                 if has_bias else torch.empty(O, dtype=torch.int64, device=device))
     flags = dict(APPLY_PLA=0, PLA_POST_BIAS=0, PLA_BINS=0, PLA_TIE_UPPER=1)
     if pla is None:
@@ -417,7 +419,7 @@ def _hw_fxp_conv2d_triton(
     bias_fp=None,
     mant_bias=6,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None,
+    pla=None, bias_round="even",
 ):
     _require_triton_cuda()
     if not qi_i8.is_cuda:
@@ -446,7 +448,7 @@ def _hw_fxp_conv2d_triton(
     # Bias onto the accumulator's fixed-point grid: acc represents
     # value * 2^(-e_layer_min), so bias_int = round(b * 2^(-e_layer_min)).
     bias_int, has_bias, e_win, pla_args, pla_flags = \
-        _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device)
+        _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device, bias_round)
 
     win_sat, win_args, apply_win = _window_launch_args(
         e_win, e_qa_out, win_bits, out_round, M, O, device)
@@ -530,7 +532,7 @@ def _hw_fxp_conv2d_triton_npe(
     mant_bias=6,
     BS=32,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None,
+    pla=None, bias_round="even",
 ):
     """Dedicated NPE triton path (per-lane exponents, BS-tiled). Bit-identical
     to the torch ref and the bs=1 reuse path; here for cross-verification.
@@ -563,7 +565,7 @@ def _hw_fxp_conv2d_triton_npe(
     inv_scale_ref = float(2.0 ** int(e_layer_min))
 
     bias_int, has_bias, e_win, pla_args, pla_flags = \
-        _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device)
+        _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device, bias_round)
 
     win_sat, win_args, apply_win = _window_launch_args(
         e_win, e_qa_out, win_bits, out_round, M, O, device)

@@ -21,8 +21,9 @@ from microxcaling.mx import MxSpecs
 
 from fixed_point.mx_fixed_point import normalize_xblock_accum, _get_xblock_cfg
 from fixed_point.mx_fixed_point_hw import (calibrate_act_scales,
-                                           calibrate_hw_grids, export_hw_grids,
-                                           resolve_out_window_bits)
+                                           calibrate_hw_grids, check_static_shift,
+                                           export_hw_grids, resolve_out_window_bits,
+                                           static_shift_of)
 from fixed_point.hw_grids import check_hw_grid, load_hw_grids
 from fixed_point.fxp_quant import (
     fake_quant_fxp, fxp_clip_stats, fxp_format_str, fxp_stats_value,
@@ -1470,6 +1471,19 @@ class MXQuantizer:
                 setattr(layer, key, int(entry[key]))
                 layer._grid_src[key] = "config"
         layer.hw_calls = int(entry.get("calls", 1))
+        if "in_scale" in entry:
+            layer.in_scale = float(entry["in_scale"])
+            layer._grid_src["in_scale"] = "config"
+        if "static_shift" in entry:
+            fmt = layer.mx_specs['a_elem_format']
+            want = static_shift_of(entry["e_qa_out"], fmt)
+            if entry["static_shift"] != want:
+                raise ValueError(
+                    f"hw_grids[{name!r}]: static_shift={entry['static_shift']} but "
+                    f"-(e_qa_out + 2*mant_bias) = {want}")
+            if xcfg.get("static_shift_bits") is not None:
+                check_static_shift(entry["e_qa_out"], xcfg["static_shift_bits"],
+                                   fmt, f"hw_grids[{name!r}]")
         if "pla_frac" in entry:
             layer._pla_grid = (int(entry["pla_frac"]), list(entry["pla_m_pos"]),
                                list(entry["pla_m_neg"]))
