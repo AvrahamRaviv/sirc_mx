@@ -1,0 +1,574 @@
+{
+ "mx_specs": {
+  "w_elem_format": "int8",
+  "a_elem_format": "int8",
+  "block_size": 32,
+  "scale_bits": 8,
+  "shared_exp_method": "max",
+  "custom_cuda": true,
+  "xblock_accum": {
+   "enabled": true,
+   "mode": "hw_fixed_point",
+   "bits": 48,
+   "sat_mode": "per_product",
+   "e_layer_min": null,
+   "out_window": "infer",
+   "out_round": "nearest",
+   "out_margin_bits": 1,
+   "weight_blockify": "flatten",
+   "act_blockify": "xblock",
+   "backend": "python",
+   "npe_triton_variant": "reuse",
+   "convT": "hw",
+   "pla": "infer",
+   "pla_bias": "bins",
+   "mant_round": "nearest",
+   "overflow": "raise",
+   "bias_round": "half_up",
+   "in_exp_bits": 4,
+   "in_exp_mode": "infer",
+   "in_exp_anchor": "min",
+   "static_shift_bits": 7
+  }
+ },
+ "groups": {
+  "input_layer": {
+   "w_elem_format": "int8",
+   "a_elem_format": "int8",
+   "block_size": 32,
+   "scale_bits": 8,
+   "shared_exp_method": "max",
+   "custom_cuda": true,
+   "xblock_accum": {
+    "enabled": true,
+    "mode": "hw_fixed_point",
+    "bits": 48,
+    "sat_mode": "per_product",
+    "e_layer_min": null,
+    "out_window": "infer",
+    "out_round": "nearest",
+    "out_margin_bits": 1,
+    "weight_blockify": "flatten",
+    "act_blockify": "xblock",
+    "backend": "triton",
+    "npe_triton_variant": "reuse",
+    "convT": "hw",
+    "pla": "infer",
+    "pla_bias": "bins",
+    "mant_round": "truncate",
+    "overflow": "raise",
+    "bias_round": "half_up",
+    "in_exp_bits": 4,
+    "in_exp_mode": "infer",
+    "in_exp_anchor": "min",
+    "static_shift_bits": 7,
+    "in_mode": "int",
+    "in_int_scale": "free"
+   }
+  },
+  "convT_plain": {
+   "w_elem_format": "int8",
+   "a_elem_format": "int8",
+   "block_size": 32,
+   "scale_bits": 8,
+   "shared_exp_method": "max",
+   "custom_cuda": true
+  }
+ },
+ "layers": [
+  "model.block2.conv0.0.0",
+  "model.block2.conv0.1.0",
+  "model.block2.convblock.0.0",
+  "model.block2.convblock.1.0",
+  "model.block2.convblock.2.0",
+  "model.block2.convblock.3.0",
+  "model.block2.convblock.4.0",
+  "model.block2.convblock.5.0",
+  "model.block3.conv0.0.0",
+  "model.block3.conv0.1.0",
+  "model.block3.convblock.0.0",
+  "model.block3.convblock.1.0",
+  "model.block3.convblock.2.0",
+  "model.block3.convblock.3.0",
+  "model.block3.convblock.4.0",
+  "model.block3.convblock.5.0",
+  "model.block4.conv0.0.0",
+  "model.block4.conv0.1.0",
+  "model.block4.convblock.0.0",
+  "model.block4.convblock.1.0",
+  "model.block4.convblock.2.0",
+  "model.block4.convblock.3.0",
+  "model.block4.convblock.4.0",
+  "model.block4.convblock.5.0",
+  {
+   "name": "model.feature_pyramid_extractor.convs.0.0.0",
+   "group": "input_layer"
+  },
+  "model.feature_pyramid_extractor.convs.0.1.0",
+  "model.feature_pyramid_extractor.convs.1.0.0",
+  "model.feature_pyramid_extractor.convs.1.1.0",
+  "model.feature_pyramid_extractor.convs.2.0.0",
+  "model.feature_pyramid_extractor.convs.2.1.0",
+  "model.block2.conv1",
+  {
+   "name": "model.block2.convtranspose_2",
+   "group": "convT_plain"
+  },
+  "model.block3.conv1",
+  {
+   "name": "model.block3.convtranspose_2",
+   "group": "convT_plain"
+  },
+  "model.block4.conv1",
+  {
+   "name": "model.warp",
+   "kind": "act_quant",
+   "call_sites": 2,
+   "inputs": [
+    {
+     "fxp": {
+      "total_bits": 8,
+      "signed": true,
+      "calibrate": true,
+      "round": "half_away",
+      "saturate": true
+     }
+    },
+    {
+     "fxp": {
+      "total_bits": 16,
+      "frac_bits": 8,
+      "signed": true,
+      "round": "half_away",
+      "saturate": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "model",
+   "kind": "out_quant",
+   "total_bits": 16,
+   "frac_bits": 8,
+   "signed": true,
+   "round": "half_away",
+   "saturate": true,
+   "clip_grad": false
+  }
+ ],
+ "calibrate_hw_grids": {
+  "enabled": true,
+  "batches": 8
+ },
+ "calibrate_act_scales": {
+  "enabled": true,
+  "batches": 8
+ },
+ "measure_error": {
+  "enabled": true,
+  "isolated": true
+ },
+ "ptq": false,
+ "hw_grids": {
+  "conv1x1": {
+   "e_layer_min": -16,
+   "e_qa_out": -20,
+   "win_bits": 22,
+   "shift_out": -4,
+   "static_shift": 8,
+   "e_base_a": 0,
+   "e_base_w": -4
+  },
+  "conv3x3_p0": {
+   "e_layer_min": -17,
+   "e_qa_out": -19,
+   "win_bits": 22,
+   "shift_out": -2,
+   "static_shift": 7,
+   "e_base_a": -1,
+   "e_base_w": -4
+  },
+  "conv3x3_p0_bias": {
+   "e_layer_min": -17,
+   "e_qa_out": -19,
+   "win_bits": 22,
+   "shift_out": -2,
+   "static_shift": 7,
+   "e_base_a": -1,
+   "e_base_w": -4
+  },
+  "conv_prelu": {
+   "e_layer_min": -16,
+   "e_qa_out": -18,
+   "win_bits": 22,
+   "shift_out": -2,
+   "static_shift": 6,
+   "e_base_a": -1,
+   "e_base_w": -3,
+   "pla_frac": 6,
+   "pla_m_pos": [
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64
+   ],
+   "pla_m_neg": [
+    0,
+    16,
+    6,
+    64,
+    32,
+    3,
+    19,
+    13
+   ],
+   "pla_bin_bounds": [
+    [
+     5369
+    ],
+    [
+     -4409
+    ],
+    [
+     1827
+    ],
+    [
+     -2984
+    ],
+    [
+     7060
+    ],
+    [
+     462
+    ],
+    [
+     -157
+    ],
+    [
+     2562
+    ]
+   ],
+   "pla_bin_scales": [
+    [
+     0,
+     64
+    ],
+    [
+     16,
+     64
+    ],
+    [
+     6,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     32,
+     64
+    ],
+    [
+     3,
+     64
+    ],
+    [
+     19,
+     64
+    ],
+    [
+     13,
+     64
+    ]
+   ],
+   "pla_bin_biases": [
+    [
+     0,
+     -343595
+    ],
+    [
+     70544,
+     282175
+    ],
+    [
+     -10962,
+     -116931
+    ],
+    [
+     190989,
+     190989
+    ],
+    [
+     -225919,
+     -451838
+    ],
+    [
+     -1387,
+     -29580
+    ],
+    [
+     2986,
+     10057
+    ],
+    [
+     -33305,
+     -163962
+    ]
+   ]
+  },
+  "conv_relu": {
+   "e_layer_min": -16,
+   "e_qa_out": -18,
+   "win_bits": 22,
+   "shift_out": -2,
+   "static_shift": 6,
+   "e_base_a": -1,
+   "e_base_w": -3,
+   "pla_frac": 6,
+   "pla_m_pos": [
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64
+   ],
+   "pla_m_neg": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "pla_bin_bounds": [
+    [
+     5369
+    ],
+    [
+     -4409
+    ],
+    [
+     1827
+    ],
+    [
+     -2984
+    ],
+    [
+     7060
+    ],
+    [
+     462
+    ],
+    [
+     -157
+    ],
+    [
+     2562
+    ]
+   ],
+   "pla_bin_scales": [
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ]
+   ],
+   "pla_bin_biases": [
+    [
+     0,
+     -343595
+    ],
+    [
+     0,
+     282175
+    ],
+    [
+     0,
+     -116931
+    ],
+    [
+     0,
+     190989
+    ],
+    [
+     0,
+     -451838
+    ],
+    [
+     0,
+     -29580
+    ],
+    [
+     0,
+     10057
+    ],
+    [
+     0,
+     -163962
+    ]
+   ]
+  },
+  "conv_prelu_negb": {
+   "e_layer_min": -16,
+   "e_qa_out": -18,
+   "win_bits": 22,
+   "shift_out": -2,
+   "static_shift": 6,
+   "e_base_a": -1,
+   "e_base_w": -3,
+   "pla_frac": 6,
+   "pla_m_pos": [
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64
+   ],
+   "pla_m_neg": [
+    0,
+    16,
+    6,
+    64,
+    32,
+    3,
+    19,
+    13
+   ],
+   "pla_bin_bounds": [
+    [
+     5369
+    ],
+    [
+     4409
+    ],
+    [
+     1827
+    ],
+    [
+     2984
+    ],
+    [
+     7060
+    ],
+    [
+     462
+    ],
+    [
+     157
+    ],
+    [
+     2562
+    ]
+   ],
+   "pla_bin_scales": [
+    [
+     0,
+     64
+    ],
+    [
+     16,
+     64
+    ],
+    [
+     6,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     32,
+     64
+    ],
+    [
+     3,
+     64
+    ],
+    [
+     19,
+     64
+    ],
+    [
+     13,
+     64
+    ]
+   ],
+   "pla_bin_biases": [
+    [
+     0,
+     -343595
+    ],
+    [
+     -70544,
+     -282174
+    ],
+    [
+     -10962,
+     -116931
+    ],
+    [
+     -190989,
+     -190989
+    ],
+    [
+     -225919,
+     -451838
+    ],
+    [
+     -1387,
+     -29580
+    ],
+    [
+     -2986,
+     -10057
+    ],
+    [
+     -33305,
+     -163962
+    ]
+   ]
+  }
+ },
+ "_comment": "mx_config_dof_run_hw_exact.json + xblock_accum ['backend=python', 'mant_round=nearest']; hw_grids from gen_hw_grids.py (lib calibrate_hw_grids, seeds 1-8, not the test seed 0)"
+}

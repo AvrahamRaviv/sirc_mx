@@ -20,6 +20,7 @@ conv), and **warp**.
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
 | `mx_config_npe_e4_pla.json` | npe_e4 + output window + PLA in HW bin form, `hw_grids` for `conv_prelu`, `conv_relu`, `conv_prelu_negb` |
+| `mx_config_npe_hw_exact.json` (+ `_nearest`, `_in`) | the lib's HW-exact switches M1-M8 (from `mx_config_dof_run_hw_exact.json`) with `hw_grids` for the conv cases; `_nearest`: mantissa round to nearest (the truncate share); `_in`: first-layer integer input (`in_mode int`, POT scale) |
 | `gen_hw_grids.py` | writes a config's `hw_grids` from an OFFLINE lib calibration on seeds 1-8 (never the test seed). The sim itself never calibrates |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
 
@@ -122,6 +123,27 @@ main.py prints HW-ALG for both, split by bin, and the PCU alone: the lib's
 bins + window (`main_ALG.pcu_on`) on HW's own accumulator words vs the
 stand-in. `hw_vs_alg_check.py` T11 does the same on 20000 random words, the
 tie case `acc == boundary` and both bias signs.
+
+## HW-exact (M1-M8)
+
+`--config mx_config_npe_hw_exact.json` turns on the lib's HW-exact switches
+(mantissa truncate, overflow raise, out_round nearest, bias half up, 4-bit
+register anchored at the min block, static shift, PLA bins). Both sides then
+run from the config's grids only:
+- HW `mx_type` uses the NPE register width (`in_exp_bits`), not `scale_bits`.
+- HW `x_cal` / `w_cal` = `6 - e_base_a` / `6 - e_base_w` (their observer
+  anchors the smallest block at shift 0; the config's bases are that block's
+  exponent). Without the bases in `hw_grids`, their observers run on the input
+  (tap `cal_from_config` says which).
+- HW `Cstruct.shift` = `hw_grids` `static_shift`; the output decodes on
+  `2^-(12 + static_shift)` = ALG's `2^e_qa_out`.
+- First layer (`_in` cases): their `is_input_layer` with `cal = -log2(in_scale)`
+  (POT only); weight cal from the lib's folded weight base.
+
+Result: conv cases bit-exact (float and integer input), PLA cases bit-exact
+against the bins stand-in, first layer bit-exact without bias. With a bias a
+per-channel constant <= 2^-16 is left: the lib's first-layer accumulator
+grid is finer than HW's, so the bias rounds on another grid.
 
 ## Config
 

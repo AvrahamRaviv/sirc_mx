@@ -71,6 +71,12 @@ CASES = {
                          dilation=2),
     "conv3x3_bias": dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=1,
                          bias=True),
+    "conv3x3_p0_bias": dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), bias=True),
+    # first (sensor) layer: integer input, per-tensor scale, no block exponent
+    # (xblock_accum.in_mode "int" on ALG, is_input_layer on HW)
+    "conv1x1_in":   dict(op="conv", x=(1, 4, 3, 32), w=(8, 4, 1, 1), input_layer=True),
+    "conv3x3_in":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), bias=True,
+                         input_layer=True, x_scale=0.5),   # inside the int8 range
     # --- conv + activation folded into the PCU (PLA) ------------------------------
     # DOF-like: 16 -> 8 channels, 3x3, bias, per-channel PReLU slope. alpha 0 is
     # a ReLU, 1 an identity; the rest exercise the negative multiplier.
@@ -130,10 +136,11 @@ def build(name, seed=0, x_frac=None):
     """
     spec = dict(CASES[name])
     gen = torch.Generator().manual_seed(seed)
-    x = torch.randn(spec.pop("x"), generator=gen)
+    x = torch.randn(spec.pop("x"), generator=gen) * spec.pop("x_scale", 1.0)
     case = {"name": name, "op": spec.pop("op"),
             "x": x if x_frac is None else to_grid(x, x_frac), "x_frac": x_frac,
             "w": None, "b": None, "flow": None, "warp": None, "act": None}
+    case["input_layer"] = bool(spec.pop("input_layer", False))
     act = spec.pop("act", None)
     if act is not None:           # ("prelu", per-channel slopes)
         case["act"] = {"kind": act[0], "alpha": torch.tensor(act[1])}

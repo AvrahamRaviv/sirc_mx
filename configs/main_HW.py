@@ -32,6 +32,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import contextlib
+import dataclasses
 
 import torch
 
@@ -46,7 +47,7 @@ from taps import tap, show
 # --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
 from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
 from npe_mx_emu import mx_config_factory, SUPPORTED_ACC_WIDTHS
-from npe_mx_emu import Cstruct, pcu
+from npe_mx_emu import Cstruct, pcu, mantissa_offset
 from npe_mx_emu import hw_pipe as _hw_pipe
 
 # Widths fixed inside npe_mx_emu - their API has no parameter for them, so the
@@ -59,8 +60,10 @@ HW_FIXED = {
 def hw_format(cfg):
     """Config mx_specs -> npe_mx_emu (mx_type, block_size).
 
-    mx_type is their name "mx-e{scale_bits}bm{mantissa bits}"; the exponent
-    wrap mask comes with it (their MXTensorConfig.overflow_mask). Refused when
+    mx_type is their name "mx-e{bits}bm{mantissa bits}"; the exponent wrap
+    mask comes with it (their MXTensorConfig.overflow_mask). bits = the NPE
+    shared-exponent register: xblock_accum.in_exp_bits when the lib models
+    that register (in_exp_mode on), else mx_specs.scale_bits. Refused when
     their code can't run it as configured, rather than silently running
     something else.
     """
@@ -68,7 +71,9 @@ def hw_format(cfg):
     a, w = sp["a_elem_format"], sp["w_elem_format"]
     if a != w or not str(a).startswith("int"):
         raise NotImplementedError(f"HW: needs a == w == intN, got a={a!r} w={w!r}")
-    ebits, mbits = int(sp["scale_bits"]), int(a[3:])
+    xa = sp.get("xblock_accum") if isinstance(sp.get("xblock_accum"), dict) else {}
+    reg = xa.get("in_exp_bits") if xa.get("in_exp_mode", "off") != "off" else None
+    ebits, mbits = int(reg if reg is not None else sp["scale_bits"]), int(a[3:])
     mx_type = f"mx-e{ebits}bm{mbits}"
     if mx_type not in mx_config_factory:
         raise NotImplementedError(
@@ -119,7 +124,7 @@ def _capture_bcu():
 # pla_bin_scales / pla_bin_biases, xblock_accum.pla_bin_tie) - the same values
 # the ALG side reads.
 
-def _pla_bins(case, cfg, qp, O):
+def _pla_bins(case, cfg, qp, O, s_shift=0):
     """The config's PLA bins for this layer, on their accumulator grid."""
     g = SC.hw_grid(cfg, case) or {}
     keys = ("pla_frac", "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases")
@@ -141,12 +146,13 @@ def _pla_bins(case, cfg, qp, O):
             "bounds": [list(map(int, v)) for v in g["pla_bin_bounds"]],
             "scales": [list(map(int, v)) for v in g["pla_bin_scales"]],
             "biases": [list(map(int, v)) for v in g["pla_bin_biases"]],
-            "tie": xa.get("pla_bin_tie", "upper"),
+            "tie": xa.get("pla_bin_tie", "upper"), "static": s_shift,
             "lo": -2.0 ** (bits - 1), "hi": 2.0 ** (bits - 1) - 1}
 
 
 def _cs(pla, scale, bias):
-    return Cstruct(bias=bias, scale=scale, shift=-pla["frac"], round_type="round",
+    return Cstruct(bias=bias, scale=scale, shift=pla.get("static", 0) - pla["frac"],
+                   round_type="round",
                    min_val=pla["lo"], max_val=pla["hi"])
 
 
@@ -220,12 +226,43 @@ def conv(case, cfg, taps):
     acc_bits = hw_acc_bits(cfg)
 
     # calibration (theirs); weights blocked per flattened kernel, as they say
-    obs_x = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_x.update(x)
-    obs_w = MXObserver(block_size=bs, mx_type=mx_type, mode="mx")
-    obs_w.update(w, per_row_flatten=True)
-    qp = LayerMXQParams(x_cal=obs_x.calibrate_offset(),
-                        w_cal=obs_w.calibrate_offset(),
-                        block_size=bs, mx_type=mx_type)
+    # Calibration offsets: from the config's hw_grids when it has the
+    # register bases (offline PTQ, as deployed): their observer anchors the
+    # smallest non-zero block at shift 0, cal = mantissa_offset - E_min, and
+    # e_base_a / e_base_w ARE E_min. Else their observers on this input.
+    grid = SC.hw_grid(cfg, case) or {}
+    m_off = mantissa_offset(mx_type)
+    s_shift = int(grid.get("static_shift", 0))     # PCU static shift (M7)
+    if case.get("input_layer"):
+        # first layer (M8): their input_mx_quantizer, x_int = round(x * 2^cal),
+        # zero shared exponent. cal from the config's in_scale (POT only:
+        # their code scales by 2^cal). The lib folds in_scale into the weights,
+        # so its weight base is of w * in_scale: E(w) = e_base_w + cal.
+        if "in_scale" not in grid or "e_base_w" not in grid:
+            raise SystemExit(f"{os.path.basename(cfg['file'])}: input layer needs "
+                             f"hw_grids in_scale and e_base_w")
+        import math
+        cal_f = -math.log2(float(grid["in_scale"]))
+        if cal_f != round(cal_f):
+            raise NotImplementedError(
+                f"HW input layer: in_scale {grid['in_scale']} is not a power of two; "
+                f"their input path scales by 2^cal (in_int_scale 'pot' needed)")
+        x_cal = int(round(cal_f))
+        w_cal = m_off - (int(grid["e_base_w"]) + x_cal)
+        cal_src = "config"
+    elif "e_base_a" in grid and "e_base_w" in grid:
+        x_cal, w_cal = m_off - int(grid["e_base_a"]), m_off - int(grid["e_base_w"])
+        cal_src = "config"
+    else:
+        obs_x = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_x.update(x)
+        obs_w = MXObserver(block_size=bs, mx_type=mx_type, mode="mx")
+        obs_w.update(w, per_row_flatten=True)
+        x_cal, w_cal = obs_x.calibrate_offset(), obs_w.calibrate_offset()
+        cal_src = "observer"
+    # out_cal decodes their output: the static shift moves the 2^-12 base grid
+    qp = LayerMXQParams(x_cal=x_cal, w_cal=w_cal, block_size=bs, mx_type=mx_type,
+                        out_cal=2 * m_off + s_shift,
+                        is_input_layer=bool(case.get("input_layer")))
 
     layer = CalibratedMXConv2d(Cin, O, (kH, kW), stride=p["stride"],
                                padding=p["padding"], qparams=qp)
@@ -236,7 +273,11 @@ def conv(case, cfg, taps):
         layer.mx_conv.weight.copy_(w)
         layer.mx_conv.bias.copy_(b if b is not None else torch.zeros(O))
     layer.calibrate()
-    pla = _pla_bins(case, cfg, qp, O) if case.get("act") else None
+    if s_shift:                         # their Cstruct.shift = the static shift
+        layer.mx_conv.load_c_struct(
+            {o: dataclasses.replace(c, shift=s_shift)
+             for o, c in layer.mx_conv.c_struct_arr.items()})
+    pla = _pla_bins(case, cfg, qp, O, s_shift) if case.get("act") else None
     if pla is not None:                 # their one-bin PCU, as it is today
         layer.mx_conv.load_c_struct(_pla_single(pla, O))
 
@@ -253,6 +294,7 @@ def conv(case, cfg, taps):
     B, _, Ho, Wo = out_raw.shape
     tap(taps, "x", x)
     tap(taps, "w", w)
+    tap(taps, "cal_from_config", int(cal_src == "config"))
     tap(taps, "x_cal", qp.x_cal)
     tap(taps, "w_cal", qp.w_cal)
     xs = x.double() * 2.0 ** qp.x_cal

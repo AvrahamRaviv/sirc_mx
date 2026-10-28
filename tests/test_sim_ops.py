@@ -216,3 +216,50 @@ def test_alg_convt_hw_path_taps():
     assert t["a_int"].shape == c["x"].shape          # quantized compact, not dilated
     assert t["w_int"].shape == c["w"].transpose(0, 1).shape
     assert "acc" in t and float((t["out"] - ref).abs().max()) < 0.05
+
+
+# --- HW-exact switches (M1-M8): both sides from one config -------------------
+
+HWX = SC.load_config("mx_config_npe_hw_exact.json")
+HWX_IN = SC.load_config("mx_config_npe_hw_exact_in.json")
+
+
+def test_hw_exact_register_width_and_cal_from_config():
+    """HW mx_type follows the NPE register (in_exp_bits 4), and their x_cal /
+    w_cal come from the config's register bases: cal = 6 - E_min."""
+    assert HW.hw_format(HWX) == ("mx-e4bm8", 32)
+    g = HWX["hw_grids"]["conv3x3_p0"]
+    t = HW.run(C.build("conv3x3_p0"), HWX)
+    assert int(t["cal_from_config"]) == 1
+    assert (int(t["x_cal"]), int(t["w_cal"])) == (6 - g["e_base_a"], 6 - g["e_base_w"])
+    assert -int(t["out_scale_log2"]) == g["e_qa_out"]      # static shift moves the grid
+
+
+@pytest.mark.parametrize("name", ["conv1x1", "conv3x3_p0", "conv3x3_p0_bias"])
+@pytest.mark.parametrize("x_frac", [None, 4])
+def test_hw_exact_conv_bit_exact(name, x_frac):
+    c = C.build(name, x_frac=x_frac)
+    a, h = ALG.run(c, HWX), HW.run(c, HWX)
+    assert bool((a["out"] == h["out"]).all())
+
+
+@pytest.mark.parametrize("name", PLA_CASES)
+def test_hw_exact_pla_bit_exact_with_bins_standin(name):
+    c = C.build(name)
+    a, h = ALG.run(c, HWX), HW.run(c, HWX)
+    assert bool((a["out"] == h["out_bins"]).all())
+    assert not bool((a["out"] == h["out"]).all())     # their 1 bin: not PReLU
+
+
+def test_hw_exact_first_layer():
+    """M8: conv1x1_in bit-exact; with a bias (conv3x3_in) a per-channel
+    constant <= 2^-16: the lib's first-layer acc grid (2^e_layer_min, block
+    exps kept on the int input) is finer than HW's 2^-(x_cal + w_cal), so the
+    bias rounds on another grid."""
+    c = C.build("conv1x1_in")
+    assert bool((ALG.run(c, HWX_IN)["out"] == HW.run(c, HWX_IN)["out"]).all())
+    c = C.build("conv3x3_in")
+    a, h = ALG.run(c, HWX_IN), HW.run(c, HWX_IN)
+    d = (a["out"].double() - h["out"].double())[0]
+    assert float(d.abs().max()) <= 2.0 ** -16
+    assert all(d[o].unique().numel() == 1 for o in range(d.shape[0]))

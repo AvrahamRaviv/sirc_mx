@@ -18,7 +18,7 @@ difference moved. Sections:
   T11 PLA (PReLU in the PCU), the PCU stage alone: the same accumulator word
       into ALG's PLA + window and into HW's pcu; (a) positive / identity,
       ReLU, (b) PReLU, (c) rounding and clamp
-Both sides run mx_config_npe_e4.json (scale_bits 4, the NPE exponent width).
+--config: default mx_config_npe_e4.json; mx_config_npe_hw_exact.json = lib HW-exact switches.
 """
 import math, os, sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,8 +26,13 @@ sys.path.insert(0, _HERE)
 import torch, torch.nn.functional as F
 import cases as C, main_ALG as _A, main_HW as _H, sim_config as SC
 
-# both sides at the NPE exponent width (4 bits); see mx_config_npe_e4.json
-CFG = SC.load_config("mx_config_npe_e4.json")
+# --config: default mx_config_npe_e4.json (NPE 4-bit exponent, ALG defaults);
+# mx_config_npe_hw_exact.json = the lib's HW-exact switches M1-M8, with grids.
+import argparse
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--config", default="mx_config_npe_e4.json")
+CFG = SC.load_config(_ap.parse_args().config)
+print(f"config: {os.path.basename(CFG['file'])}")
 
 
 class A:
@@ -107,20 +112,24 @@ print("half up       ", (v / 4 + 0.5).floor().long().tolist())
 print("ALG floor     ", (v >> 2).tolist(), "  ALG nearest", ((v + 2) >> 2).tolist(),
       "(xblock_accum.out_round)")
 cc = C.build("conv3x3_p0"); hh = H.run(cc)
-e = 12 - int(hh["x_cal"]) - int(hh["w_cal"])
+e = int(hh["out_scale_log2"]) - int(hh["x_cal"]) - int(hh["w_cal"])   # incl. static shift
 print(f"conv3x3_p0: out_raw == floor(acc*2^{e} + 1/2): "
       f"{bool((hh['out_raw'] == (hh['hw_acc'].double() * 2.0 ** e + 0.5).floor()).all())}")
 
 # ---------------------------------------------------------------- T5 bias
 hdr("T5 bias projection")
-cc = C.build("conv3x3_bias"); cc["params"]["padding"] = 0
+cc = C.build("conv3x3_p0_bias")
 hh = H.run(cc); aa = A.run(cc)
 bc = int(hh["x_cal"]) + int(hh["w_cal"])
 b = cc["b"].double()
 print(f"HW bias = floor(b*2^{bc} + 1/2) (acc LSB 2^-{bc}), err max {float((b - (b * 2 ** bc + 0.5).floor() / 2 ** bc).abs().max()):.2e}")
-print(f"ALG bias = round(b*2^20) (torch: half to even),  err max {float((b - (b * 2 ** 20).round() / 2 ** 20).abs().max()):.2e}")
+ea = -int(aa.get("e_layer_min", -20))
+half_up = CFG["mx_specs"].get("xblock_accum", {}).get("bias_round", "even") == "half_up"
+rb = (lambda v: (v + 0.5).floor()) if half_up else (lambda v: v.round())
+print(f"ALG bias = {'floor(v+1/2)' if half_up else 'round half to even'} of b*2^{ea},  "
+      f"err max {float((b - rb(b * 2 ** ea) / 2 ** ea).abs().max()):.2e}")
 t = torch.tensor([0.5, 1.5, 2.5, -0.5, -2.5], dtype=torch.float64)
-print(f"ties b*2^k {t.tolist()}: HW {(t + 0.5).floor().long().tolist()}  ALG {t.round().long().tolist()}")
+print(f"ties b*2^k {t.tolist()}: HW {(t + 0.5).floor().long().tolist()}  ALG {rb(t).long().tolist()}")
 print(f"with bias end-to-end: max|ALG-fp32| {float((aa['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}  max|HW-fp32| {float((hh['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}")
 
 # ---------------------------------------------------------------- T6 saturation
@@ -133,7 +142,8 @@ for signs in ([1, 1, -1], [1, 1, 1]):
     for s_ in signs:
         acc = max(lo, min(hi, acc + s_ * 2 ** 46))
     print(f"products {['%+d*2^46' % s_ for s_ in signs]}: true {sum(signs) * 2 ** 46}  "
-          f"HW wrap {int(bcu(xd, xe, wd, we, acc_bit_width=48).item())}  ALG clamp {acc}")
+          f"HW wrap {int(bcu(xd, xe, wd, we, acc_bit_width=48).item())}  ALG clamp {acc}"
+          + ("  (ALG overflow 'raise': eval raises here)" if CFG["mx_specs"].get("xblock_accum", {}).get("overflow") == "raise" else ""))
 
 # ---------------------------------------------------------------- T8 observer blocking
 hdr("T8 weight observer blocks vs weight quantizer blocks")
@@ -154,9 +164,15 @@ print("block shared exps:", m.shared_exp.tolist(), " block2 data:", m.data[0, 1,
 hdr("T10 4-bit exponent window: ALG fixed [-7,7] vs HW per-tensor offset (weights x0.01)")
 c = C.build("conv3x3_p0"); c["w"] = c["w"] * 0.01
 r = F.conv2d(c["x"], c["w"])
-a = A.run(c); h = H.run(c)
-print(f"ALG: w_exp codes [{int(a['w_exp'].min())}..{int(a['w_exp'].max())}] (0 = clamped at E=-7)  "
-      f"w_int max {int(a['w_int'].abs().max())}  max err {float((a['out'] - r).abs().max()):.2e}")
+try:
+    a = A.run(c)
+except RuntimeError as e:      # HW-exact: weights x0.01 leave the config's register
+    print(f"ALG raises (grids in the config are for the unscaled weights): {str(e)[:150]}")
+    a = None
+h = H.run(c)
+if a is not None:
+  print(f"ALG: w_exp codes [{int(a['w_exp'].min())}..{int(a['w_exp'].max())}] (0 = clamped at E=-7)  "
+        f"w_int max {int(a['w_int'].abs().max())}  max err {float((a['out'] - r).abs().max()):.2e}")
 print(f"HW : w_cal {int(h['w_cal'])} slides the window  "
       f"w_mant max {int(h['hw_w_mant'].abs().max())}  max err {float((h['out'] - r).abs().max()):.2e}")
 
