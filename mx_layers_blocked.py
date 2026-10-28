@@ -21,6 +21,7 @@ Documented as a known limitation — Phase C can wrap this in a custom
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from microxcaling.mx.linear import Linear as MXLinear
@@ -31,7 +32,10 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
                                            clamp_block_exp, floor_log2, in_exp_on,
-                                           dilate_input)
+                                           dilate_input, PLAParams, pla_multipliers)
+
+# Activations PLA can fold into the PCU multiply: two segments split at 0.
+PLA_ACTS = (nn.PReLU, nn.LeakyReLU, nn.ReLU)
 
 
 def quantize_mx_op(x, *args, **kwargs):
@@ -195,6 +199,14 @@ class MXConv2dBlocked(MXConv2d):
         return out
 
 
+def _pla_bypass(act, args, out):
+    """Forward hook on an activation folded into the MXConv2dHW before it:
+    the conv's PLA already applied it when its output is marked. A module
+    function (not a closure) so it survives deepcopy."""
+    x = args[0] if args else None
+    return x if getattr(x, "_pla_folded", False) else None
+
+
 def _reset_hw_call_counts(root, args):
     """Forward pre-hook on the quantized root: a new forward starts, every
     MXConv2dHW in it is uncalled. A module function (not a closure) so the
@@ -237,6 +249,11 @@ class MXConv2dHW(MXConv2d):
         [e_base, e_base + 2^in_exp_bits - 1] per tensor (see
         `clamp_block_exp`). Input base `e_base_a` is calibrated; weight base
         `e_base_w` comes from the current weights unless the config sets it.
+      - `xblock_accum.pla` ('off' | 'infer') folds the activation that follows
+        in an nn.Sequential (`fold_pla`) into the PCU multiply before the
+        window, in eval mode. The activation module stays in place (state_dict
+        unchanged) and passes a PLA output through; train mode runs it as
+        before. Multipliers: hw_grids pla_* if set, else from its slope.
     """
 
     def weight_exp_base(self):
@@ -299,6 +316,71 @@ class MXConv2dHW(MXConv2d):
         self._last_sat = None
         self._last_win = None
         self._last_win_sat = None
+        # PLA: the folded activation, kept in a tuple so it is not registered
+        # as a submodule (it stays where it is in the model), and hw_grids
+        # multipliers (frac, m_pos, m_neg) when the config gives them.
+        self._pla_act = None
+        self._pla_grid = None
+        self._pla_last = False          # the last forward applied PLA
+
+    def fold_pla(self, act):
+        """Fold `act` (applied to this layer's output) into the PLA stage."""
+        if not isinstance(act, PLA_ACTS):
+            raise TypeError(f"PLA cannot fold {type(act).__name__}")
+        O = self.out_channels
+        if isinstance(act, nn.PReLU) and act.num_parameters not in (1, O):
+            raise ValueError(f"PLA: PReLU has {act.num_parameters} slopes, "
+                             f"{self._mx_layer_name} has {O} channels")
+        if getattr(act, "inplace", False):
+            act.inplace = False         # the bypass hands its input on
+        if not getattr(act, "_pla_hooked", False):
+            act.register_forward_hook(_pla_bypass)
+            act._pla_hooked = True
+        self._pla_act = (act,)
+
+    def pla_alpha(self):
+        """Negative-side slope per output channel of the folded activation."""
+        act, O = self._pla_act[0], self.out_channels
+        if isinstance(act, nn.PReLU):
+            a = act.weight.detach().to(torch.float64).cpu().flatten()
+        elif isinstance(act, nn.LeakyReLU):
+            a = torch.tensor([float(act.negative_slope)], dtype=torch.float64)
+        else:
+            a = torch.zeros(1, dtype=torch.float64)
+        return a.expand(O).clone() if a.numel() == 1 else a
+
+    def pla_on(self):
+        """PLA configured and an activation folded (the mode decides when)."""
+        return (self._pla_act is not None
+                and _get_xblock_cfg(self).get("pla", "off") != "off")
+
+    def pla_params(self):
+        """`PLAParams` of this layer: hw_grids multipliers, else quantized from
+        the folded activation's slopes."""
+        cfg = _get_xblock_cfg(self)
+        if self._pla_grid is not None:
+            frac, m_pos, m_neg = self._pla_grid
+            if len(m_pos) != self.out_channels:
+                raise ValueError(
+                    f"hw_grids[{self._mx_layer_name!r}]: {len(m_pos)} PLA "
+                    f"multipliers for {self.out_channels} channels")
+            m_pos = torch.tensor(m_pos, dtype=torch.int64)
+            m_neg = torch.tensor(m_neg, dtype=torch.int64)
+        else:
+            m_pos, m_neg, frac = pla_multipliers(
+                self.pla_alpha(), int(cfg.get("pla_mult_bits", 8)),
+                cfg.get("pla_frac_bits"))
+        return PLAParams(m_pos, m_neg, int(frac), cfg.get("pla_bias", "pre"))
+
+    def _pla_float(self, z):
+        """The folded activation in float (calibration / error references)."""
+        a = self.pla_alpha().to(device=z.device, dtype=z.dtype).view(1, -1, 1, 1)
+        return torch.where(z >= 0, z, z * a)
+
+    def pla_ref(self, y):
+        """`y` (an FP32 reference of this conv) through the folded activation
+        when the last forward applied PLA, so the two compare like for like."""
+        return self._pla_float(y) if self._pla_last else y
 
     def forward(self, x):
         if self.mx_none:
@@ -383,7 +465,8 @@ class MXConv2dHW(MXConv2d):
             cal.update(qi, qw, bs, fmt=a_fmt,
                        act_blockify=act_blockify, weight_blockify=weight_blockify)
             out = self._fp32_blocked_forward(qi, qw, bf_bias, H, W)
-            cal.update_out(out)
+            # With PLA the window sees the activated output.
+            cal.update_out(self._pla_float(out) if self.pla_on() else out)
             return out
 
         cfg = _get_xblock_cfg(self)
@@ -431,6 +514,11 @@ class MXConv2dHW(MXConv2d):
                 f"Run `calibrate_hw_grids(model, loader)` first."
             )
         e_qa_out = int(self.e_qa_out) if apply_win else None
+        apply_pla = (self.pla_on() and cfg.get('pla') == 'infer'
+                     and not self.training)
+        if apply_pla and not apply_win:
+            raise RuntimeError(f"MXConv2dHW {name}: pla needs the output window on")
+        self._pla_last = apply_pla
         if apply_win and not self.training and self._win_calls is not None:
             self._win_calls += 1
             if self._win_calls > self.hw_calls:
@@ -477,6 +565,7 @@ class MXConv2dHW(MXConv2d):
             e_qa_out=e_qa_out,
             win_bits=resolve_out_window_bits(cfg, a_fmt) if apply_win else None,
             out_round=cfg.get('out_round', 'floor'),
+            pla=self.pla_params() if apply_pla else None,
         )
         if self._tap_acc:
             self._last_acc = stats.get('acc')
@@ -511,6 +600,8 @@ class MXConv2dHW(MXConv2d):
                 self._sat_total_window = 0
 
         out = quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
+        if apply_pla:
+            out._pla_folded = True      # the folded activation passes it on
         return out
 
     def _fp32_blocked_forward(self, qi, qw, bf_bias, H, W):

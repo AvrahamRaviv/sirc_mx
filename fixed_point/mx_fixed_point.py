@@ -12,6 +12,8 @@ _VALID_OUT_WINDOW = ("off", "infer", "always")
 _VALID_OUT_ROUND = ("floor", "nearest")
 _VALID_IN_EXP_MODE = ("off", "infer", "always")
 _VALID_CONVT = ("plain", "hw")
+_VALID_PLA = ("off", "infer")
+_VALID_PLA_BIAS = ("pre", "post")
 
 
 def validate_xblock_accum_bits(bits):
@@ -178,6 +180,15 @@ XBLOCK_ACCUM_DEFAULTS = {
     # 'hw' builds MXConvTranspose2dHW (zero-insert conv on the MXConv2dHW path).
     # Grouped convT stays plain either way.
     "convT": "plain",
+    # PLA (hw_fixed_point + out_window only): fold the PReLU / LeakyReLU / ReLU
+    # that directly follows an MXConv2dHW in an nn.Sequential into the PCU
+    # multiply before the window (see mx_fixed_point_hw.PLAParams). 'infer' =
+    # eval mode only; train mode runs the float activation module as before.
+    "pla": "off",
+    "pla_mult_bits": 8,           # signed width of the combined multiplier
+    "pla_frac_bits": None,        # its fraction bits; None = largest that fits
+    "pla_bias": "pre",            # 'pre' (bias in acc, PReLU order) or 'post'
+                                  # (emulator pcu_pla order: after the multiply)
 }
 
 
@@ -326,6 +337,31 @@ def normalize_xblock_accum(value):
                 f"xblock_accum.out_margin_bits must be a non-negative int, "
                 f"got {cfg['out_margin_bits']!r}"
             )
+        if cfg["pla"] not in _VALID_PLA:
+            raise ValueError(
+                f"xblock_accum.pla must be in {_VALID_PLA}, got {cfg['pla']!r}")
+        if cfg["pla_bias"] not in _VALID_PLA_BIAS:
+            raise ValueError(
+                f"xblock_accum.pla_bias must be in {_VALID_PLA_BIAS}, "
+                f"got {cfg['pla_bias']!r}")
+        mb = cfg["pla_mult_bits"]
+        if isinstance(mb, bool) or not isinstance(mb, int) or not 2 <= mb <= 16:
+            raise ValueError(
+                f"xblock_accum.pla_mult_bits must be int in [2, 16], got {mb!r}")
+        fb = cfg["pla_frac_bits"]
+        if fb is not None and (isinstance(fb, bool) or not isinstance(fb, int)
+                               or not 0 <= fb <= mb - 2):
+            raise ValueError(
+                f"xblock_accum.pla_frac_bits must be None or int in "
+                f"[0, pla_mult_bits - 2], got {fb!r}")
+        if cfg["pla"] != "off":
+            if cfg["out_window"] == "off":
+                raise ValueError("xblock_accum.pla needs out_window 'infer' or "
+                                 "'always' (PLA sits in front of the window)")
+            if cfg["bits"] + mb > 62:
+                raise ValueError(
+                    f"xblock_accum: bits + pla_mult_bits = {cfg['bits'] + mb} "
+                    f"does not fit the int64 emulation (max 62)")
         # Phase 1 supports only the two documented combinations.
         _combo = (cfg["act_blockify"], cfg["weight_blockify"])
         if _combo not in (("channel", "channel"), ("xblock", "flatten")):

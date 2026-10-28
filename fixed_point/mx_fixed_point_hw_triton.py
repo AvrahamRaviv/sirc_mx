@@ -11,7 +11,8 @@ handles every MXINT format (int8..int16); product math runs in int64.
 
 With APPLY_WIN the static output window (`mx_fixed_point_hw._apply_out_window`)
 runs on the int64 word before the fp32 cast; its constants come from
-`_window_params`, shared with the torch ref.
+`_window_params`, shared with the torch ref. APPLY_PLA multiplies the word by
+the per-channel PLA multiplier first (`mx_fixed_point_hw._apply_pla`).
 
 Importable without Triton (gated on `_TRITON_AVAILABLE`).
 """
@@ -58,11 +59,16 @@ if _TRITON_AVAILABLE:
         win_sat_ptr,    # *i8,  [M, O]  (only written if APPLY_WIN)
         win_rshift, win_lshift, win_round_add, win_hi, win_pre_hi,  # i64
         out_scale,      # fp32  = 2^e_qa_out
+        pla_pos_ptr,    # *i64, [O]   (only read if APPLY_PLA)
+        pla_neg_ptr,    # *i64, [O]
+        pla_bias_ptr,   # *i64, [O]   (only read if PLA_POST_BIAS)
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         SAT_PER_PRODUCT: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         APPLY_WIN: tl.constexpr,
+        APPLY_PLA: tl.constexpr,
+        PLA_POST_BIAS: tl.constexpr,
     ):
         pid_m = tl.program_id(axis=0)
         pid_o = tl.program_id(axis=1)
@@ -141,6 +147,13 @@ if _TRITON_AVAILABLE:
             acc = tl.where(over, hi, acc)
             acc = tl.where(under, lo, acc)
 
+        if APPLY_PLA:
+            m_pos = tl.load(pla_pos_ptr + pid_o).to(tl.int64)
+            m_neg = tl.load(pla_neg_ptr + pid_o).to(tl.int64)
+            acc = acc * tl.where(acc < 0, m_neg, m_pos)
+            if PLA_POST_BIAS:
+                acc = acc + tl.load(pla_bias_ptr + pid_o).to(tl.int64)
+
         out_off = offs_m * O + pid_o
         if APPLY_WIN:
             v = (acc + win_round_add) >> win_rshift
@@ -174,10 +187,15 @@ if _TRITON_AVAILABLE:
         win_sat_ptr,    # *i8,  [M, O]  (only written if APPLY_WIN)
         win_rshift, win_lshift, win_round_add, win_hi, win_pre_hi,  # i64
         out_scale,      # fp32  = 2^e_qa_out
+        pla_pos_ptr,    # *i64, [O]   (only read if APPLY_PLA)
+        pla_neg_ptr,    # *i64, [O]
+        pla_bias_ptr,   # *i64, [O]   (only read if PLA_POST_BIAS)
         BLOCK_M: tl.constexpr,
         BS: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         APPLY_WIN: tl.constexpr,
+        APPLY_PLA: tl.constexpr,
+        PLA_POST_BIAS: tl.constexpr,
     ):
         """NPE kernel: independent per-lane exponents (no lane sharing). Loop
         order kb -> j -> kk (cin = kb*BS + j outer, kk inner) reproduces the
@@ -236,6 +254,13 @@ if _TRITON_AVAILABLE:
             acc = tl.where(over, hi, acc)
             acc = tl.where(under, lo, acc)
 
+        if APPLY_PLA:
+            m_pos = tl.load(pla_pos_ptr + pid_o).to(tl.int64)
+            m_neg = tl.load(pla_neg_ptr + pid_o).to(tl.int64)
+            acc = acc * tl.where(acc < 0, m_neg, m_pos)
+            if PLA_POST_BIAS:
+                acc = acc + tl.load(pla_bias_ptr + pid_o).to(tl.int64)
+
         out_off = offs_m * O + pid_o
         if APPLY_WIN:
             v = (acc + win_round_add) >> win_rshift
@@ -262,6 +287,29 @@ def _window_launch_args(e_layer_min, e_qa_out, win_bits, out_round, M, O, device
     win_sat = torch.zeros((M, O), dtype=torch.int8, device=device)
     return win_sat, (rshift, lshift, round_add, win_hi, pre_hi,
                      float(2.0 ** int(e_qa_out))), 1
+
+
+def _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device):
+    """(bias_int, HAS_BIAS, e_win, pla tensors, APPLY_PLA, PLA_POST_BIAS).
+
+    The accumulator bias is round(b * 2^-e_layer_min), half up with PLA; in
+    the PLA 'post' order it goes after the multiply instead, on the grid
+    e_win = e_layer_min - frac the window then extracts from."""
+    from .mx_fixed_point_hw import _bias_to_grid
+    dummy = torch.empty(1, dtype=torch.int64, device=device)
+    post = pla is not None and pla.bias == "post"
+    has_bias = bias_fp is not None and not post
+    bias_int = (_bias_to_grid(bias_fp, e_layer_min, pla is not None, device).contiguous()
+                if has_bias else torch.empty(O, dtype=torch.int64, device=device))
+    if pla is None:
+        return bias_int, has_bias, int(e_layer_min), (dummy, dummy, dummy), 0, 0
+    e_win = int(e_layer_min) - int(pla.frac)
+    b_post = (_bias_to_grid(bias_fp, e_win, True, device).contiguous()
+              if post and bias_fp is not None else dummy)
+    pos = pla.m_pos.to(device=device, dtype=torch.int64).contiguous()
+    neg = pla.m_neg.to(device=device, dtype=torch.int64).contiguous()
+    return (bias_int, has_bias, e_win, (pos, neg, b_post), 1,
+            1 if (post and bias_fp is not None) else 0)
 
 
 def _fill_win_sink(win_sink, win_sat, B, L, O):
@@ -321,6 +369,7 @@ def _hw_fxp_conv2d_triton(
     bias_fp=None,
     mant_bias=6,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
+    pla=None,
 ):
     _require_triton_cuda()
     if not qi_i8.is_cuda:
@@ -346,18 +395,13 @@ def _hw_fxp_conv2d_triton(
     inv_scale_ref = float(2.0 ** int(e_layer_min))
     sat_per_product = 1 if sat_mode == "per_product" else 0
 
-    has_bias = bias_fp is not None
-    if has_bias:
-        # Project bias onto the accumulator's fixed-point grid:
-        #   acc represents value * 2^(-e_layer_min); so bias_int = round(b * 2^(-e_layer_min)).
-        scale_to_acc = float(2.0 ** (-int(e_layer_min)))
-        bias_int = (bias_fp.detach().to(torch.float64).to(device) * scale_to_acc) \
-            .round().to(torch.int64).contiguous()
-    else:
-        bias_int = torch.empty(O, dtype=torch.int64, device=device)
+    # Bias onto the accumulator's fixed-point grid: acc represents
+    # value * 2^(-e_layer_min), so bias_int = round(b * 2^(-e_layer_min)).
+    bias_int, has_bias, e_win, pla_args, apply_pla, pla_post = \
+        _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device)
 
     win_sat, win_args, apply_win = _window_launch_args(
-        e_layer_min, e_qa_out, win_bits, out_round, M, O, device)
+        e_win, e_qa_out, win_bits, out_round, M, O, device)
 
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
@@ -366,9 +410,10 @@ def _hw_fxp_conv2d_triton(
         qi_flat, qw_flat, Ea_flat, Ew_flat, bias_int, out, sat,
         M, O, nb, kK,
         int(e_layer_min), int(two_bias), int(lo), int(hi), inv_scale_ref,
-        win_sat, *win_args,
+        win_sat, *win_args, *pla_args,
         BLOCK_M=BLOCK_M, BS=bs, SAT_PER_PRODUCT=sat_per_product,
         HAS_BIAS=1 if has_bias else 0, APPLY_WIN=apply_win,
+        APPLY_PLA=apply_pla, PLA_POST_BIAS=pla_post,
     )
 
     # Caller reshapes to [B, O, H_out, W_out]. We return [B, O, L] and sat [B, O, L].
@@ -437,6 +482,7 @@ def _hw_fxp_conv2d_triton_npe(
     mant_bias=6,
     BS=32,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
+    pla=None,
 ):
     """Dedicated NPE triton path (per-lane exponents, BS-tiled). Bit-identical
     to the torch ref and the bs=1 reuse path; here for cross-verification.
@@ -468,16 +514,11 @@ def _hw_fxp_conv2d_triton_npe(
     two_bias = 2 * int(mant_bias)
     inv_scale_ref = float(2.0 ** int(e_layer_min))
 
-    has_bias = bias_fp is not None
-    if has_bias:
-        scale_to_acc = float(2.0 ** (-int(e_layer_min)))
-        bias_int = (bias_fp.detach().to(torch.float64).to(device) * scale_to_acc) \
-            .round().to(torch.int64).contiguous()
-    else:
-        bias_int = torch.empty(O, dtype=torch.int64, device=device)
+    bias_int, has_bias, e_win, pla_args, apply_pla, pla_post = \
+        _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device)
 
     win_sat, win_args, apply_win = _window_launch_args(
-        e_layer_min, e_qa_out, win_bits, out_round, M, O, device)
+        e_win, e_qa_out, win_bits, out_round, M, O, device)
 
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
@@ -486,9 +527,10 @@ def _hw_fxp_conv2d_triton_npe(
         qi_flat, qw_flat, Ea_flat, Ew_flat, bias_int, out, sat,
         M, O, nb, kK,
         int(e_layer_min), int(two_bias), int(lo), int(hi), inv_scale_ref,
-        win_sat, *win_args,
+        win_sat, *win_args, *pla_args,
         BLOCK_M=BLOCK_M, BS=BS,
         HAS_BIAS=1 if has_bias else 0, APPLY_WIN=apply_win,
+        APPLY_PLA=apply_pla, PLA_POST_BIAS=pla_post,
     )
 
     B = qi_i8.shape[0]

@@ -370,12 +370,14 @@ def _fp32_functional(mod, x):
     """FP32 reference output of `mod` on input x, using its stored weights."""
     w = mod.weight.to(x.dtype)
     b = mod.bias.to(x.dtype) if mod.bias is not None else None
+    # A layer whose last forward applied PLA returned conv + activation.
+    pla = mod.pla_ref if isinstance(mod, MXConv2dHW) else (lambda y: y)
     if isinstance(mod, (MXConvTranspose2d, MXConvTranspose2dHW)):
-        return F.conv_transpose2d(x, w, b, mod.stride, mod.padding,
-                                  mod.output_padding, mod.groups, mod.dilation)
+        return pla(F.conv_transpose2d(x, w, b, mod.stride, mod.padding,
+                                      mod.output_padding, mod.groups, mod.dilation))
     if isinstance(mod, MXConv2d):
-        return F.conv2d(x, w, b, mod.stride, mod.padding,
-                        mod.dilation, mod.groups)
+        return pla(F.conv2d(x, w, b, mod.stride, mod.padding,
+                            mod.dilation, mod.groups))
     if isinstance(mod, MXLinear):
         return F.linear(x, w, b)
     return None

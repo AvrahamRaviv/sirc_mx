@@ -17,6 +17,10 @@ Names are the ones in "layers". Per layer:
   calls        times the layer runs per forward on this one grid (default 1),
                e.g. 2 for a feature extractor shared by both images;
                calibration pools all calls, so the grid covers each of them
+  pla_frac     only with xblock_accum.pla: fraction bits of the PLA multipliers
+  pla_m_pos    per output channel (list of int): multiplier for a word >= 0
+  pla_m_neg    per output channel (list of int): multiplier for a word < 0
+               (the folded activation slope, alpha * 2^pla_frac quantized)
 
 e_layer_min and e_qa_out are required; win_bits and shift_out are derived
 values, written by `export_hw_grids` and checked on load. Calibration runs
@@ -29,8 +33,15 @@ standalone.
 import json
 
 HW_GRID_KEYS = ("e_layer_min", "e_qa_out", "win_bits", "shift_out",
-                "e_base_a", "e_base_w", "calls")
+                "e_base_a", "e_base_w", "calls",
+                "pla_frac", "pla_m_pos", "pla_m_neg")
 _REQUIRED = ("e_layer_min", "e_qa_out")
+_PLA_KEYS = ("pla_frac", "pla_m_pos", "pla_m_neg")
+_LIST_KEYS = ("pla_m_pos", "pla_m_neg")
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
 
 
 def check_hw_grid(name, entry, win_bits=None):
@@ -50,8 +61,22 @@ def check_hw_grid(name, entry, win_bits=None):
     if missing:
         raise ValueError(f"hw_grids[{name!r}]: missing {missing}")
     for k, v in entry.items():
-        if isinstance(v, bool) or not isinstance(v, int):
+        if k in _LIST_KEYS:
+            if not (isinstance(v, list) and v and all(_is_int(t) for t in v)):
+                raise TypeError(f"hw_grids[{name!r}][{k!r}] must be a non-empty "
+                                f"list of int, got {v!r}")
+        elif not _is_int(v):
             raise TypeError(f"hw_grids[{name!r}][{k!r}] must be int, got {v!r}")
+    pla = [k for k in _PLA_KEYS if k in entry]
+    if pla and len(pla) != len(_PLA_KEYS):
+        raise ValueError(f"hw_grids[{name!r}]: PLA needs all of "
+                         f"{list(_PLA_KEYS)}, got {pla}")
+    if pla:
+        if len(entry["pla_m_pos"]) != len(entry["pla_m_neg"]):
+            raise ValueError(f"hw_grids[{name!r}]: pla_m_pos and pla_m_neg "
+                             f"lengths differ")
+        if entry["pla_frac"] < 0:
+            raise ValueError(f"hw_grids[{name!r}]: pla_frac must be >= 0")
     if entry.get("calls", 1) < 1:
         raise ValueError(f"hw_grids[{name!r}]: calls must be >= 1")
     shift = entry["e_qa_out"] - entry["e_layer_min"]

@@ -19,7 +19,7 @@ from microxcaling.mx.linear import Linear as MXLinear
 from microxcaling.mx.mx_ops import quantize_mx_op
 from microxcaling.mx import MxSpecs
 
-from fixed_point.mx_fixed_point import normalize_xblock_accum
+from fixed_point.mx_fixed_point import normalize_xblock_accum, _get_xblock_cfg
 from fixed_point.mx_fixed_point_hw import (calibrate_act_scales,
                                            calibrate_hw_grids, export_hw_grids,
                                            resolve_out_window_bits)
@@ -29,7 +29,8 @@ from fixed_point.fxp_quant import (
     normalize_out_quant,
 )
 from mx_layers_blocked import (MXConv2dBlocked, MXLinearBlocked, MXConv2dHW,
-                               _reset_hw_call_counts, install_hw_call_guard)
+                               PLA_ACTS, _reset_hw_call_counts,
+                               install_hw_call_guard)
 from mx_layers_act import MXActQuant, install_act_call_guard
 from mx_layers_convT import MXConvTranspose2dHW
 from mx_stats import collect_stats as _collect_stats_impl
@@ -1469,6 +1470,9 @@ class MXQuantizer:
                 setattr(layer, key, int(entry[key]))
                 layer._grid_src[key] = "config"
         layer.hw_calls = int(entry.get("calls", 1))
+        if "pla_frac" in entry:
+            layer._pla_grid = (int(entry["pla_frac"]), list(entry["pla_m_pos"]),
+                               list(entry["pla_m_neg"]))
 
     def _check_hw_grids(self, model):
         """Every hw_grids name must be an MXConv2dHW of this model: a typo or a
@@ -1703,6 +1707,7 @@ class MXQuantizer:
             setattr(parent, leaf, new)
 
         self._warn_unreplaced(layer_map, matched, bindings, verbose)
+        n_pla = self._fold_pla(model, verbose=verbose)
 
         # Param-free ops (kind == 'act_quant') are wrapped after the conv/linear
         # pass: wrapping inserts an `.inner` level in the module path, which
@@ -1737,6 +1742,36 @@ class MXQuantizer:
                     reasons[r] = reasons.get(r, 0) + 1
                 tally = ", ".join(f"{r}: {n}" for r, n in reasons.items())
                 print(f"[MXQuantizer] fallback reasons: {tally}")
+
+    @staticmethod
+    def _fold_pla(model, verbose=1):
+        """PLA: give every MXConv2dHW with xblock_accum.pla on the PReLU /
+        LeakyReLU / ReLU that directly follows it in an nn.Sequential (see
+        MXConv2dHW.fold_pla). A layer with nothing to fold runs without PLA;
+        one whose hw_grids entry has PLA multipliers must fold. Returns the
+        number folded."""
+        hw = {id(m): m for m in model.modules() if isinstance(m, MXConv2dHW)}
+        folded = set()
+        for seq in model.modules():
+            if not isinstance(seq, nn.Sequential):
+                continue
+            kids = list(seq._modules.values())
+            for conv, act in zip(kids, kids[1:]):
+                if (isinstance(conv, MXConv2dHW) and isinstance(act, PLA_ACTS)
+                        and _get_xblock_cfg(conv).get("pla", "off") != "off"):
+                    conv.fold_pla(act)
+                    folded.add(id(conv))
+        for m in hw.values():
+            if m._pla_grid is not None and id(m) not in folded:
+                raise ValueError(
+                    f"hw_grids[{m._mx_layer_name!r}] has PLA multipliers but no "
+                    f"activation was folded into it (xblock_accum.pla off, or "
+                    f"no PReLU / LeakyReLU / ReLU right after it)")
+        on = [m for m in hw.values() if _get_xblock_cfg(m).get("pla", "off") != "off"]
+        if on and verbose >= 1:
+            print(f"[MXQuantizer] PLA: folded the activation into "
+                  f"{len(folded)}/{len(on)} HW layers with pla on")
+        return len(folded)
 
     @staticmethod
     def _warn_unreplaced(layer_map, matched, bindings, verbose=1):
@@ -2670,6 +2705,8 @@ class MXQuantizer:
             def hook(mod, args, kwargs, out):
                 q_out = q_mod(*[_to(a) for a in args],
                               **{k: _to(v) for k, v in kwargs.items()})
+                if isinstance(q_mod, MXConv2dHW) and q_mod._pla_last:
+                    out = q_mod.pla_ref(out)    # PLA output = conv + activation
                 s = accum[name]
                 for f, q in zip(_tensors(out), _tensors(q_out)):
                     if not (torch.is_tensor(f) and f.is_floating_point()):

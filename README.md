@@ -319,6 +319,23 @@ change. Grouped (depthwise) convT stays on plain MX; GPTQ skips the layer.
 `configs/mx_config_dof_run_win_cal_convT.json` is the DOF run config with the
 three dense `conv1` layers on this path.
 
+`xblock_accum.pla: "infer"` (default `"off"`, needs `out_window` on) folds the
+`PReLU` / `LeakyReLU` / `ReLU` that directly follows an HW conv (or HW convT) in
+an `nn.Sequential` into the PCU multiply in front of the output window: per
+output channel two signed `pla_mult_bits` (8) multipliers, `m_pos = 2^frac`
+and `m_neg = floor(alpha * 2^frac + 0.5)`, are picked by the sign of the
+accumulator word (bias in, `pla_bias: "pre"`), and the window extracts from
+`N * m` (48 + 8 = 56 bits) on the grid `2^(e_layer_min - frac)`. `frac`
+(`pla_frac_bits`, null = largest that fits: 6 for 8b) and the slopes come from
+the module offline; `e_qa_out` is calibrated on the activated output by the
+same `calibrate_hw_grids`. The activation module stays in the model (state_dict
+unchanged) and passes a PLA output through; train mode runs it as before.
+`pla_bias: "post"` is the emulator's `pcu_pla` order (bias after the multiply,
+segment by the bias-free word), kept for the HW comparison. The grids file
+carries `pla_frac`, `pla_m_pos`, `pla_m_neg` per layer, and the sim/inference
+use them as given; a grids file without them still loads.
+`configs/mx_config_dof_run_win_cal_pla.json` is the convT run config with PLA on.
+
 ```json
 "groups": {
   "int4": {"w_elem_format": "int4", "a_elem_format": "int4"},

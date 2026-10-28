@@ -30,8 +30,17 @@ word is just cast to fp32 (dynamic, top-aligned ~24 bits). The next layer's MX r
 shared exponent; HW stores it in 4 bits, which decodes to the same lattice
 in range. TODO: model the 4b output exponent clamp (saturate/reset tails).
 
+PLA (xblock_accum.pla, default off): the PCU's per-channel multiply between
+the accumulator and the window folds the activation that follows the conv
+(PReLU / LeakyReLU / ReLU). Per output channel two signed `pla_mult_bits`
+multipliers, m_pos = 2^frac and m_neg = q(alpha * 2^frac), are picked by the
+sign of the word, P = N * m (48 + 8 = 56b), and the unchanged window extracts
+O from P on the grid 2^(e_layer_min - frac). See `PLAParams`.
+
 Only MXINT formats are supported. FP8/MXFP paths are rejected.
 """
+
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -250,6 +259,70 @@ def _apply_out_window(acc, e_acc, e_qa_out, win_bits, out_round="floor"):
     return v, over | under
 
 
+class PLAParams(NamedTuple):
+    """Integer PCU multiply of one layer (`_apply_pla`).
+
+    m_pos, m_neg : int64 [O], signed multipliers for a word >= 0 / < 0
+    frac         : fraction bits of both; P sits on the grid 2^(e_acc - frac)
+    bias         : 'pre'  - bias in the accumulator, so the segment follows
+                            the sign of acc + bias (what PReLU(conv) needs)
+                   'post' - emulator order (pcu_pla): P = N * m + bias * m_pos,
+                            segment by the sign of the bias-free N. Equals
+                            'pre' only for m_neg == m_pos; with a fold it
+                            differs where N and N + bias have other signs
+    """
+    m_pos: torch.Tensor
+    m_neg: torch.Tensor
+    frac: int
+    bias: str = "pre"
+
+
+def pla_multipliers(alpha, mult_bits=8, frac_bits=None):
+    """(m_pos, m_neg, frac) of y = z (z >= 0), alpha * z (z < 0), unit scale.
+
+    m_pos = 2^frac, m_neg = floor(alpha * 2^frac + 0.5) (offline, round half
+    up as the HW bias), both signed `mult_bits`. `frac_bits` None = the
+    largest frac where both fit (8b, |alpha| <= 1 -> 6).
+    """
+    a = torch.as_tensor(alpha).detach().to(torch.float64).cpu().flatten()
+    lo, hi = -(1 << (mult_bits - 1)), (1 << (mult_bits - 1)) - 1
+
+    def fits(f):
+        mn = torch.floor(a * 2.0 ** f + 0.5)
+        return (1 << f) <= hi and int(mn.min()) >= lo and int(mn.max()) <= hi
+
+    if frac_bits is None:
+        frac = next((f for f in range(mult_bits - 2, -1, -1) if fits(f)), None)
+        if frac is None:
+            raise ValueError(f"PLA: slopes {a.min().item():.4g}..{a.max().item():.4g} "
+                             f"do not fit {mult_bits}b multipliers")
+    else:
+        frac = int(frac_bits)
+        if not fits(frac):
+            raise ValueError(f"PLA: frac {frac} overflows {mult_bits}b "
+                             f"multipliers (slopes {a.min().item():.4g}.."
+                             f"{a.max().item():.4g})")
+    m_neg = torch.floor(a * 2.0 ** frac + 0.5).to(torch.int64)
+    return torch.full_like(m_neg, 1 << frac), m_neg, frac
+
+
+def _bias_to_grid(bias_fp, e_grid, half_up, device):
+    """Bias on the integer grid 2^e_grid: round half to even, or with
+    `half_up` floor(v + 0.5), the HW's offline rounding (used with PLA)."""
+    v = bias_fp.detach().to(torch.float64).to(device) * float(2.0 ** (-int(e_grid)))
+    return ((v + 0.5).floor() if half_up else v.round()).to(torch.int64)
+
+
+def _apply_pla(acc, pla, bias_post=None):
+    """P = acc * (m_neg if acc < 0 else m_pos) [+ bias_post], per output
+    channel (dim 1). int64 exact: |acc| < 2^(bits-1), |m| <= 2^(mult_bits-1)."""
+    shape = (1, acc.shape[1]) + (1,) * (acc.dim() - 2)
+    m = torch.where(acc < 0, pla.m_neg.to(acc.device).view(shape),
+                    pla.m_pos.to(acc.device).view(shape))
+    p = acc * m
+    return p if bias_post is None else p + bias_post.view(shape)
+
+
 def e_qa_out_from_absmax(absmax, win_bits, margin_bits=0):
     """Output grid from a calibrated |max|: floor(log2(absmax)) - (win_bits-1)
     + margin_bits, so absmax itself fits the window unsaturated. None for an
@@ -336,6 +409,7 @@ def _hw_fxp_conv2d_ref(
     mant_bias=MANTISSA_BIAS,
     return_acc=False,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
+    pla=None,
 ):
     """Pure-torch reference for the HW fixed-point conv2d kernel.
 
@@ -361,7 +435,11 @@ def _hw_fxp_conv2d_ref(
     With `e_qa_out` set, `out` is the static output window instead of the
     fp32 cast (see `_apply_out_window`); `win_sink`, if given, receives the
     window saturation map as 'win_sat' and the window word as 'win'.
+    `pla` (a `PLAParams`, needs `e_qa_out`) multiplies the word before the
+    window; `acc` stays the accumulator word.
     """
+    if pla is not None and e_qa_out is None:
+        raise ValueError("PLA needs the output window (e_qa_out)")
     if not isinstance(stride, tuple):   stride   = (int(stride),   int(stride))
     if not isinstance(padding, tuple):  padding  = (int(padding),  int(padding))
     if not isinstance(dilation, tuple): dilation = (int(dilation), int(dilation))
@@ -428,17 +506,22 @@ def _hw_fxp_conv2d_ref(
                 acc, sat_step = _sat(acc, lo, hi)
                 sat = sat | sat_step
 
-    if bias_fp is not None:
+    bias_post = None
+    if bias_fp is not None and pla is not None and pla.bias == "post":
+        # Emulator order: the bias joins after the PCU multiply, on its grid.
+        bias_post = _bias_to_grid(bias_fp, e_min - pla.frac, True, device).view(1, O, 1)
+    elif bias_fp is not None:
         # Project bias onto acc grid: bias_int = round(b * 2^(-e_layer_min)).
-        scale_to_acc = float(2.0 ** (-e_min))
-        bias_int = (bias_fp.detach().to(torch.float64) * scale_to_acc) \
-            .round().to(torch.int64).to(device).view(1, O, 1)
+        bias_int = _bias_to_grid(bias_fp, e_min, pla is not None, device).view(1, O, 1)
         acc = acc + bias_int
         acc, sat_step = _sat(acc, lo, hi)
         sat = sat | sat_step
 
     if e_qa_out is not None:
-        O_win, win_sat = _apply_out_window(acc, e_min, e_qa_out, win_bits, out_round)
+        word, e_word = acc, e_min
+        if pla is not None:
+            word, e_word = _apply_pla(acc, pla, bias_post), e_min - int(pla.frac)
+        O_win, win_sat = _apply_out_window(word, e_word, e_qa_out, win_bits, out_round)
         out = O_win.to(torch.float32) * float(2.0 ** int(e_qa_out))
         if win_sink is not None:
             win_sink["win_sat"] = win_sat
@@ -456,6 +539,7 @@ def _hw_fxp_conv2d_ref_npe(
     bits, sat_mode,
     bias_fp=None, mant_bias=MANTISSA_BIAS, return_acc=False,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
+    pla=None,
 ):
     """NPE reference: the two operands carry independent, full-resolution
     per-element shared exponents (weight = flatten-block, act = X-block). This
@@ -478,7 +562,7 @@ def _hw_fxp_conv2d_ref_npe(
         bs=1, bits=bits, sat_mode=sat_mode,
         bias_fp=bias_fp, mant_bias=mant_bias, return_acc=return_acc,
         e_qa_out=e_qa_out, win_bits=win_bits, out_round=out_round,
-        win_sink=win_sink,
+        win_sink=win_sink, pla=pla,
     )
 
 
@@ -513,13 +597,14 @@ class HWFxpConv2dFn(torch.autograd.Function):
         npe_triton_variant='reuse',
         e_qa_out=None, win_bits=None, out_round='floor',
         in_dil=(1, 1), in_extra=(0, 0),
+        pla=None,
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
         win_sink = {} if e_qa_out is not None else None
         win_kw = dict(
             e_qa_out=None if e_qa_out is None else int(e_qa_out),
             win_bits=None if win_bits is None else int(win_bits),
-            out_round=str(out_round), win_sink=win_sink,
+            out_round=str(out_round), win_sink=win_sink, pla=pla,
         )
         npe = (act_blockify == "xblock" and weight_blockify == "flatten")
         # A caller that taps the integer accumulator sets `want_acc` in the
@@ -671,17 +756,17 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 22 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # forward took 23 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
         # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink,
         # fmt, act_blockify, weight_blockify, npe_triton_variant,
-        # e_qa_out, win_bits, out_round, in_dil, in_extra
+        # e_qa_out, win_bits, out_round, in_dil, in_extra, pla
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
             None, None, None, None, None, None,
             None, None, None,
             None, None, None,
-            None, None,
+            None, None, None,
         )
 
 
@@ -696,6 +781,7 @@ def hw_fxp_conv2d(
     e_qa_out=None, win_bits=None, out_round='floor',
     out_exp_bits=OUT_EXP_BITS,
     in_dil=1, in_extra=0,
+    pla=None,
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
@@ -714,7 +800,12 @@ def hw_fxp_conv2d(
     `fmt` and `out_exp_bits` (`derive_out_window_bits`).
     `in_dil` / `in_extra` zero-insert the extracted input (`dilate_input`):
     `stride`/`padding`/`dilation` then describe the stride-1 conv over it.
+    `pla` (`PLAParams`, None = off) runs the PCU multiply before the window
+    (forward only, needs `e_qa_out`); the caller applies the float activation
+    to the gradient path itself.
     """
+    if pla is not None and e_qa_out is None:
+        raise ValueError("hw_fxp_conv2d: pla needs the output window (e_qa_out)")
     if e_qa_out is not None and win_bits is None:
         win_bits = derive_out_window_bits(fmt, out_exp_bits)
     if e_layer_min is None:
@@ -733,6 +824,7 @@ def hw_fxp_conv2d(
         None if e_qa_out is None else int(e_qa_out),
         None if win_bits is None else int(win_bits), str(out_round),
         _pair(in_dil), _pair(in_extra),
+        pla,
     )
 
 
@@ -1104,7 +1196,8 @@ def calibrate_hw_grids(model, data_iter, num_batches=8, forward_fn=None,
 def export_hw_grids(model):
     """{layer name: {e_layer_min, e_qa_out, win_bits, shift_out}} for every
     `MXConv2dHW` in `model` - the config's "hw_grids" section (see
-    `fixed_point.hw_grids`). Raises if a layer has no grid yet."""
+    `fixed_point.hw_grids`), plus pla_frac / pla_m_pos / pla_m_neg for a
+    layer with PLA folded. Raises if a layer has no grid yet."""
     from mx_layers_blocked import MXConv2dHW, _get_xblock_cfg
     from .hw_grids import check_hw_grid
 
@@ -1133,6 +1226,11 @@ def export_hw_grids(model):
                 continue
             entry["e_base_a"] = int(m.e_base_a)
             entry["e_base_w"] = int(m.weight_exp_base())
+        if m.pla_on():
+            pla = m.pla_params()
+            entry.update(pla_frac=int(pla.frac),
+                         pla_m_pos=[int(v) for v in pla.m_pos.tolist()],
+                         pla_m_neg=[int(v) for v in pla.m_neg.tolist()])
         grids[name] = check_hw_grid(name, entry)
     if missing:
         raise ValueError(f"export_hw_grids: {len(missing)} layers have no grids "
