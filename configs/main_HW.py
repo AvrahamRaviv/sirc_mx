@@ -46,6 +46,7 @@ from taps import tap, show
 # --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
 from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
 from npe_mx_emu import mx_config_factory, SUPPORTED_ACC_WIDTHS
+from npe_mx_emu import Cstruct, pcu
 from npe_mx_emu import hw_pipe as _hw_pipe
 
 # Widths fixed inside npe_mx_emu - their API has no parameter for them, so the
@@ -108,6 +109,86 @@ def _capture_bcu():
         _hw_pipe.bcu = orig
 
 
+# --- PLA (activation folded into the PCU) -----------------------------------
+# HW (their answer to Q10): per channel, bins split by boundaries on the
+# accumulator word; bin k has an int8 signed scale S_k and a bias B_k:
+# out = S_k * acc + B_k -> pcu_div (shift, round half up) -> relux clamp.
+# PReLU / leaky = 2 bins at boundary acc = -b. Their emulator today is ONE bin
+# (Cstruct has one scale and one bias); they will extend Cstruct / pcu_pla.
+# All values come from the config (hw_grids pla_frac, pla_bin_bounds /
+# pla_bin_scales / pla_bin_biases, xblock_accum.pla_bin_tie) - the same values
+# the ALG side reads.
+
+def _pla_bins(case, cfg, qp, O):
+    """The config's PLA bins for this layer, on their accumulator grid."""
+    g = SC.hw_grid(cfg, case) or {}
+    keys = ("pla_frac", "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases")
+    miss = [k for k in keys if k not in g]
+    if miss:
+        raise SystemExit(f"{os.path.basename(cfg['file'])}: hw_grids "
+                         f"{SC.grid_key(cfg, case)!r} lacks {miss}; the HW PCU "
+                         f"bins come from the config")
+    # bounds / biases sit on the grid of the config's e_layer_min; their
+    # accumulator LSB is 2^-(x_cal + w_cal). Same grid needed, else the values
+    # would have to be re-derived (= calibration, which the sim does not do).
+    if -qp.b_cal != int(g["e_layer_min"]):
+        raise NotImplementedError(
+            f"HW PLA: their accumulator grid 2^-{qp.b_cal} (x_cal + w_cal) != "
+            f"config e_layer_min {g['e_layer_min']}; the config's bins don't apply")
+    xa = cfg["mx_specs"].get("xblock_accum") or {}
+    bits = HW_FIXED["pcu_clamp_bits"]
+    return {"frac": int(g["pla_frac"]),
+            "bounds": [list(map(int, v)) for v in g["pla_bin_bounds"]],
+            "scales": [list(map(int, v)) for v in g["pla_bin_scales"]],
+            "biases": [list(map(int, v)) for v in g["pla_bin_biases"]],
+            "tie": xa.get("pla_bin_tie", "upper"),
+            "lo": -2.0 ** (bits - 1), "hi": 2.0 ** (bits - 1) - 1}
+
+
+def _cs(pla, scale, bias):
+    return Cstruct(bias=bias, scale=scale, shift=-pla["frac"], round_type="round",
+                   min_val=pla["lo"], max_val=pla["hi"])
+
+
+def _pla_single(pla, O):
+    """Their emulator as it is: ONE bin per channel. Given the upper bin
+    (S = m_pos, B its bias): exact for the positive side, no PReLU."""
+    return {o: _cs(pla, pla["scales"][o][-1], pla["biases"][o][-1]) for o in range(O)}
+
+
+def bins_pcu(n, pla, o, e):
+    """OUR ASSUMPTION UNTIL HW EMULATOR HAS BINS, one channel `o`: bin of
+    each acc word n (bounds ascending; tie 'upper': n == bound goes up), then
+    their pcu with that bin's S_k, B_k. Returns (out int64, bin uint8)."""
+    k = torch.zeros_like(n, dtype=torch.uint8)
+    for j, t in enumerate(pla["bounds"][o]):
+        k = torch.where(n >= t if pla["tie"] == "upper" else n > t,
+                        torch.full_like(k, j + 1), k)
+    y = torch.zeros_like(n)
+    for j, (sk, bk) in enumerate(zip(pla["scales"][o], pla["biases"][o])):
+        y = torch.where(k == j, pcu(n, c_struct=_cs(pla, sk, bk), e_min_layer=e).long(), y)
+    return y, k
+
+
+def _pla_bins_standin(taps, pla, layer, mx_a):
+    """OUR ASSUMPTION UNTIL HW EMULATOR HAS BINS: per channel pick the bin by
+    acc vs the boundaries (tie rule from the config), then their pcu
+    (pcu_pla -> pcu_div -> relux) with that bin's S_k, B_k. Runs on the
+    accumulator lines their bcu produced."""
+    acc = taps["hw_acc"]
+    e = int(layer.mx_conv.mx_weight.e_min_layer + mx_a.e_min_layer)
+    out = torch.empty_like(acc)
+    bins = torch.zeros_like(acc, dtype=torch.uint8)
+    for o in range(acc.shape[1]):
+        out[:, o], bins[:, o] = bins_pcu(acc[:, o], pla, o, e)
+    tap(taps, "pla_frac", pla["frac"])
+    tap(taps, "pla_bin_scales", torch.tensor(pla["scales"]))
+    tap(taps, "pla_bin_biases", torch.tensor(pla["biases"]))
+    tap(taps, "pla_bin_bounds", torch.tensor(pla["bounds"]))
+    tap(taps, "hw_pla_bin", bins)
+    tap(taps, "hw_out_raw_bins", out)
+    tap(taps, "out_bins", out * 2.0 ** -layer.output_scale_log2)
+
 def conv(case, cfg, taps):
     """MX conv on the HW team's NPE emulator (hw/npe_mx_emu).
 
@@ -155,6 +236,9 @@ def conv(case, cfg, taps):
         layer.mx_conv.weight.copy_(w)
         layer.mx_conv.bias.copy_(b if b is not None else torch.zeros(O))
     layer.calibrate()
+    pla = _pla_bins(case, cfg, qp, O) if case.get("act") else None
+    if pla is not None:                 # their one-bin PCU, as it is today
+        layer.mx_conv.load_c_struct(_pla_single(pla, O))
 
     seen_mx = []
     hook = layer.mx_conv.register_forward_pre_hook(
@@ -181,7 +265,10 @@ def conv(case, cfg, taps):
     # bcu is called per (b, oc, oh) in that loop order -> [B, O, Ho, Wo]
     tap(taps, "hw_acc", torch.stack(lines).reshape(B, O, Ho, Wo))
     tap(taps, "out_raw", out_raw)
+    tap(taps, "out_scale_log2", layer.output_scale_log2)   # out grid 2^-this
     tap(taps, "out", out_raw * 2.0 ** -layer.output_scale_log2)
+    if pla is not None:
+        _pla_bins_standin(taps, pla, layer, mx_a)
     return taps["out"]
 
 

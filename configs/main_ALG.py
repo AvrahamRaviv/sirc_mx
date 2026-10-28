@@ -47,6 +47,7 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
         sys.path.insert(0, p)
 
 from mx_quantizer import MXQuantizer
+from mx_layers_blocked import MXConv2dHW
 from fixed_point.fxp_quant import fxp_step
 
 import cases as C
@@ -56,11 +57,12 @@ from taps import tap, show
 # Config
 # =============================================================================
 
-from sim_config import DEFAULT_CONFIG, load_config   # noqa: E402  (re-exported)
+from sim_config import DEFAULT_CONFIG, load_config, hw_grid   # noqa: E402  (re-exported)
 
 
-def _entry(cfg, op):
-    """The `layers` entry for the layer under test, renamed "op"."""
+def _entry(cfg, op, as_name="op"):
+    """The `layers` entry for the layer under test, renamed `as_name` ("op",
+    or "op.0" for the conv inside a conv + activation Sequential)."""
     name = cfg["layer"]
     if name is None and op == "warp":
         name = next((n for n, e in cfg["entries"].items()
@@ -68,14 +70,16 @@ def _entry(cfg, op):
         if name is None:
             raise SystemExit(f"{cfg['file']}: no act_quant entry for warp")
     if name is None:
-        return "op"
+        return as_name
     e = json.loads(json.dumps(cfg["entries"][name]))   # deep copy
-    e["name"] = "op"
+    e["name"] = as_name
     return e
 
 
-def _mx_config(cfg, entry):
-    """The mx_config.json written for MXQuantizer: file's specs + one layer."""
+def _mx_config(cfg, entry, grid=None):
+    """The mx_config.json written for MXQuantizer: file's specs + one layer,
+    plus that layer's hw_grids entry (re-keyed to the sim's name) so the lib
+    loads the static grids itself, as in the framework."""
     specs = json.loads(json.dumps(cfg["mx_specs"]))
     groups = json.loads(json.dumps(cfg["groups"]))
     if not torch.cuda.is_available():     # no CUDA: lib's python quantizer
@@ -85,8 +89,12 @@ def _mx_config(cfg, entry):
         xa = specs.get("xblock_accum")
         if isinstance(xa, dict):
             xa["backend"] = cfg["backend"]
-    return {"mx_specs": specs, "groups": groups, "layers": [entry],
-            "ptq": False, "measure_error": False}
+    out = {"mx_specs": specs, "groups": groups, "layers": [entry],
+           "ptq": False, "measure_error": False}
+    if grid is not None:
+        name = entry if isinstance(entry, str) else entry["name"]
+        out["hw_grids"] = {name: grid}
+    return out
 
 
 class _One(nn.Module):
@@ -100,12 +108,12 @@ class _One(nn.Module):
         return self.op(*args)
 
 
-def quantize(layer, cfg, entry="op"):
+def quantize(layer, cfg, entry="op", grid=None):
     """MXQuantizer on a one-layer model, as the framework calls it. Returns the
-    replaced layer."""
+    replaced layer (a Sequential stays one: conv + its activation)."""
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "mx_config.json"), "w") as f:
-            json.dump(_mx_config(cfg, entry), f)
+            json.dump(_mx_config(cfg, entry, grid), f)
         with contextlib.redirect_stdout(io.StringIO()):
             q = MXQuantizer(save_dir=d).quant(_One(layer))
     return q.eval().op
@@ -172,12 +180,24 @@ def conv(case, cfg, taps):
         layer.weight.copy_(w)
         if case["b"] is not None:
             layer.bias.copy_(case["b"])
-    mod = quantize(layer, cfg, _entry(cfg, "conv"))
+    grid = hw_grid(cfg, case)           # static grids from the config only
+    act = case.get("act")
+    if act is not None:
+        # conv + PReLU in a Sequential: the lib folds the activation into the
+        # PCU multiply (PLA) when xblock_accum.pla is on; else it runs after.
+        prelu = nn.PReLU(O)
+        with torch.no_grad():
+            prelu.weight.copy_(act["alpha"])
+        seq = quantize(nn.Sequential(layer, prelu), cfg,
+                       _entry(cfg, "conv", "op.0"), grid)
+        mod = seq[0]
+    else:
+        mod = seq = quantize(layer, cfg, _entry(cfg, "conv"), grid)
     mod._tap_acc = True                 # keep qi, qw and the int64 acc word
     sp = mod.mx_specs
 
     with torch.no_grad():
-        out = mod(x)
+        out = seq(x)
 
     tap(taps, "x", x)
     tap(taps, "w", w)
@@ -192,8 +212,47 @@ def conv(case, cfg, taps):
     if mod._last_acc is not None:                # python backend only
         tap(taps, "acc", mod._last_acc)          # int64 [B, O, Ho, Wo]
         tap(taps, "sat", mod._last_sat.to(torch.uint8))
-    tap(taps, "out", out)                        # acc * 2^e_layer_min
+    if mod.e_layer_min is not None:
+        tap(taps, "e_layer_min", int(mod.e_layer_min))
+    if mod._last_win is not None:                # output window on
+        tap(taps, "e_qa_out", int(mod.e_qa_out))
+        if mod._pla_last:                        # PLA applied in this forward
+            pla = mod.pla_params()
+            tap(taps, "pla_frac", int(pla.frac))
+            tap(taps, "pla_m_pos", pla.m_pos)
+            tap(taps, "pla_m_neg", pla.m_neg)
+            if pla.bias == "bins":
+                tap(taps, "pla_bin_scales", pla.scales)
+                tap(taps, "pla_bin_biases", pla.biases)
+                tap(taps, "pla_bin_bounds", pla.bounds)
+        tap(taps, "win", mod._last_win)          # int64 O on 2^e_qa_out
+        tap(taps, "win_sat", mod._last_win_sat.to(torch.uint8))
+    # out: acc * 2^e_layer_min (no window) | win * 2^e_qa_out (window; after
+    # PLA when folded)
+    tap(taps, "out", out)
     return out
+
+
+def pcu_on(acc, cfg, case, e_out):
+    """The lib's PCU steps (PLA bins + output window) on an accumulator word
+    from anywhere - e.g. HW's own - so the PCU is compared alone. Bins, frac,
+    tie, window width and rounding from the config; output grid 2^e_out.
+    acc: int64 [B, O, ...] on the config's e_layer_min grid."""
+    from fixed_point.mx_fixed_point_hw import (PLAParams, _apply_pla,
+                                               _apply_out_window,
+                                               resolve_out_window_bits)
+    g = hw_grid(cfg, case)
+    xa = cfg["mx_specs"]["xblock_accum"]
+    t = lambda k: torch.tensor(g[k], dtype=torch.int64)
+    pla = PLAParams(t("pla_m_pos"), t("pla_m_neg"), int(g["pla_frac"]), "bins",
+                    t("pla_bin_bounds"), t("pla_bin_scales"), t("pla_bin_biases"),
+                    xa.get("pla_bin_tie", "upper"))
+    B, O = acc.shape[:2]
+    word = _apply_pla(acc.reshape(B, O, -1), pla)
+    win = resolve_out_window_bits(xa, cfg["mx_specs"]["a_elem_format"])
+    o, sat = _apply_out_window(word, int(g["e_layer_min"]) - pla.frac, e_out, win,
+                               xa.get("out_round", "floor"))
+    return o.reshape(acc.shape), sat.reshape(acc.shape)
 
 
 @contextlib.contextmanager
@@ -241,8 +300,31 @@ def convt(case, cfg, taps):
         layer.weight.copy_(w)
         if case["b"] is not None:
             layer.bias.copy_(case["b"])
-    mod = quantize(layer, cfg, _entry(cfg, "convt"))
+    mod = quantize(layer, cfg, _entry(cfg, "convt"), hw_grid(cfg, case))
     sp = mod.mx_specs
+
+    if isinstance(mod, MXConv2dHW):
+        # xblock_accum.convT = "hw": the lib's MXConvTranspose2dHW quantizes
+        # the compact input (NPE blocks along W), zero-inserts the extracted
+        # operand and runs the HW conv. Taps as conv; w_int / w_exp are its
+        # equivalent conv weight (transposed, flipped) [O, Cin, kH, kW].
+        mod._tap_acc = True
+        with torch.no_grad():
+            out = mod(x)
+        tap(taps, "x", x)
+        tap(taps, "w", w)
+        a_int, a_exp = mx_decode(mod._last_qi, axis=3, **_dec(sp, "a"))
+        tap(taps, "a_int", a_int)
+        tap(taps, "a_exp", a_exp)
+        wc = mod._last_qw
+        w_int, w_exp = mx_decode(wc.reshape(wc.shape[0], -1), axis=1, **_dec(sp, "w"))
+        tap(taps, "w_int", w_int.reshape(wc.shape))
+        tap(taps, "w_exp", w_exp)
+        if mod._last_acc is not None:
+            tap(taps, "acc", mod._last_acc)
+            tap(taps, "sat", mod._last_sat.to(torch.uint8))
+        tap(taps, "out", out)
+        return out
 
     with torch.no_grad(), _capture_mx(TC) as seen:
         out = mod(x)

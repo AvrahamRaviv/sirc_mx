@@ -5,7 +5,8 @@ A case is a plain dict:
 
     {"name": "conv3x3", "op": "conv", "params": {...},
      "x": tensor, "w": tensor or None, "b": tensor or None,
-     "flow": tensor or None, "warp": {...} or None}
+     "flow": tensor or None, "warp": {...} or None,
+     "act": {"kind": "prelu", "alpha": per-channel tensor} or None}
 
     python cases.py            # list them
 """
@@ -70,6 +71,15 @@ CASES = {
                          dilation=2),
     "conv3x3_bias": dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=1,
                          bias=True),
+    # --- conv + activation folded into the PCU (PLA) ------------------------------
+    # DOF-like: 16 -> 8 channels, 3x3, bias, per-channel PReLU slope. alpha 0 is
+    # a ReLU, 1 an identity; the rest exercise the negative multiplier.
+    "conv_prelu":   dict(op="conv", x=(1, 16, 6, 40), w=(8, 16, 3, 3), bias=True,
+                         act=("prelu", (0.0, 0.25, 0.1, 1.0, 0.5, 0.05, 0.3, 0.2))),
+    "conv_relu":    dict(op="conv", x=(1, 16, 6, 40), w=(8, 16, 3, 3), bias=True,
+                         act=("prelu", (0.0,) * 8)),
+    "conv_prelu_negb": dict(op="conv", x=(1, 16, 6, 40), w=(8, 16, 3, 3), bias=-1,
+                            act=("prelu", (0.0, 0.25, 0.1, 1.0, 0.5, 0.05, 0.3, 0.2))),
     # --- convT (HW: zero-insert = dilate the input, then a plain conv) ----------
     "convt_k3_s2":  dict(op="convt", x=(1, 4, 5, 16), w=(4, 8, 3, 3), stride=2,
                          padding=1, output_padding=1),
@@ -123,13 +133,19 @@ def build(name, seed=0, x_frac=None):
     x = torch.randn(spec.pop("x"), generator=gen)
     case = {"name": name, "op": spec.pop("op"),
             "x": x if x_frac is None else to_grid(x, x_frac), "x_frac": x_frac,
-            "w": None, "b": None, "flow": None, "warp": None}
+            "w": None, "b": None, "flow": None, "warp": None, "act": None}
+    act = spec.pop("act", None)
+    if act is not None:           # ("prelu", per-channel slopes)
+        case["act"] = {"kind": act[0], "alpha": torch.tensor(act[1])}
     if case["op"] in ("conv", "convt"):
         w_shape = spec.pop("w")
         case["w"] = torch.randn(w_shape, generator=gen) * 0.1
-        if spec.pop("bias", False):
+        bias = spec.pop("bias", False)      # True, or -1: all-negative bias
+        if bias:
             o = w_shape[0] if case["op"] == "conv" else w_shape[1]
             case["b"] = torch.randn(o, generator=gen) * 0.1
+            if bias == -1:
+                case["b"] = -case["b"].abs()
         case["params"] = {"stride": 1, "padding": 0, "dilation": 1, **spec}
     else:
         case["flow"] = _flow(case["x"].shape, spec.pop("flow"), gen)

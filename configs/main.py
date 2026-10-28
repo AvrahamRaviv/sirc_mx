@@ -127,6 +127,26 @@ def main():
                 print(f"  HW input off its integer grid (x*2^x_cal): "
                       f"{int(hw['pre_round_moved'])}/{case['x'].numel()} elements"
                       f" (not rounded: not an input layer)")
+            if "out_bins" in hw:
+                # PLA. HW: their one-bin PCU (as it is) and our bins stand-in
+                # (main_HW, until their emulator has bins). PCU alone: the
+                # lib's PLA + window on HW's own acc words, same 2^-12 grid.
+                k = hw["hw_pla_bin"]
+                neg = k == 0
+                d1 = (alg["out"].double() - hw["out"].double()).abs()
+                d2 = (alg["out"].double() - hw["out_bins"].double()).abs()
+                print(f"  PLA: lower bin {int(neg.sum())}/{neg.numel()} elements")
+                for lab, d_ in (("their PCU (1 bin)", d1), ("bins stand-in (ours)", d2)):
+                    print(f"    HW-ALG {lab:21s} max {float(d_.max()):.4g}  "
+                          f"lower bin max {float(d_[neg].max()) if neg.any() else 0:.4g}  "
+                          f"upper bin max {float(d_[~neg].max()) if (~neg).any() else 0:.4g}")
+                try:
+                    o, _ = ALG.pcu_on(hw["hw_acc"], cfg, case, -int(hw["out_scale_log2"]))
+                    nd = int((o != hw["hw_out_raw_bins"]).sum())
+                    print(f"    PCU alone (same acc): lib bins vs stand-in "
+                          f"{nd}/{o.numel()} differ")
+                except (NotImplementedError, SystemExit) as e:
+                    print(f"    PCU alone: skipped ({e})")
             d = (alg["out"].double() - hw["out"].double()).abs()
             outd.setdefault(name, {})[xf] = (float(d.max()),
                                              float((d ** 2).mean().sqrt()))

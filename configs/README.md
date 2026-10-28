@@ -14,11 +14,13 @@ conv), and **warp**.
 | `cases.py` | the case table: one op per case, tiny shapes, fixed seed. Also `Warp`, the float spec of the warp |
 | `taps.py` | `tap(taps, name, t)` logs a value at any point; `show(taps)` prints them in order |
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
-| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu` (conv). convT and warp are still placeholders |
+| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv runs on their code (incl. PLA via a labelled bins stand-in). convT and warp are still placeholders (their emulator has neither yet) |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop |
-| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their confluence guide (with their answers to the review table), `EL_nb/` their notebooks |
+| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
-| `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width. HW runs only at 4 bits |
+| `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
+| `mx_config_npe_e4_pla.json` | npe_e4 + output window + PLA in HW bin form, `hw_grids` for `conv_prelu`, `conv_relu`, `conv_prelu_negb` |
+| `gen_hw_grids.py` | writes a config's `hw_grids` from an OFFLINE lib calibration on seeds 1-8 (never the test seed). The sim itself never calibrates |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
 
 ## Taps
@@ -34,8 +36,9 @@ conv), and **warp**.
   - NPE blocking of 32: activations along W; weights per filter, flattened C-major.
   - `acc` is the int64 word of the 48-bit saturating accumulator, with LSB `2^-20`.
 - **convT**:
-  - The lib has no HW path. It quantizes plain MX blocked along Cin and accumulates in fp32, so only `out` is comparable, as float.
-  - Open question: does HW quantize before or after the zero insert?
+  - `xblock_accum.convT = "hw"`: the lib's `MXConvTranspose2dHW` quantizes the compact input (blocks along W), zero-inserts the extracted operand and runs the HW conv. Taps as conv; `w_int` / `w_exp` are its equivalent conv weight `[O, Cin, kH, kW]`. HW confirmed this order (quantize compact, zeros never in a block).
+  - Otherwise plain MX blocked along Cin with fp32 accumulation: only `out` compares, as float.
+  - HW side: their emulator has no convT yet (output interleaving still open).
 - **warp**:
   - `ref` is int8 with a static scale.
   - `grid` is Q8.8: a displacement in px, channel 0 = x.
@@ -91,6 +94,34 @@ parameter): PCU clamp 24 bits (`main_HW.HW_FIXED`).
 
 Their code does not support padding (it raises) or dilation (it has no such
 parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.
+
+## Static grids and PLA
+
+The sim never calibrates: per-layer grids come from the config's `hw_grids`
+(`e_layer_min`, `e_qa_out`, `pla_frac`, `pla_bin_bounds` / `pla_bin_scales` /
+`pla_bin_biases`), looked up by `--layer` or else the case name. main_ALG hands
+that entry to the lib (re-keyed to the sim's layer name), so the lib loads it
+as in the framework. With the output window on and no grids the run stops
+with a clear message. Make the values offline with `gen_hw_grids.py`.
+
+`conv_prelu` / `conv_relu` / `conv_prelu_negb`: conv + PReLU (per-channel
+slope) in an `nn.Sequential`, so the lib folds the activation into the PCU
+(PLA, `pla_bias: "bins"`). ALG taps add `e_layer_min e_qa_out pla_frac
+pla_m_pos pla_m_neg pla_bin_* win win_sat`.
+
+HW PLA (their answer): per channel, bins split by boundaries on the
+accumulator word, each with an int8 scale S_k and bias B_k: `S_k * acc + B_k`
+→ `pcu_div` (round half up) → `relux`. PReLU = 2 bins at `acc = -b`. Their
+emulator is still one bin (one `Cstruct` scale and bias). main_HW:
+- `out` / `out_raw`: their PCU as it is, one bin (the upper one).
+- `out_bins` / `hw_out_raw_bins`: **our assumption until HW emulator has
+  bins** (`main_HW.bins_pcu`): pick the bin by acc vs boundary (config tie
+  rule), then their `pcu` with that bin's S_k, B_k.
+
+main.py prints HW-ALG for both, split by bin, and the PCU alone: the lib's
+bins + window (`main_ALG.pcu_on`) on HW's own accumulator words vs the
+stand-in. `hw_vs_alg_check.py` T11 does the same on 20000 random words, the
+tie case `acc == boundary` and both bias signs.
 
 ## Config
 

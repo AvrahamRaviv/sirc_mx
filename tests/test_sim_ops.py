@@ -120,3 +120,99 @@ def test_hw_acc_width_comes_from_config():
     xa = dict(E4["mx_specs"]["xblock_accum"], bits=35)
     with pytest.raises(NotImplementedError, match="supports"):
         HW.hw_acc_bits({"mx_specs": dict(E4["mx_specs"], xblock_accum=xa)})
+
+
+# --- PLA: activation folded into the PCU (HW bin form) -------------------------
+
+PLA = SC.load_config("mx_config_npe_e4_pla.json")
+PLA_CASES = ("conv_prelu", "conv_relu", "conv_prelu_negb")
+
+
+@pytest.mark.parametrize("name", PLA_CASES)
+def test_pla_both_sides_use_config_bins(name):
+    """ALG (lib) and HW read the same bins from the config's hw_grids; the sim
+    never calibrates."""
+    g = PLA["hw_grids"][name]
+    a = ALG.run(C.build(name), PLA)
+    h = HW.run(C.build(name), PLA)
+    assert int(a["e_layer_min"]) == g["e_layer_min"]
+    assert int(a["e_qa_out"]) == g["e_qa_out"]
+    for k in ("pla_bin_bounds", "pla_bin_scales", "pla_bin_biases"):
+        assert a[k].tolist() == g[k] == h[k].tolist()
+    assert bool((a["win"].double() * 2.0 ** g["e_qa_out"] == a["out"].double()).all())
+
+
+def test_pla_without_grids_fails_clearly():
+    cfg = dict(PLA, hw_grids={})
+    with pytest.raises(SystemExit, match="does not calibrate"):
+        ALG.run(C.build("conv_prelu"), cfg)
+
+
+@pytest.mark.parametrize("name", PLA_CASES)
+def test_pla_pcu_alone_lib_bins_equal_hw_standin(name):
+    """The PCU alone: the lib's bins + window on HW's own accumulator words
+    equals the bins stand-in (their pcu per bin) bit for bit."""
+    case = C.build(name)
+    h = HW.run(case, PLA)
+    o, _ = ALG.pcu_on(h["hw_acc"], PLA, case, -int(h["out_scale_log2"]))
+    assert bool((o == h["hw_out_raw_bins"]).all())
+
+
+def test_pla_their_one_bin_differs_only_in_the_lower_bin():
+    """Evidence for HW: their one-bin PCU equals the stand-in in the upper bin
+    and differs in the lower bin wherever S_0 != S_1."""
+    h = HW.run(C.build("conv_prelu"), PLA)
+    low = h["hw_pla_bin"] == 0
+    d = h["out_raw"].long() != h["hw_out_raw_bins"]
+    assert not bool(d[~low].any())
+    sc = h["pla_bin_scales"]
+    other = (sc[:, 0] != sc[:, 1]).view(1, -1, 1, 1).expand_as(d)
+    assert bool(d[low & other].float().mean() > 0.9)
+    assert not bool(d[low & ~other].any())
+
+
+@pytest.mark.parametrize("b", [0.0371, -0.0371])
+@pytest.mark.parametrize("tie", ["upper", "lower"])
+def test_pla_bins_standin_bit_exact_incl_tie(b, tie):
+    """Same acc words (random + bound - 1, bound, bound + 1) into the lib's
+    bins and the stand-in: equal for both tie rules and both bias signs, on the
+    output grid and on the fine grid where the tie word differs per rule."""
+    from fixed_point.mx_fixed_point_hw import (PLAParams, pla_bins, _apply_pla,
+                                               _apply_out_window)
+    bcal, frac = 16, 6
+    for m_neg in (0, 16, 3, 64):
+        bd, sc, bi = pla_bins(torch.tensor([64]), torch.tensor([m_neg]),
+                              torch.tensor([b], dtype=torch.float64), -bcal, frac)
+        pla = PLAParams(torch.tensor([64]), torch.tensor([m_neg]), frac, "bins",
+                        bd, sc, bi, tie)
+        t = int(bd[0, 0])
+        g = torch.Generator().manual_seed(5)
+        N = torch.cat([torch.randint(-2 ** 20, 2 ** 20, (2000,), generator=g),
+                       torch.tensor([t - 1, t, t + 1])]).to(torch.int64)
+        d = {"bounds": bd.tolist(), "scales": sc.tolist(), "biases": bi.tolist(),
+             "tie": tie, "frac": frac, "lo": -2.0 ** 23, "hi": 2.0 ** 23 - 1}
+        # fine grid: only words that fit the window there (|P| < 2^22; wider
+        # words are the known 22- vs 24-bit clamp difference, not the bins)
+        small = N[(N.abs() < 2 ** 14) | (N - t).abs().le(1)]
+        for e_out, e_hw, n in ((-12, 12 - bcal, N), (-bcal - frac, frac, small)):
+            w = _apply_pla(n.view(1, 1, -1), pla)
+            a = _apply_out_window(w, -bcal - frac, e_out, 22, "nearest")[0].view(-1)
+            h, k = HW.bins_pcu(n, d, 0, e_hw)
+            assert bool((a == h).all()), (m_neg, e_out)
+        assert int(k[-2]) == (1 if tie == "upper" else 0)   # acc == bound
+
+
+def test_alg_convt_hw_path_taps():
+    """xblock_accum.convT = "hw": main_ALG taps the lib's MXConvTranspose2dHW
+    like a conv (compact input blocked along W, equivalent conv weight)."""
+    import json
+    cfg = json.loads(json.dumps(E4))
+    cfg["mx_specs"]["xblock_accum"].update(convT="hw", backend="python")
+    c = C.build("convt_k4_s2")
+    t = ALG.run(c, cfg)
+    p = c["params"]
+    ref = F.conv_transpose2d(c["x"], c["w"], None, p["stride"], p["padding"],
+                             p.get("output_padding", 0))
+    assert t["a_int"].shape == c["x"].shape          # quantized compact, not dilated
+    assert t["w_int"].shape == c["w"].transpose(0, 1).shape
+    assert "acc" in t and float((t["out"] - ref).abs().max()) < 0.05

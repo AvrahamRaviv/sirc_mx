@@ -1,0 +1,501 @@
+{
+ "_comment": "mx_config_npe_e4.json + xblock_accum ['out_window=infer', 'out_round=nearest', 'pla=infer', 'pla_bias=bins', 'pla_bin_tie=upper', 'e_layer_min=null', 'backend=python']; hw_grids from gen_hw_grids.py (lib calibrate_hw_grids, seeds 1-8, not the test seed 0)",
+ "mx_specs": {
+  "w_elem_format": "int8",
+  "a_elem_format": "int8",
+  "block_size": 32,
+  "scale_bits": 4,
+  "shared_exp_method": "max",
+  "custom_cuda": true,
+  "xblock_accum": {
+   "enabled": true,
+   "mode": "hw_fixed_point",
+   "bits": 48,
+   "sat_mode": "per_product",
+   "e_layer_min": null,
+   "weight_blockify": "flatten",
+   "act_blockify": "xblock",
+   "backend": "python",
+   "npe_triton_variant": "reuse",
+   "out_window": "infer",
+   "out_round": "nearest",
+   "pla": "infer",
+   "pla_bias": "bins",
+   "pla_bin_tie": "upper"
+  }
+ },
+ "groups": {
+  "convT_plain": {
+   "w_elem_format": "int8",
+   "a_elem_format": "int8",
+   "block_size": 32,
+   "scale_bits": 4,
+   "shared_exp_method": "max",
+   "custom_cuda": true
+  }
+ },
+ "layers": [
+  "model.block2.conv0.0.0",
+  "model.block2.conv0.1.0",
+  "model.block2.convblock.0.0",
+  "model.block2.convblock.1.0",
+  "model.block2.convblock.2.0",
+  "model.block2.convblock.3.0",
+  "model.block2.convblock.4.0",
+  "model.block2.convblock.5.0",
+  "model.block3.conv0.0.0",
+  "model.block3.conv0.1.0",
+  "model.block3.convblock.0.0",
+  "model.block3.convblock.1.0",
+  "model.block3.convblock.2.0",
+  "model.block3.convblock.3.0",
+  "model.block3.convblock.4.0",
+  "model.block3.convblock.5.0",
+  "model.block4.conv0.0.0",
+  "model.block4.conv0.1.0",
+  "model.block4.convblock.0.0",
+  "model.block4.convblock.1.0",
+  "model.block4.convblock.2.0",
+  "model.block4.convblock.3.0",
+  "model.block4.convblock.4.0",
+  "model.block4.convblock.5.0",
+  "model.feature_pyramid_extractor.convs.0.0.0",
+  "model.feature_pyramid_extractor.convs.0.1.0",
+  "model.feature_pyramid_extractor.convs.1.0.0",
+  "model.feature_pyramid_extractor.convs.1.1.0",
+  "model.feature_pyramid_extractor.convs.2.0.0",
+  "model.feature_pyramid_extractor.convs.2.1.0",
+  {
+   "name": "model.block2.conv1",
+   "group": "convT_plain"
+  },
+  {
+   "name": "model.block2.convtranspose_2",
+   "group": "convT_plain"
+  },
+  {
+   "name": "model.block3.conv1",
+   "group": "convT_plain"
+  },
+  {
+   "name": "model.block3.convtranspose_2",
+   "group": "convT_plain"
+  },
+  {
+   "name": "model.block4.conv1",
+   "group": "convT_plain"
+  },
+  {
+   "name": "model.warp",
+   "kind": "act_quant",
+   "call_sites": 3,
+   "inputs": [
+    {
+     "fxp": {
+      "total_bits": 8,
+      "signed": true,
+      "calibrate": true,
+      "pow2": false,
+      "round": "half_away",
+      "saturate": true
+     }
+    },
+    {
+     "fxp": {
+      "total_bits": 16,
+      "frac_bits": 8,
+      "signed": true,
+      "round": "half_away",
+      "saturate": true
+     }
+    }
+   ],
+   "output": {
+    "fxp": {
+     "total_bits": 8,
+     "signed": true,
+     "calibrate": true,
+     "pow2": false,
+     "round": "half_away",
+     "saturate": true
+    }
+   }
+  },
+  {
+   "name": "model",
+   "kind": "out_quant",
+   "total_bits": 16,
+   "frac_bits": 8,
+   "signed": true,
+   "round": "half_away",
+   "saturate": true,
+   "clip_grad": false
+  }
+ ],
+ "ptq": false,
+ "hw_grids": {
+  "conv_prelu": {
+   "e_layer_min": -16,
+   "e_qa_out": -19,
+   "win_bits": 22,
+   "shift_out": -3,
+   "pla_frac": 6,
+   "pla_m_pos": [
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64
+   ],
+   "pla_m_neg": [
+    0,
+    16,
+    6,
+    64,
+    32,
+    3,
+    19,
+    13
+   ],
+   "pla_bin_bounds": [
+    [
+     5369
+    ],
+    [
+     -4409
+    ],
+    [
+     1827
+    ],
+    [
+     -2984
+    ],
+    [
+     7060
+    ],
+    [
+     462
+    ],
+    [
+     -157
+    ],
+    [
+     2562
+    ]
+   ],
+   "pla_bin_scales": [
+    [
+     0,
+     64
+    ],
+    [
+     16,
+     64
+    ],
+    [
+     6,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     32,
+     64
+    ],
+    [
+     3,
+     64
+    ],
+    [
+     19,
+     64
+    ],
+    [
+     13,
+     64
+    ]
+   ],
+   "pla_bin_biases": [
+    [
+     0,
+     -343595
+    ],
+    [
+     70544,
+     282175
+    ],
+    [
+     -10962,
+     -116931
+    ],
+    [
+     190989,
+     190989
+    ],
+    [
+     -225919,
+     -451838
+    ],
+    [
+     -1387,
+     -29580
+    ],
+    [
+     2986,
+     10057
+    ],
+    [
+     -33305,
+     -163962
+    ]
+   ]
+  },
+  "conv_relu": {
+   "e_layer_min": -16,
+   "e_qa_out": -19,
+   "win_bits": 22,
+   "shift_out": -3,
+   "pla_frac": 6,
+   "pla_m_pos": [
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64
+   ],
+   "pla_m_neg": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "pla_bin_bounds": [
+    [
+     5369
+    ],
+    [
+     -4409
+    ],
+    [
+     1827
+    ],
+    [
+     -2984
+    ],
+    [
+     7060
+    ],
+    [
+     462
+    ],
+    [
+     -157
+    ],
+    [
+     2562
+    ]
+   ],
+   "pla_bin_scales": [
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ],
+    [
+     0,
+     64
+    ]
+   ],
+   "pla_bin_biases": [
+    [
+     0,
+     -343595
+    ],
+    [
+     0,
+     282175
+    ],
+    [
+     0,
+     -116931
+    ],
+    [
+     0,
+     190989
+    ],
+    [
+     0,
+     -451838
+    ],
+    [
+     0,
+     -29580
+    ],
+    [
+     0,
+     10057
+    ],
+    [
+     0,
+     -163962
+    ]
+   ]
+  },
+  "conv_prelu_negb": {
+   "e_layer_min": -16,
+   "e_qa_out": -19,
+   "win_bits": 22,
+   "shift_out": -3,
+   "pla_frac": 6,
+   "pla_m_pos": [
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64
+   ],
+   "pla_m_neg": [
+    0,
+    16,
+    6,
+    64,
+    32,
+    3,
+    19,
+    13
+   ],
+   "pla_bin_bounds": [
+    [
+     5369
+    ],
+    [
+     4409
+    ],
+    [
+     1827
+    ],
+    [
+     2984
+    ],
+    [
+     7060
+    ],
+    [
+     462
+    ],
+    [
+     157
+    ],
+    [
+     2562
+    ]
+   ],
+   "pla_bin_scales": [
+    [
+     0,
+     64
+    ],
+    [
+     16,
+     64
+    ],
+    [
+     6,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     32,
+     64
+    ],
+    [
+     3,
+     64
+    ],
+    [
+     19,
+     64
+    ],
+    [
+     13,
+     64
+    ]
+   ],
+   "pla_bin_biases": [
+    [
+     0,
+     -343595
+    ],
+    [
+     -70544,
+     -282174
+    ],
+    [
+     -10962,
+     -116931
+    ],
+    [
+     -190989,
+     -190989
+    ],
+    [
+     -225919,
+     -451838
+    ],
+    [
+     -1387,
+     -29580
+    ],
+    [
+     -2986,
+     -10057
+    ],
+    [
+     -33305,
+     -163962
+    ]
+   ]
+  }
+ }
+}

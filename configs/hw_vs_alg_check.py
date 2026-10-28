@@ -15,6 +15,9 @@ difference moved. Sections:
   T8 weight observer blocking (per_row_flatten) vs weight quantizer blocking
   T9 4-bit exponent wrap
   T10 4-bit exponent window: ALG fixed vs HW per-tensor offset
+  T11 PLA (PReLU in the PCU), the PCU stage alone: the same accumulator word
+      into ALG's PLA + window and into HW's pcu; (a) positive / identity,
+      ReLU, (b) PReLU, (c) rounding and clamp
 Both sides run mx_config_npe_e4.json (scale_bits 4, the NPE exponent width).
 """
 import math, os, sys
@@ -156,3 +159,91 @@ print(f"ALG: w_exp codes [{int(a['w_exp'].min())}..{int(a['w_exp'].max())}] (0 =
       f"w_int max {int(a['w_int'].abs().max())}  max err {float((a['out'] - r).abs().max()):.2e}")
 print(f"HW : w_cal {int(h['w_cal'])} slides the window  "
       f"w_mant max {int(h['hw_w_mant'].abs().max())}  max err {float((h['out'] - r).abs().max()):.2e}")
+
+# ---------------------------------------------------------------- T11 PLA
+# HW PLA = per-channel bins on the accumulator word (their answer to Q10):
+# out = S_k * acc + B_k -> pcu_div (round half up) -> relux. Their emulator is
+# still ONE bin; main_HW.bins_pcu is our stand-in (their pcu per bin).
+# Same int64 accumulator word N into both PCUs, so only the PCU differs:
+# ALG = the lib's pla_bins + _apply_pla + _apply_out_window.
+# Grids aligned: acc LSB 2^-16 (x_cal + w_cal = 16), output 2^-12 on both.
+from fixed_point.mx_fixed_point_hw import (PLAParams, pla_bins, _apply_pla,
+                                           _apply_out_window)
+from npe_mx_emu import Cstruct, pcu
+
+BCAL, EOUT, WIN, FRAC = 16, -12, 22, 6
+E_HW = 12 - BCAL                         # their e_min_layer sum
+
+
+def bins_of(b, m_neg, m_pos=64, tie="upper"):
+    bd, sc, bi = pla_bins(torch.tensor([m_pos]), torch.tensor([m_neg]),
+                          torch.tensor([b], dtype=torch.float64), -BCAL, FRAC)
+    return PLAParams(torch.tensor([m_pos]), torch.tensor([m_neg]), FRAC, "bins",
+                     bd, sc, bi, tie)
+
+
+def alg_bins(N, pla):
+    w = _apply_pla(N.view(1, 1, -1), pla)
+    o, sat = _apply_out_window(w, -BCAL - FRAC, EOUT, WIN, "nearest")
+    return o.view(-1)
+
+
+def hw_bins(N, pla):
+    d = {"bounds": pla.bounds.tolist(), "scales": pla.scales.tolist(),
+         "biases": pla.biases.tolist(), "tie": pla.tie, "frac": FRAC,
+         "lo": -2.0 ** 23, "hi": 2.0 ** 23 - 1}
+    return _H.bins_pcu(N, d, 0, E_HW)
+
+
+def hw_one_bin(N, pla):
+    cs = Cstruct(bias=int(pla.biases[0, -1]), scale=int(pla.scales[0, -1]), shift=-FRAC,
+                 round_type="round", min_val=-2.0 ** 23, max_val=2.0 ** 23 - 1)
+    return pcu(N, c_struct=cs, e_min_layer=E_HW).long()
+
+
+hdr("T11 PLA bins: the PCU stage alone (same acc word, acc LSB 2^-16, out 2^-12)")
+g = torch.Generator().manual_seed(11)
+N = torch.randint(-2 ** 20, 2 ** 20, (20000,), generator=g, dtype=torch.int64)
+print("N: 20000 random in [-2^20, 2^20)")
+for b in (0.0371, -0.0371):
+    for name, m_neg in (("identity", 64), ("ReLU", 0), ("PReLU 0.25", 16), ("PReLU 0.05", 3)):
+        pla = bins_of(b, m_neg)
+        a_, (h_, k) = alg_bins(N, pla), hw_bins(N, pla)
+        one = hw_one_bin(N, pla)
+        low = k == 0
+        print(f"  bias {b:+.4f} {name:10s} bound {int(pla.bounds[0, 0]):6d} S {pla.scales[0].tolist()} "
+              f"B {pla.biases[0].tolist()}: lib vs stand-in {int((a_ != h_).sum())} differ | "
+              f"vs their 1 bin {int((a_ != one).sum())} differ "
+              f"({int((a_ != one)[~low].sum())} in the upper bin)")
+
+print("(tie) acc == boundary, both tie rules - on the fine grid 2^-(16+6) (no output")
+print("      shift), where the two bins give different words; on 2^-12 both round to 0")
+def alg_fine(N, pla):
+    w = _apply_pla(N.view(1, 1, -1), pla)
+    return _apply_out_window(w, -BCAL - FRAC, -BCAL - FRAC, WIN, "nearest")[0].view(-1)
+def hw_fine(N, pla):
+    d = {"bounds": pla.bounds.tolist(), "scales": pla.scales.tolist(),
+         "biases": pla.biases.tolist(), "tie": pla.tie, "frac": FRAC,
+         "lo": -2.0 ** 23, "hi": 2.0 ** 23 - 1}
+    return _H.bins_pcu(N, d, 0, FRAC)      # their shift: -FRAC + FRAC = 0
+for b in (0.0371, -0.0371):
+    for tie in ("upper", "lower"):
+        pla = bins_of(b, 16, tie=tie)
+        t = int(pla.bounds[0, 0])
+        Nt = torch.tensor([t - 1, t, t + 1], dtype=torch.int64)
+        a_, (h_, k) = alg_fine(Nt, pla), hw_fine(Nt, pla)
+        print(f"  bias {b:+.4f} tie {tie:5s}: N = bound-1, bound, bound+1 -> bins {k.tolist()}  "
+              f"lib {a_.tolist()}  stand-in {h_.tolist()}  "
+              f"{'equal' if bool((a_ == h_).all()) else 'DIFFER'}")
+print("(c) rounding ties and clamp (identity bins, bias 0)")
+pla = bins_of(0.0, 64)
+P = torch.tensor([2, 6, 10, -2, -6, -10, 3, -3], dtype=torch.int64) * 2 ** (BCAL - 12 - 2)
+print(f"  x/4 of [2,6,10,-2,-6,-10,3,-3]: lib {alg_bins(P, pla).tolist()}  "
+      f"stand-in {hw_bins(P, pla)[0].tolist()}")
+big = torch.tensor([2 ** 22 - 1, 2 ** 22, 5_000_000, 2 ** 23, -2 ** 22, -2 ** 23 - 5],
+                   dtype=torch.int64)
+Nb = big * 2 ** (BCAL - 12)
+print(f"  out (LSB)    {big.tolist()}")
+print(f"  lib window   {alg_bins(Nb, pla).tolist()}  (+-(2^22-1))")
+print(f"  their relux  {hw_bins(Nb, pla)[0].tolist()}  ([-2^23, 2^23-1]; HW: >= 2^22 is "
+      f"unreachable by PTQ, no clamp needed)")
