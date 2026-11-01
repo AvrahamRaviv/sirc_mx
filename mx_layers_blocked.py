@@ -32,6 +32,7 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from fixed_point.mx_fixed_point import (cross_block_accumulate_from_specs, _get_xblock_cfg,
                                         overflow_raises)
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
+                                           out_window_sat_word,
                                            clamp_block_exp, floor_log2, in_exp_on,
                                            dilate_input, PLAParams, pla_bins, pla_multipliers,
                                            block_exp_range, check_block_exp,
@@ -261,7 +262,8 @@ class MXConv2dHW(MXConv2d):
         `mant_round` 'truncate' (a/w mantissas toward zero), `overflow`
         'raise' (eval: accumulator / window / exponent register / int input
         out of range raise instead of clamping; `overflow_saturate`
-        ['out_window'] keeps the window saturating, as HW), `bias_round` 'half_up',
+        ['out_window'] saturates the window to the HW value, +-127 * 2^15 for
+        int8/4b, instead), `bias_round` 'half_up',
         `in_exp_anchor` 'min' (register base at the min non-zero block, eval
         only; train stays max-anchored), `static_shift_bits` (range check of
         the PCU static shift), `in_mode` 'int' (per-tensor int8 input, the
@@ -682,6 +684,7 @@ class MXConv2dHW(MXConv2d):
             out_round=cfg.get('out_round', 'floor'),
             pla=self.pla_params(int(e_min)) if apply_pla else None,
             bias_round=cfg.get('bias_round', 'even'),
+            sat_word=out_window_sat_word(cfg, a_fmt) if apply_win else None,
         )
         if self._tap_acc:
             self._last_acc = stats.get('acc')

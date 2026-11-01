@@ -127,8 +127,8 @@ tie case `acc == boundary` and both bias signs.
 ## HW-exact (M1-M8)
 
 `--config mx_config_npe_hw_exact.json` turns on the lib's HW-exact switches
-(mantissa truncate, overflow raise with the output window saturating
-(`overflow_saturate: ["out_window"]`, HW: `+-127 * 2^15` on the output grid),
+(mantissa truncate, overflow raise with the output window saturating to the
+HW value `+-127 * 2^15` on the output grid (`overflow_saturate: ["out_window"]`),
 out_round nearest, bias half up, 4-bit register anchored at the min block,
 static shift, PLA bins). Both sides then
 run from the config's grids only:

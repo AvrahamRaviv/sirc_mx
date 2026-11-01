@@ -25,7 +25,8 @@ sys.path.insert(0, "/home/avrahamra/PycharmProjects")
 
 from fixed_point.hw_grids import check_hw_grid, load_hw_grids
 from fixed_point.mx_fixed_point import normalize_xblock_accum
-from fixed_point.mx_fixed_point_hw import (_apply_out_window, _bias_to_grid,
+from fixed_point.mx_fixed_point_hw import (_apply_out_window, _bias_to_grid, _window_params,
+                                           out_window_sat_word, window_sat_word,
                                            block_exp_range, calibrate_hw_grids,
                                            check_static_shift, clamp_block_exp,
                                            export_hw_grids, in_int_scale_from_absmax,
@@ -215,33 +216,72 @@ def test_m3_window_overflow_clamps_by_default():
 
 
 # ---------------------------------------------------------------------------
-# M3 window with overflow_saturate ['out_window']: saturates as HW (HW answer
-# 2026-11-01: above the window, mantissa all ones at SE = 15), while the
-# accumulator, the exponent register and the int input keep raising
+# M3 window with overflow_saturate ['out_window']: saturates to the HW value
+# (HW answer 2026-11-01: mantissa all ones at SE = 15, 127 * 2^15 on the
+# output grid), while the accumulator, the exponent register and the int
+# input keep raising
 # ---------------------------------------------------------------------------
-
 
 SAT = ["out_window"]
 HW_MAX = 127 * 2 ** 15            # int8 mantissa all ones at the top 4b code
 
 
+def test_window_sat_word_hand_vector():
+    assert window_sat_word("int8", 22) == HW_MAX
+    assert window_sat_word("int8", 23) == 127 * 2 ** 16
+    assert window_sat_word("int4", 22) == 7 * 2 ** 19
+    with pytest.raises(ValueError, match="narrower"):
+        window_sat_word("int8", 6)
+    assert out_window_sat_word(normalize_xblock_accum({}), "int8") is None
+    on = normalize_xblock_accum({"overflow": "raise", "overflow_saturate": SAT})
+    assert out_window_sat_word(on, "int8") == HW_MAX
+
+
+def test_window_params_sat_word():
+    # Detection stays at 2^22 - 1 (pre_hi); only the clamp value moves.
+    assert _window_params(0, 3, 22, "floor") == (3, 0, 0, 2 ** 22 - 1, 2 ** 22 - 1)
+    assert _window_params(0, 3, 22, "floor", HW_MAX) == (3, 0, 0, HW_MAX, 2 ** 22 - 1)
+    assert _window_params(5, 3, 22, "floor", HW_MAX)[3:] == (HW_MAX, (2 ** 22 - 1) >> 2)
+    for bad in (0, 2 ** 22):
+        with pytest.raises(ValueError, match="saturation word"):
+            _window_params(0, 0, 22, "floor", bad)
+    from fixed_point.mx_fixed_point_hw_triton import _window_launch_args
+    _, args, on = _window_launch_args(0, 3, 22, "nearest", 1, 1, "cpu", HW_MAX)
+    assert on == 1 and args[:5] == (3, 0, 4, HW_MAX, 2 ** 22 - 1)
+
+
+def test_apply_out_window_sat_word():
+    acc = torch.tensor([2 ** 22, 2 ** 22 - 1, HW_MAX + 1, -(2 ** 22), -(2 ** 22 - 1), 10 ** 9])
+    v, sat = _apply_out_window(acc, 0, 0, 22, sat_word=HW_MAX)
+    assert v.tolist() == [HW_MAX, 2 ** 22 - 1, HW_MAX + 1, -HW_MAX, -(2 ** 22 - 1), HW_MAX]
+    assert sat.tolist() == [True, False, False, True, False, True]
+    # Left shift 2: pre_hi = (2^22 - 1) >> 2 catches it before the shift.
+    edge = (2 ** 22 - 1) >> 2
+    v, sat = _apply_out_window(torch.tensor([edge, edge + 1, -edge - 1]), 5, 3, 22,
+                               sat_word=HW_MAX)
+    assert v.tolist() == [edge << 2, HW_MAX, -HW_MAX]
+    # out_round nearest, rshift 1: 2^23 - 1 rounds up to 2^22, past the edge.
+    v, sat = _apply_out_window(torch.tensor([2 ** 23 - 3, 2 ** 23 - 1, -(2 ** 23 + 1)]),
+                               0, 1, 22, out_round="nearest", sat_word=HW_MAX)
+    assert v.tolist() == [2 ** 22 - 1, HW_MAX, -HW_MAX]
+    assert sat.tolist() == [False, True, True]
+
+
 def test_m3_saturate_does_not_raise_and_counts():
     x = torch.ones(1, 32, 1, 1)                 # O = 2^22: one past the window
     m = _m3_model(-17, overflow_saturate=SAT)
-    out = _run(m, x).flatten().tolist()
-    assert out == [(2 ** 22 - 1) * 2.0 ** -17] * 2          # same as 'clamp'
+    assert _run(m, x).flatten().tolist() == [HW_MAX * 2.0 ** -17] * 2
     assert m.c1._win_sat_seen_life == 2                       # still counted
     assert _run(m, x, train=True).flatten().tolist() == [32.0, 32.0]
 
 
 def test_m3_saturate_left_shift_regime():
-    # e_qa_out = e_layer_min - 2: the word is shifted left by 2, pre_hi =
-    # win_hi >> 2 catches it before the shift. acc = 32 * 2^20 = 2^25.
+    # e_qa_out = e_layer_min - 2: acc = 32 * 2^20 = 2^25, shifted left by 2.
     x = torch.ones(1, 32, 1, 1)
     with pytest.raises(RuntimeError, match="22b output window"):
         _run(_m3_model(-22), x)
     out = _run(_m3_model(-22, overflow_saturate=SAT), x).flatten().tolist()
-    assert out == [(2 ** 22 - 1) * 2.0 ** -22] * 2
+    assert out == [HW_MAX * 2.0 ** -22] * 2
 
 
 def test_m3_saturate_keeps_acc_raise():
@@ -265,21 +305,16 @@ def test_m3_saturate_keeps_register_and_int_input_raise():
         _run(_m8_model(0.1, overflow="raise", overflow_saturate=SAT), x)
 
 
-def test_m3_nearest_carry_saturates():
-    # out_round nearest, rshift 1: 2^23 - 1 rounds up to 2^22, past the edge.
-    acc = torch.tensor([2 ** 23 - 3, 2 ** 23 - 1, -(2 ** 23 - 1), -(2 ** 23 + 1)])
-    v, sat = _apply_out_window(acc, 0, 1, 22, out_round="nearest")
-    assert v.tolist() == [2 ** 22 - 1, 2 ** 22 - 1, -(2 ** 22 - 1), -(2 ** 22 - 1)]
-    assert sat.tolist() == [False, True, False, True]
-
-
-# Window words at the edges, and what the next layer's MX requant must read
-# (by hand: the block exponent of 2^21..2^22-1 is 21, step 2^15; nearest
-# rounds then clamps the mantissa to 127, truncate drops the bits).
-_EDGE = [2 ** 22 + 5, 2 ** 22, 2 ** 22 - 1, HW_MAX + 1, HW_MAX, HW_MAX - 1]
+# Accumulator words at the edges (on the output grid), the window word each
+# must give, and what the next layer's MX requant must read, by hand: words
+# past 2^22 - 1 saturate to 127 * 2^15; in-range words keep their value, block
+# exponent 21, step 2^15: nearest rounds then clamps the mantissa to 127,
+# truncate drops the bits. 2^22 - 1 itself is left out: microxcaling's fp32
+# floor(log2) reads it as 2^22 at large |e_qa_out| (upstream, open question).
+_EDGE = [2 ** 22 + 5, 2 ** 22, HW_MAX + 1, HW_MAX, HW_MAX - 1]
 _EDGE = _EDGE + [-w for w in _EDGE]
-_WANT = {"nearest": [HW_MAX] * 5 + [HW_MAX],
-         "truncate": [HW_MAX] * 5 + [126 * 2 ** 15]}
+_WORD = [HW_MAX, HW_MAX, HW_MAX + 1, HW_MAX, HW_MAX - 1]
+_WANT = {"nearest": [HW_MAX] * 5, "truncate": [HW_MAX] * 4 + [126 * 2 ** 15]}
 
 
 class _Two(nn.Module):
@@ -292,12 +327,15 @@ class _Two(nn.Module):
         return self.c2(self.c1(x))
 
 
+@pytest.mark.parametrize("e_out", [-40, -30, -17, -13, 0])
 @pytest.mark.parametrize("mant_round", ["nearest", "truncate"])
-def test_m3_saturated_word_reaches_next_layer_as_hw_max(mant_round):
+def test_m3_saturated_word_reaches_next_layer_as_hw_max(mant_round, e_out):
     """Two real layers, NPE blockify, overflow 'raise' with the window
-    saturating: c1's window word (one channel = one W-block of c2) is read
-    by c2 as +-127 * 2^15 on c1's output grid for every word past it."""
-    n, e_out = len(_EDGE), -17
+    saturating: c1's window word (one channel = one W-block of c2) is read by
+    c2 as +-127 * 2^15 on c1's output grid for every word past the window,
+    at every grid (the fp32 log2 of the old +-(2^22 - 1) clamp rounds up
+    outside e_qa_out -29..-14)."""
+    n = len(_EDGE)
     net = _Two(n)
     tmp = tempfile.mkdtemp()
     xb = {"enabled": True, "mode": "hw_fixed_point", "bits": 48, "backend": "python",
@@ -307,31 +345,34 @@ def test_m3_saturated_word_reaches_next_layer_as_hw_max(mant_round):
     cfg = {"mx_specs": {"w_elem_format": "int8", "a_elem_format": "int8",
                         "block_size": 32, "custom_cuda": False, "xblock_accum": xb},
            "layers": ["c1", "c2"], "ptq": False, "measure_error": False,
-           "hw_grids": {"c1": {"e_layer_min": -20, "e_qa_out": e_out},
-                        "c2": {"e_layer_min": -20, "e_qa_out": -10}}}
+           "hw_grids": {"c1": {"e_layer_min": e_out - 3, "e_qa_out": e_out},
+                        "c2": {"e_layer_min": e_out - 3, "e_qa_out": e_out + 3}}}
     with open(os.path.join(tmp, "mx_config.json"), "w") as f:
         json.dump(cfg, f)
     m = MXQuantizer(save_dir=tmp).quant(net)
-    # c1: word_o = sign_o * 31.5 * 2^17 + bias_o * 2^17 = _EDGE[o], exactly
-    # (31.5 is on the input's MX grid; the bias is a multiple of 2^-17).
+    # c1: word_o = (sign_o * 31.5 * 2^17 + bias_o * 2^-e_out) = _EDGE[o], exact:
+    # x = 31.5 * 2^(e_out + 17) is on the input's MX grid, the bias a multiple
+    # of 2^e_out on the accumulator grid 2^(e_out - 3).
+    sign = [1.0 if v > 0 else -1.0 for v in _EDGE]
     w = torch.zeros(n, 32, 1, 1)
-    sign = torch.tensor([1.0 if v > 0 else -1.0 for v in _EDGE])
-    w[:, 0, 0, 0] = sign
-    b = torch.tensor([(v - s * 31.5 * 2 ** 17) * 2.0 ** -17 for v, s in zip(_EDGE, sign.tolist())])
+    w[:, 0, 0, 0] = torch.tensor(sign)
+    b = torch.tensor([(v - s * 31.5 * 2 ** 17) * 2.0 ** e_out for v, s in zip(_EDGE, sign)],
+                     dtype=torch.float64)
     with torch.no_grad():
         m.c1.weight.copy_(w)
         m.c1.bias.copy_(b)
         m.c2.weight.fill_(1.0)
+    assert torch.equal(m.c1.bias.double(), b)                 # fp32 holds it exactly
     m.c1._tap_acc = m.c2._tap_acc = True
     x = torch.zeros(1, 32, 1, 1)
-    x[0, 0] = 31.5
+    x[0, 0] = 31.5 * 2.0 ** (e_out + 17)
     _run(m, x)
-    words = m.c1._last_win.flatten().tolist()
-    assert words == [max(-(2 ** 22 - 1), min(2 ** 22 - 1, v)) for v in _EDGE]
+    assert m.c1._last_win.flatten().tolist() == _WORD + [-v for v in _WORD]
     assert m.c1._win_sat_seen_life == 4                       # +-2^22, +-(2^22 + 5)
-    got = (m.c2._last_qi.flatten() * 2.0 ** -e_out).tolist()
+    got = (m.c2._last_qi.flatten().double() * 2.0 ** -e_out).tolist()
     want = _WANT[mant_round]
     assert got == want + [-v for v in want]                   # symmetric
+
 
 # ---------------------------------------------------------------------------
 # M4 output rounding: round half up, ties toward +inf (Q4)
@@ -628,16 +669,18 @@ def test_config_defaults_and_validation():
             d["static_shift_bits"], d["in_mode"], d["in_int_scale"]) == \
         ("nearest", "clamp", "even", "max", None, "mx", "free")
     assert d["overflow_saturate"] == ()
-    assert normalize_xblock_accum({"overflow_saturate": ["out_window"]})[
+    assert normalize_xblock_accum({"overflow": "raise", "overflow_saturate": ["out_window"]})[
         "overflow_saturate"] == ("out_window",)
     for bad in [{"mant_round": "floor"}, {"overflow": "wrap"}, {"bias_round": "up"},
                 {"in_exp_anchor": "mid"}, {"static_shift_bits": 1},
                 {"static_shift_bits": True}, {"in_mode": "fp"},
-                {"in_int_scale": "pow2"}, {"overflow_saturate": "out_window"},
-                {"overflow_saturate": ["acc"]}, {"overflow_saturate": None},
-                {"overflow_saturate": ["out_window", "out_window"]}]:
+                {"in_int_scale": "pow2"},
+                {"overflow_saturate": ["out_window"]}]:      # needs overflow 'raise'
         with pytest.raises(ValueError):
             normalize_xblock_accum(bad)
+    for bad in ["out_window", ["acc"], None, ["out_window", "out_window"]]:
+        with pytest.raises(ValueError, match="overflow_saturate must"):
+            normalize_xblock_accum({"overflow": "raise", "overflow_saturate": bad})
 
 
 def _config_specs():

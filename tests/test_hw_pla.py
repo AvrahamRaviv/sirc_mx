@@ -282,8 +282,8 @@ def test_bins_int_reference_and_vs_pre(convT, out_round, act):
 @pytest.mark.parametrize("bias_order", ["bins", "pre"])
 def test_window_saturation_with_pla(bias_order):
     """overflow 'raise' + overflow_saturate ['out_window'] with PLA on: the
-    window on P saturates exactly as 'clamp' and is counted; 'raise' alone
-    raises on the same words."""
+    window on P saturates where 'clamp' does, to the HW value +-127 * 2^15
+    instead of +-(2^22 - 1), and is counted; 'raise' alone raises."""
     x = _data(1, seed=3)[0]
     runs = {"clamp": {}, "raise": {"overflow": "raise"},
             "sat": {"overflow": "raise", "overflow_saturate": ["out_window"]}}
@@ -295,12 +295,13 @@ def test_window_saturation_with_pla(bias_order):
             with pytest.raises(RuntimeError, match="output window"):
                 _run(seq, x)
             continue
-        y, _, win = _run(seq, x)
+        _, _, win = _run(seq, x)
         assert seq[0]._pla_last
-        out[name] = (y, win, seq[0]._win_sat_seen_life)
-    assert out["sat"][2] > 0 and out["sat"][2] == out["clamp"][2]
-    assert int((out["sat"][1].abs() == 2 ** WIN - 1).sum()) == out["sat"][2]
-    assert torch.equal(out["sat"][0], out["clamp"][0])
+        out[name] = (win, seq[0]._last_win_sat, seq[0]._win_sat_seen_life)
+    (w_c, s_c, n_c), (w_s, s_s, n_s) = out["clamp"], out["sat"]
+    assert n_s > 0 and n_s == n_c and torch.equal(s_s, s_c)
+    want = torch.where(s_c, torch.sign(w_c) * 127 * 2 ** 15, w_c)
+    assert torch.equal(w_s, want)
 
 
 def test_act_passes_pla_output_through_and_train_mode_unchanged():

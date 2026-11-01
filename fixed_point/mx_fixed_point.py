@@ -206,11 +206,10 @@ XBLOCK_ACCUM_DEFAULTS = {
     "overflow": "clamp",          # accumulator / output window / exponent register /
                                   # int input out of range: 'clamp' or 'raise' (eval
                                   # only; a PTQ contract violation). Train always clamps
-    "overflow_saturate": (),      # with overflow 'raise': the parts that saturate
-                                  # instead of raising, as HW does. 'out_window':
-                                  # window word to +-(2^win_bits - 1), which the next
-                                  # MX requant reads as +-max_int at the top
-                                  # exponent code (int8/4b: +-127 * 2^15)
+    "overflow_saturate": (),      # needs overflow 'raise': the parts that saturate
+                                  # to the HW value instead of raising. 'out_window':
+                                  # window word to +-max_int at the top output exponent
+                                  # code (int8/4b: +-127 * 2^15), eval and train
     "bias_round": "even",         # bias onto the acc grid: 'even' (round half to
                                   # even) or 'half_up' (floor(v + 0.5), the HW)
     "in_exp_anchor": "max",       # in_exp register base: 'max' (max block exp -
@@ -412,6 +411,9 @@ def normalize_xblock_accum(value):
                 raise ValueError(f"xblock_accum.{key} must be in {valid}, "
                                  f"got {cfg[key]!r}")
         cfg["overflow_saturate"] = _overflow_saturate(cfg["overflow_saturate"])
+        if cfg["overflow_saturate"] and cfg["overflow"] != "raise":
+            raise ValueError("xblock_accum.overflow_saturate needs overflow 'raise' "
+                             "(with 'clamp' nothing raises)")
         ssb = cfg["static_shift_bits"]
         if ssb is not None and (isinstance(ssb, bool) or not isinstance(ssb, int)
                                 or not 2 <= ssb <= 16):

@@ -28,10 +28,13 @@ O * 2^e_qa_out. `win_bits` is what one output MX block can address:
 22 for int8 with a 4b shared exponent (23 with sign). Without a window the
 word is just cast to fp32 (dynamic, top-aligned ~24 bits). The next layer's MX requant then uses a full-res
 shared exponent; HW stores it in 4 bits, which decodes to the same lattice
-in range. A saturated word +-(2^win_bits - 1) requants (nearest or truncate)
-to +-max_int at the top exponent code, +-127 * 2^15 on the output grid for
-int8/4b: the value HW saturates to (HW answer 2026-11-01). With overflow
-'raise', `overflow_saturate` ['out_window'] keeps that saturation in eval.
+in range. `overflow_saturate` ['out_window'] (with overflow 'raise') clamps a
+saturated word to the HW value instead, the output block's max: mantissa all
+ones at the top exponent code, +-127 * 2^15 for int8/4b (`window_sat_word`,
+HW answer 2026-11-01). It is exact on the output grid for any e_qa_out. The
+default +-(2^win_bits - 1) does not always requant to it: the next MX
+requant takes floor(log2) in fp32, which reads it as 2^22 * 2^e_qa_out
+outside e_qa_out -29..-14 (int8, 22 bits, measured).
 TODO: model the 4b output exponent clamp (saturate/reset tails).
 
 PLA (xblock_accum.pla, default off): the PCU's per-channel multiply between
@@ -227,7 +230,27 @@ def resolve_out_window_bits(cfg, fmt):
     return int(wb)
 
 
-def _window_params(e_acc, e_qa_out, win_bits, out_round):
+def window_sat_word(fmt, win_bits):
+    """The HW saturation word of the output window: the largest value one
+    output MX block holds, mantissa all ones at the top exponent code,
+    max_int * 2^(win_bits - (mbits - 1)). int8, 22 bits: 127 * 2^15."""
+    mbits, _, max_val, _ = _int_format_params(fmt)
+    sh = int(win_bits) - (mbits - 1)
+    if sh < 0:
+        raise ValueError(f"output window of {win_bits} bits is narrower than "
+                         f"the {fmt} mantissa ({mbits - 1} bits)")
+    return max_val << sh
+
+
+def out_window_sat_word(cfg, fmt):
+    """`window_sat_word` when `xblock_accum.overflow_saturate` lists
+    'out_window', else None (the window keeps +-(2^win_bits - 1))."""
+    if "out_window" not in cfg.get("overflow_saturate", ()):
+        return None
+    return window_sat_word(fmt, resolve_out_window_bits(cfg, fmt))
+
+
+def _window_params(e_acc, e_qa_out, win_bits, out_round, sat_word=None):
     """Integer constants of the static output window, shared by the torch ref
     and the triton launchers.
 
@@ -235,7 +258,9 @@ def _window_params(e_acc, e_qa_out, win_bits, out_round):
     the window (`round_add` turns floor into round-half-up). Negative: left
     shift, the accumulator holds fewer than `win_bits` significant bits.
     `pre_hi` is the largest |value| that survives the left shift unsaturated,
-    so saturation is detected before the shift can overflow.
+    so saturation is detected before the shift can overflow. `win_hi` is the
+    |word| a saturated value is clamped to: `sat_word` (`window_sat_word`,
+    the HW value) or, None, 2^win_bits - 1.
     """
     if win_bits is None:
         raise ValueError("output window needs win_bits; see derive_out_window_bits")
@@ -243,20 +268,28 @@ def _window_params(e_acc, e_qa_out, win_bits, out_round):
     rshift = max(s, 0)
     lshift = max(-s, 0)
     round_add = (1 << (rshift - 1)) if (out_round == "nearest" and rshift > 0) else 0
-    win_hi = (1 << int(win_bits)) - 1
-    pre_hi = win_hi >> lshift
+    top = (1 << int(win_bits)) - 1
+    pre_hi = top >> lshift
+    if sat_word is None:
+        win_hi = top
+    elif not 0 < int(sat_word) <= top:
+        raise ValueError(f"saturation word {sat_word} outside the {win_bits}b window")
+    else:
+        win_hi = int(sat_word)
     return rshift, lshift, round_add, win_hi, pre_hi
 
 
-def _apply_out_window(acc, e_acc, e_qa_out, win_bits, out_round="floor"):
-    """O = acc >> (e_qa_out - e_acc), saturated to +-(2^win_bits - 1).
+def _apply_out_window(acc, e_acc, e_qa_out, win_bits, out_round="floor",
+                      sat_word=None):
+    """O = acc >> (e_qa_out - e_acc); |O| > 2^win_bits - 1 saturates to
+    +-(2^win_bits - 1), or +-sat_word when given (see `_window_params`).
 
     acc : int64 tensor on the grid 2^e_acc. Returns (O int64 on the grid
     2^e_qa_out, saturation mask). O * 2^e_qa_out is exact in fp32 for
     win_bits <= 24.
     """
     rshift, lshift, round_add, win_hi, pre_hi = _window_params(
-        e_acc, e_qa_out, win_bits, out_round)
+        e_acc, e_qa_out, win_bits, out_round, sat_word)
     v = (acc + round_add) >> rshift
     over = v > pre_hi
     under = v < -pre_hi
@@ -556,7 +589,7 @@ def _hw_fxp_conv2d_ref(
     mant_bias=MANTISSA_BIAS,
     return_acc=False,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None, bias_round="even",
+    pla=None, bias_round="even", sat_word=None,
 ):
     """Pure-torch reference for the HW fixed-point conv2d kernel.
 
@@ -671,7 +704,8 @@ def _hw_fxp_conv2d_ref(
         word, e_word = acc, e_min
         if pla is not None:
             word, e_word = _apply_pla(acc, pla, bias_post), e_min - int(pla.frac)
-        O_win, win_sat = _apply_out_window(word, e_word, e_qa_out, win_bits, out_round)
+        O_win, win_sat = _apply_out_window(word, e_word, e_qa_out, win_bits, out_round,
+                                           sat_word)
         out = O_win.to(torch.float32) * float(2.0 ** int(e_qa_out))
         if win_sink is not None:
             win_sink["win_sat"] = win_sat
@@ -689,7 +723,7 @@ def _hw_fxp_conv2d_ref_npe(
     bits, sat_mode,
     bias_fp=None, mant_bias=MANTISSA_BIAS, return_acc=False,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None, bias_round="even",
+    pla=None, bias_round="even", sat_word=None,
 ):
     """NPE reference: the two operands carry independent, full-resolution
     per-element shared exponents (weight = flatten-block, act = X-block). This
@@ -712,7 +746,7 @@ def _hw_fxp_conv2d_ref_npe(
         bs=1, bits=bits, sat_mode=sat_mode,
         bias_fp=bias_fp, mant_bias=mant_bias, return_acc=return_acc,
         e_qa_out=e_qa_out, win_bits=win_bits, out_round=out_round,
-        win_sink=win_sink, pla=pla, bias_round=bias_round,
+        win_sink=win_sink, pla=pla, bias_round=bias_round, sat_word=sat_word,
     )
 
 
@@ -747,7 +781,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
         npe_triton_variant='reuse',
         e_qa_out=None, win_bits=None, out_round='floor',
         in_dil=(1, 1), in_extra=(0, 0),
-        pla=None, bias_round='even',
+        pla=None, bias_round='even', sat_word=None,
     ):
         _, mant_bias, _, _ = _int_format_params(fmt)
         win_sink = {} if e_qa_out is not None else None
@@ -756,6 +790,7 @@ class HWFxpConv2dFn(torch.autograd.Function):
             win_bits=None if win_bits is None else int(win_bits),
             out_round=str(out_round), win_sink=win_sink, pla=pla,
             bias_round=str(bias_round),
+            sat_word=None if sat_word is None else int(sat_word),
         )
         npe = (act_blockify == "xblock" and weight_blockify == "flatten")
         # A caller that taps the integer accumulator sets `want_acc` in the
@@ -907,17 +942,18 @@ class HWFxpConv2dFn(torch.autograd.Function):
         )
         grad_bias = grad_out.sum(dim=(0, 2, 3)) if ctx.has_bias else None
 
-        # forward took 24 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
+        # forward took 25 args: qi_fp, qw_fp, bias_fp, e_layer_min, bs, bits,
         # sat_mode, ste_mask, stride, padding, dilation, backend, stats_sink,
         # fmt, act_blockify, weight_blockify, npe_triton_variant,
-        # e_qa_out, win_bits, out_round, in_dil, in_extra, pla, bias_round
+        # e_qa_out, win_bits, out_round, in_dil, in_extra, pla, bias_round,
+        # sat_word
         return (
             grad_qi, grad_qw, grad_bias,
             None, None, None, None, None,
             None, None, None, None, None, None,
             None, None, None,
             None, None, None,
-            None, None, None, None,
+            None, None, None, None, None,
         )
 
 
@@ -932,7 +968,7 @@ def hw_fxp_conv2d(
     e_qa_out=None, win_bits=None, out_round='floor',
     out_exp_bits=OUT_EXP_BITS,
     in_dil=1, in_extra=0,
-    pla=None, bias_round='even',
+    pla=None, bias_round='even', sat_word=None,
 ):
     """Public entry point; see `HWFxpConv2dFn.forward` for semantics.
 
@@ -954,7 +990,9 @@ def hw_fxp_conv2d(
     `pla` (`PLAParams`, None = off) runs the PCU multiply before the window
     (forward only, needs `e_qa_out`); the caller applies the float activation
     to the gradient path itself. `bias_round` 'even' (default) | 'half_up'
-    (floor(v + 0.5), the HW's offline bias rounding).
+    (floor(v + 0.5), the HW's offline bias rounding). `sat_word` (None =
+    2^win_bits - 1) is the |word| a saturated window value clamps to
+    (`window_sat_word`, the HW value).
     """
     if pla is not None and e_qa_out is None:
         raise ValueError("hw_fxp_conv2d: pla needs the output window (e_qa_out)")
@@ -989,6 +1027,7 @@ def hw_fxp_conv2d(
         None if win_bits is None else int(win_bits), str(out_round),
         _pair(in_dil), _pair(in_extra),
         pla, str(bias_round),
+        None if sat_word is None else int(sat_word),
     )
 
 

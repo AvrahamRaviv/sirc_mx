@@ -353,11 +353,13 @@ HW-exact switches (all off by default, match the NPE emulator):
 (hw_grids `static_shift = -(e_qa_out + 12)`), `in_mode: "int"` (first layer,
 hw_grids `in_scale`). `configs/mx_config_dof_run_hw_exact.json` turns them all
 on. `overflow: "raise"` raises in eval on an accumulator, window, exponent
-register or int input overflow; `overflow_saturate: ["out_window"]` (on in the
-HW-exact configs) keeps the window saturating instead, as HW does: the word
-clips to `+-(2^22 - 1)`, which the next layer's MX requant reads as
-`+-127 * 2^15` on the output grid (mantissa all ones at the top 4b code), in
-both `mant_round` modes. The accumulator keeps raising (HW wraps it). `mant_round: "truncate"` is what HW silicon does today (Q1); it costs ~10 dB
+register or int input overflow. `overflow_saturate: ["out_window"]` (needs
+`overflow: "raise"`; on in the HW-exact configs) saturates the window instead,
+to the HW value: mantissa all ones at the top 4b code, `+-127 * 2^15` on the
+output grid, at any `e_qa_out`. The default clamp `+-(2^22 - 1)` reads the
+same after the next MX requant only for `e_qa_out` in -29..-14 (fp32 log2 in
+microxcaling). The accumulator keeps raising (HW wraps it).
+`mant_round: "truncate"` is what HW silicon does today (Q1); it costs ~10 dB
 on a 4-layer DOF-shaped net and is under discussion with HW, so the default
 stays `"nearest"`.
 

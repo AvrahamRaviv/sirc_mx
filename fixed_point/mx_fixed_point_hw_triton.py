@@ -314,13 +314,14 @@ if _TRITON_AVAILABLE:
         tl.store(sat_ptr + out_off, sat.to(tl.int8), mask=mask_m)
 
 
-def _window_launch_args(e_layer_min, e_qa_out, win_bits, out_round, M, O, device):
+def _window_launch_args(e_layer_min, e_qa_out, win_bits, out_round, M, O, device,
+                        sat_word=None):
     """(win_sat buffer, scalar args, APPLY_WIN) for a kernel launch."""
     from .mx_fixed_point_hw import _window_params
     if e_qa_out is None:
         return torch.empty(1, dtype=torch.int8, device=device), (0, 0, 0, 0, 0, 1.0), 0
     rshift, lshift, round_add, win_hi, pre_hi = _window_params(
-        e_layer_min, e_qa_out, win_bits, out_round)
+        e_layer_min, e_qa_out, win_bits, out_round, sat_word)
     win_sat = torch.zeros((M, O), dtype=torch.int8, device=device)
     return win_sat, (rshift, lshift, round_add, win_hi, pre_hi,
                      float(2.0 ** int(e_qa_out))), 1
@@ -419,7 +420,7 @@ def _hw_fxp_conv2d_triton(
     bias_fp=None,
     mant_bias=6,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None, bias_round="even",
+    pla=None, bias_round="even", sat_word=None,
 ):
     _require_triton_cuda()
     if not qi_i8.is_cuda:
@@ -451,7 +452,7 @@ def _hw_fxp_conv2d_triton(
         _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device, bias_round)
 
     win_sat, win_args, apply_win = _window_launch_args(
-        e_win, e_qa_out, win_bits, out_round, M, O, device)
+        e_win, e_qa_out, win_bits, out_round, M, O, device, sat_word)
 
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
@@ -532,7 +533,7 @@ def _hw_fxp_conv2d_triton_npe(
     mant_bias=6,
     BS=32,
     e_qa_out=None, win_bits=None, out_round="floor", win_sink=None,
-    pla=None, bias_round="even",
+    pla=None, bias_round="even", sat_word=None,
 ):
     """Dedicated NPE triton path (per-lane exponents, BS-tiled). Bit-identical
     to the torch ref and the bs=1 reuse path; here for cross-verification.
@@ -568,7 +569,7 @@ def _hw_fxp_conv2d_triton_npe(
         _bias_pla_launch_args(bias_fp, pla, e_layer_min, O, device, bias_round)
 
     win_sat, win_args, apply_win = _window_launch_args(
-        e_win, e_qa_out, win_bits, out_round, M, O, device)
+        e_win, e_qa_out, win_bits, out_round, M, O, device, sat_word)
 
     BLOCK_M = 64
     grid = ((M + BLOCK_M - 1) // BLOCK_M, O)
