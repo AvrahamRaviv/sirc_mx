@@ -28,7 +28,11 @@ O * 2^e_qa_out. `win_bits` is what one output MX block can address:
 22 for int8 with a 4b shared exponent (23 with sign). Without a window the
 word is just cast to fp32 (dynamic, top-aligned ~24 bits). The next layer's MX requant then uses a full-res
 shared exponent; HW stores it in 4 bits, which decodes to the same lattice
-in range. TODO: model the 4b output exponent clamp (saturate/reset tails).
+in range. A saturated word +-(2^win_bits - 1) requants (nearest or truncate)
+to +-max_int at the top exponent code, +-127 * 2^15 on the output grid for
+int8/4b: the value HW saturates to (HW answer 2026-11-01). With overflow
+'raise', `overflow_saturate` ['out_window'] keeps that saturation in eval.
+TODO: model the 4b output exponent clamp (saturate/reset tails).
 
 PLA (xblock_accum.pla, default off): the PCU's per-channel multiply between
 the accumulator and the window folds the activation that follows the conv

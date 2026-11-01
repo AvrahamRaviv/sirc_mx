@@ -29,7 +29,8 @@ from microxcaling.mx.convolution import Conv2d as MXConv2d
 from microxcaling.mx.mx_ops import quantize_mx_op as _quantize_mx_op_raw
 from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 
-from fixed_point.mx_fixed_point import cross_block_accumulate_from_specs, _get_xblock_cfg
+from fixed_point.mx_fixed_point import (cross_block_accumulate_from_specs, _get_xblock_cfg,
+                                        overflow_raises)
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
                                            clamp_block_exp, floor_log2, in_exp_on,
                                            dilate_input, PLAParams, pla_bins, pla_multipliers,
@@ -259,7 +260,8 @@ class MXConv2dHW(MXConv2d):
       - HW-exact switches, all off by default (`xblock_accum`):
         `mant_round` 'truncate' (a/w mantissas toward zero), `overflow`
         'raise' (eval: accumulator / window / exponent register / int input
-        out of range raise instead of clamping), `bias_round` 'half_up',
+        out of range raise instead of clamping; `overflow_saturate`
+        ['out_window'] keeps the window saturating, as HW), `bias_round` 'half_up',
         `in_exp_anchor` 'min' (register base at the min non-zero block, eval
         only; train stays max-anchored), `static_shift_bits` (range check of
         the PCU static shift), `in_mode` 'int' (per-tensor int8 input, the
@@ -468,6 +470,7 @@ class MXConv2dHW(MXConv2d):
         name = self._mx_layer_name or f"conv-{id(self):x}"
         hw_eval = not self.training
         raise_over = cfg_early.get('overflow', 'clamp') == 'raise' and hw_eval
+        raise_win = overflow_raises(cfg_early, 'out_window') and hw_eval
         int_in = cfg_early.get('in_mode', 'mx') == 'int'
         if int_in:
             obs = getattr(self, '_in_scale_obs', None)
@@ -693,13 +696,13 @@ class MXConv2dHW(MXConv2d):
                 f"MXConv2dHW {name}: {sat_count}/{total} outputs overflowed the "
                 f"{cfg['bits']}b accumulator (e_layer_min={int(e_min)}). HW wraps "
                 f"(PTQ contract violation, xblock_accum.overflow 'raise').")
-        if raise_over and stats.get('win_sat_count', 0):
+        if raise_win and stats.get('win_sat_count', 0):
             raise RuntimeError(
                 f"MXConv2dHW {name}: {int(stats['win_sat_count'])}/{total} outputs "
                 f"outside the {resolve_out_window_bits(cfg, a_fmt)}b output window "
-                f"(e_qa_out={e_qa_out}): |value| >= 2^win_bits is impossible in HW "
-                f"(PTQ contract violation, xblock_accum.overflow 'raise'). "
-                f"Recalibrate or raise out_margin_bits.")
+                f"(e_qa_out={e_qa_out}, xblock_accum.overflow 'raise'). Recalibrate, "
+                f"raise out_margin_bits, or set overflow_saturate [\"out_window\"] "
+                f"(HW saturates the window).")
         self._fwd_count += 1
         self._sat_total_life += total
         self._sat_seen_life += sat_count

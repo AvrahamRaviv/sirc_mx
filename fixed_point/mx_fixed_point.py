@@ -17,6 +17,7 @@ _VALID_PLA_BIAS = ("bins", "pre", "post")
 _VALID_PLA_TIE = ("upper", "lower")
 _VALID_MANT_ROUND = ("nearest", "truncate")
 _VALID_OVERFLOW = ("clamp", "raise")
+_VALID_OVERFLOW_SATURATE = ("out_window",)
 _VALID_BIAS_ROUND = ("even", "half_up")
 _VALID_IN_EXP_ANCHOR = ("max", "min")
 _VALID_IN_MODE = ("mx", "int")
@@ -202,9 +203,14 @@ XBLOCK_ACCUM_DEFAULTS = {
     # HW-exact switches (hw_fixed_point only; defaults keep the ALG behaviour).
     "mant_round": "nearest",      # a/w MX mantissas: 'nearest' (microxcaling) or
                                   # 'truncate' (toward zero, the HW block-mode emit)
-    "overflow": "clamp",          # accumulator / output window out of range: 'clamp'
-                                  # or 'raise' (eval only; HW wraps, a PTQ contract
-                                  # violation). Train always clamps
+    "overflow": "clamp",          # accumulator / output window / exponent register /
+                                  # int input out of range: 'clamp' or 'raise' (eval
+                                  # only; a PTQ contract violation). Train always clamps
+    "overflow_saturate": (),      # with overflow 'raise': the parts that saturate
+                                  # instead of raising, as HW does. 'out_window':
+                                  # window word to +-(2^win_bits - 1), which the next
+                                  # MX requant reads as +-max_int at the top
+                                  # exponent code (int8/4b: +-127 * 2^15)
     "bias_round": "even",         # bias onto the acc grid: 'even' (round half to
                                   # even) or 'half_up' (floor(v + 0.5), the HW)
     "in_exp_anchor": "max",       # in_exp register base: 'max' (max block exp -
@@ -405,6 +411,7 @@ def normalize_xblock_accum(value):
             if cfg[key] not in valid:
                 raise ValueError(f"xblock_accum.{key} must be in {valid}, "
                                  f"got {cfg[key]!r}")
+        cfg["overflow_saturate"] = _overflow_saturate(cfg["overflow_saturate"])
         ssb = cfg["static_shift_bits"]
         if ssb is not None and (isinstance(ssb, bool) or not isinstance(ssb, int)
                                 or not 2 <= ssb <= 16):
@@ -419,6 +426,27 @@ def normalize_xblock_accum(value):
                 f"('channel','channel') [default] or ('xblock','flatten') [NPE]"
             )
     return cfg
+
+
+def _overflow_saturate(value):
+    """`xblock_accum.overflow_saturate` as a tuple of unique part names from
+    `_VALID_OVERFLOW_SATURATE` (a JSON list or a tuple)."""
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"xblock_accum.overflow_saturate must be a list of "
+                         f"{_VALID_OVERFLOW_SATURATE}, got {value!r}")
+    bad = [v for v in value if v not in _VALID_OVERFLOW_SATURATE]
+    if bad or len(set(value)) != len(value):
+        raise ValueError(f"xblock_accum.overflow_saturate must list unique parts "
+                         f"of {_VALID_OVERFLOW_SATURATE}, got {value!r}")
+    return tuple(value)
+
+
+def overflow_raises(cfg, part):
+    """True when an out-of-range value in `part` raises in eval: overflow
+    'raise' and `part` not in overflow_saturate. The caller adds the eval-only
+    condition; train always clamps."""
+    return (cfg.get("overflow", "clamp") == "raise"
+            and part not in cfg.get("overflow_saturate", ()))
 
 
 def _get_xblock_cfg(mx_specs):

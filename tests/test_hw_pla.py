@@ -279,6 +279,30 @@ def test_bins_int_reference_and_vs_pre(convT, out_round, act):
 # Layer behaviour
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("bias_order", ["bins", "pre"])
+def test_window_saturation_with_pla(bias_order):
+    """overflow 'raise' + overflow_saturate ['out_window'] with PLA on: the
+    window on P saturates exactly as 'clamp' and is counted; 'raise' alone
+    raises on the same words."""
+    x = _data(1, seed=3)[0]
+    runs = {"clamp": {}, "raise": {"overflow": "raise"},
+            "sat": {"overflow": "raise", "overflow_saturate": ["out_window"]}}
+    out = {}
+    for name, kw in runs.items():
+        seq = _block(_prelu(), pla_bias=bias_order, **kw)
+        seq[0].e_qa_out -= 4                    # calibrated grid fits; 4 bits short
+        if name == "raise":
+            with pytest.raises(RuntimeError, match="output window"):
+                _run(seq, x)
+            continue
+        y, _, win = _run(seq, x)
+        assert seq[0]._pla_last
+        out[name] = (y, win, seq[0]._win_sat_seen_life)
+    assert out["sat"][2] > 0 and out["sat"][2] == out["clamp"][2]
+    assert int((out["sat"][1].abs() == 2 ** WIN - 1).sum()) == out["sat"][2]
+    assert torch.equal(out["sat"][0], out["clamp"][0])
+
+
 def test_act_passes_pla_output_through_and_train_mode_unchanged():
     seq = _block(_prelu())
     conv, act = seq
