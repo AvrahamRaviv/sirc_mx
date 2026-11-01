@@ -236,10 +236,11 @@ def conv(case, cfg, taps):
 def pcu_on(acc, cfg, case, e_out):
     """The lib's PCU steps (PLA bins + output window) on an accumulator word
     from anywhere - e.g. HW's own - so the PCU is compared alone. Bins, frac,
-    tie, window width and rounding from the config; output grid 2^e_out.
+    tie, window width, rounding and saturation word from the config; output
+    grid 2^e_out.
     acc: int64 [B, O, ...] on the config's e_layer_min grid."""
     from fixed_point.mx_fixed_point_hw import (PLAParams, _apply_pla,
-                                               _apply_out_window,
+                                               _apply_out_window, out_window_sat_word,
                                                resolve_out_window_bits)
     g = hw_grid(cfg, case)
     xa = cfg["mx_specs"]["xblock_accum"]
@@ -249,9 +250,11 @@ def pcu_on(acc, cfg, case, e_out):
                     xa.get("pla_bin_tie", "upper"))
     B, O = acc.shape[:2]
     word = _apply_pla(acc.reshape(B, O, -1), pla)
-    win = resolve_out_window_bits(xa, cfg["mx_specs"]["a_elem_format"])
+    fmt = cfg["mx_specs"]["a_elem_format"]
+    win = resolve_out_window_bits(xa, fmt)
     o, sat = _apply_out_window(word, int(g["e_layer_min"]) - pla.frac, e_out, win,
-                               xa.get("out_round", "floor"))
+                               xa.get("out_round", "floor"),
+                               out_window_sat_word(xa, fmt))
     return o.reshape(acc.shape), sat.reshape(acc.shape)
 
 

@@ -2,6 +2,7 @@
 integer taps explain its own output - conv acc from a_int/w_int, warp out_code
 from ref_code/grid_code."""
 
+import copy
 import os
 import sys
 
@@ -249,6 +250,26 @@ def test_hw_exact_pla_bit_exact_with_bins_standin(name):
     a, h = ALG.run(c, HWX), HW.run(c, HWX)
     assert bool((a["out"] == h["out_bins"]).all())
     assert not bool((a["out"] == h["out"]).all())     # their 1 bin: not PReLU
+
+
+@pytest.mark.parametrize("cfg_name", ["mx_config_npe_hw_exact.json",
+                                      "mx_config_npe_hw_exact_nearest.json"])
+def test_hw_exact_pcu_on_saturates_as_the_layer(cfg_name):
+    """overflow_saturate ['out_window']: the sim's lib PCU alone (pcu_on) on
+    the layer's own accumulator words gives the layer's window word, also
+    where it saturates (to +-127 * 2^15). Grid 6 bits short so it does."""
+    cfg = copy.deepcopy(SC.load_config(cfg_name))
+    case = C.build("conv_prelu")
+    g = cfg["hw_grids"]["conv_prelu"]
+    g["e_qa_out"] -= 6
+    g["static_shift"] = -(g["e_qa_out"] + 12)
+    g["shift_out"] = g["e_qa_out"] - g["e_layer_min"]
+    t = ALG.run(case, cfg)
+    sat = t["win_sat"].bool()
+    assert bool(sat.any()) and not bool(sat.all())
+    assert bool((t["win"][sat].abs() == 127 * 2 ** 15).all())
+    o, s = ALG.pcu_on(t["acc"], cfg, case, g["e_qa_out"])
+    assert torch.equal(s, sat) and torch.equal(o, t["win"])
 
 
 def test_hw_exact_first_layer():

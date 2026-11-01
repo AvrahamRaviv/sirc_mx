@@ -120,8 +120,8 @@ emulator is still one bin (one `Cstruct` scale and bias). main_HW:
   rule), then their `pcu` with that bin's S_k, B_k.
 
 main.py prints HW-ALG for both, split by bin, and the PCU alone: the lib's
-bins + window (`main_ALG.pcu_on`) on HW's own accumulator words vs the
-stand-in. `hw_vs_alg_check.py` T11 does the same on 20000 random words, the
+bins + window (`main_ALG.pcu_on`, the layer's saturation word with
+`overflow_saturate`) on HW's own accumulator words vs the stand-in. `hw_vs_alg_check.py` T11 does the same on 20000 random words, the
 tie case `acc == boundary` and both bias signs.
 
 ## HW-exact (M1-M8)
