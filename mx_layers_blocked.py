@@ -484,10 +484,7 @@ class MXConv2dHW(MXConv2d):
             if obs is not None:
                 # in_scale pre-sweep: observe the raw input, run a float conv.
                 obs[0] = max(obs[0], float(x.detach().abs().max()))
-                g = self._hw_geom()
-                return F.conv2d(dilate_input(x, g['in_dil'], g['in_extra']),
-                                self._hw_weight(), self.bias, g['stride'],
-                                g['padding'], g['dilation'])
+                return self._geometry_conv(x, self._hw_weight(), self.bias, dense=True)
             if self.in_scale is not None:
                 x = int_input(x, self.in_scale, check=raise_over, what=f"MXConv2dHW {name}")
             elif getattr(self, '_calibration_state', None) is None:
@@ -841,11 +838,12 @@ class MXConv2dHW(MXConv2d):
                                        None if bias is None else bias.float(), dense)
 
     def _geometry_conv(self, qi, qw, bias, dense=False):
-        """Conv of the MX operands on the geometry the kernel runs (the
-        convT zero-insert included, exact). `dense`: always F.conv2d (the
-        fast training path). Else calibration's reference: the
-        channel-blocked einsum when Cin splits into blocks, F.conv2d
-        otherwise. Same sum, another order."""
+        """Float conv on the geometry the kernel runs (the convT
+        zero-insert included, exact): the one owner of that geometry.
+        `dense`: always F.conv2d (the fast training path on the MX operands,
+        the in_scale pre-sweep on the raw input). Else calibration's
+        reference: the channel-blocked einsum when Cin splits into blocks,
+        F.conv2d otherwise. Same sum, another order."""
         geom = self._hw_geom()
         qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])
         if dense or qi.shape[1] % self.mx_specs['block_size'] != 0:

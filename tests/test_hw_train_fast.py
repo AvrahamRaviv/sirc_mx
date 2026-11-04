@@ -9,8 +9,11 @@ What is pinned here:
   * the gradients are the kernel's STE gradients, ste_mask included;
   * eval with 'fast' set is the kernel, bit for bit;
   * calibrate_hw_grids(force=True) in the middle of QAT works with 'fast';
-  * the fast training step reads nothing back from the device.
+  * the fast training step reads nothing back from the device;
+  * the saturation totals count each output once, on both paths;
+  * the in_mode 'int' pre-sweep is the float layer on the kernel's geometry.
 """
+import copy
 import json
 import os
 import sys
@@ -589,18 +592,62 @@ def test_fast_shared_layer_called_twice():
         assert torch.equal(model(data[0]), y_hw)
 
 
-def test_fast_int_input_layer():
-    """in_mode 'int' (the first layer): fast sees the same int8 input."""
+def _int_input_layer(net):
     groups = {"inp": {"w_elem_format": "int8", "a_elem_format": "int8",
                       "block_size": 32, "custom_cuda": False,
                       "xblock_accum": {"enabled": True, "mode": "hw_fixed_point",
                                        "bits": 48, "backend": "python",
                                        "e_layer_min": None, "out_window": "always",
-                                       "verbose": 0, "in_mode": "int", **NPE}}}
-    net = nn.Sequential(nn.Conv2d(6, 16, 3, padding=1))
-    model = _model(net=net, layers=[{"name": "0", "group": "inp"}], groups=groups)
+                                       "convT": "hw", "verbose": 0,
+                                       "in_mode": "int", **NPE}}}
+    return _model(net=net, layers=[{"name": "0", "group": "inp"}], groups=groups)
+
+
+def test_fast_int_input_layer():
+    """in_mode 'int' (the first layer): fast sees the same int8 input."""
+    model = _int_input_layer(nn.Sequential(nn.Conv2d(6, 16, 3, padding=1)))
     data = _data()
     calibrate_hw_grids(model, data, num_batches=3, verbose=0)
     (m, y_hw, y_fast, _), = _fast_vs_hw(model, data[0])
     assert m.in_scale is not None
     assert torch.equal(y_hw, y_fast)
+
+
+@pytest.mark.parametrize("path", ["hw", "fast"])
+def test_saturation_totals_count_each_output_once(path):
+    """`_sat_total_life` / `_sat_total_window` are the denominators of the
+    saturation percentages report_hw_stats and the sampled log print: one
+    forward adds the output element count, on either path."""
+    data = _data()
+    model = _model()
+    calibrate_hw_grids(model, data, num_batches=3, verbose=0)
+    _set_path(model, path)
+    model.train()
+    for m, _, o in _layer_io(model, data[0]):
+        assert m._sat_total_life == o.numel(), m._mx_layer_name
+        assert m._sat_total_window == o.numel(), m._mx_layer_name
+
+
+@pytest.mark.parametrize("make", [
+    lambda: nn.ConvTranspose2d(6, 16, 4, stride=2, padding=1, output_padding=1),
+    lambda: nn.Conv2d(6, 16, 3, stride=2, padding=2, dilation=2),
+], ids=["convT", "dilated"])
+def test_in_scale_pre_sweep_is_the_float_layer(make):
+    """While calibrate_hw_grids observes in_scale, an in_mode 'int' layer
+    returns a float conv of the raw input on the kernel's geometry (the convT
+    zero-insert and output_padding, stride, dilation): the float layer's own
+    output, up to the fp32 summation order."""
+    torch.manual_seed(7)
+    ref = make()
+    model = _int_input_layer(nn.Sequential(copy.deepcopy(ref)))
+    m, = _hw_layers(model)
+    x = _data()[0]
+    m._in_scale_obs = [0.0]
+    model.eval()
+    with torch.no_grad():
+        y = m(x)
+        y_ref = ref(x)
+    assert m._in_scale_obs == [float(x.abs().max())]
+    del m._in_scale_obs
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, atol=1e-5, rtol=1e-5)

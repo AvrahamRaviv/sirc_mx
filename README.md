@@ -361,9 +361,10 @@ accumulator range, and with `out_window: "always"` the window itself
 is the kernel's STE, `ste_mask` included, bit for bit on an fp32 model while
 no partial sum saturates (the kernel masks a lane that saturated at any
 product or at the bias add, fast only on the final sum; on a model cast to
-bf16 the input gradient differs by bf16 rounding, weight and bias gradients
-stay equal). Eval (`model.eval()`) and the sim always run the kernel, whatever
-`train_path` says.
+bf16 the input and weight gradients differ by bf16 rounding, about 1 bf16
+ulp: fast computes them in fp32 and rounds once, the kernel's STE runs them
+in bf16; bias gradients stay equal). Eval (`model.eval()`) and the sim
+always run the kernel, whatever `train_path` says.
 
 It equals the kernel while every product sits on the accumulator grid and the
 partial sums fit fp32's 24 bits (measured on CPU; on GPU cuDNN may pick an FFT
