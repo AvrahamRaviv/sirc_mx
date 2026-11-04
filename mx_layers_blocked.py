@@ -33,7 +33,7 @@ from fixed_point.mx_fixed_point import (cross_block_accumulate_from_specs, _get_
                                         overflow_raises)
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
                                            out_window_sat_word, _apply_out_window,
-                                           _bias_to_grid,
+                                           _bias_to_grid, _sat, signed_range,
                                            clamp_block_exp, floor_log2, in_exp_on,
                                            dilate_input, PLAParams, pla_bins, pla_multipliers,
                                            block_exp_range, check_block_exp,
@@ -615,8 +615,10 @@ class MXConv2dHW(MXConv2d):
                 qw = qw + (cw - qw).detach()
             else:
                 nw = 0
-            self._in_exp_cut_life[0] += na
-            self._in_exp_cut_life[1] += nw
+            # A new list: with sync=False the counts are tensors, never added
+            # to in place (see _count_sat).
+            cut_a, cut_w = self._in_exp_cut_life
+            self._in_exp_cut_life = [cut_a + na, cut_w + nw]
             if self._tap_acc:
                 self._last_qi, self._last_qw = qi.detach(), qw.detach()
 
@@ -776,8 +778,8 @@ class MXConv2dHW(MXConv2d):
         It differs from the kernel only in the sum: the range is checked on
         the final sum (the kernel saturates per product, HW wraps), a product
         below the grid is not floored, and fp32 adds in another order (exact
-        while the partial sums fit 24 bits). An MXINT8 (or narrower) operand
-        is exact in TF32 and bf16, so tensor cores change nothing else. No
+        while the partial sums fit 24 bits). The conv runs in fp32 with
+        autocast off (`_float_conv`): a bf16 sum would round to 8 bits. No
         host sync.
         Returns (out, saturated count as a 0-d tensor, total)."""
         scale = 2.0 ** e_min
@@ -787,10 +789,8 @@ class MXConv2dHW(MXConv2d):
             b_grid = _bias_to_grid(bf_bias, e_min, half_up, bf_bias.device)
             bias = bf_bias + (b_grid.to(bf_bias.dtype) * scale - bf_bias).detach()
         out = self._float_conv(qi, qw, bias, dense=True)
-        top = 1 << (int(cfg['bits']) - 1)
-        lo, hi = -top * scale, (top - 1) * scale
-        sat = (out < lo) | (out > hi)
-        clamped = out.clamp(lo, hi)
+        lo, hi = signed_range(cfg['bits'])
+        clamped, sat = _sat(out, lo * scale, hi * scale)
         if cfg['ste_mask']:
             out = torch.where(sat, clamped.detach(), out)
         else:
@@ -827,20 +827,31 @@ class MXConv2dHW(MXConv2d):
         convT zero-insert included, exact in fp32). `dense`: always F.conv2d
         (the fast training path). Else calibration's reference: the
         channel-blocked einsum when Cin splits into blocks, F.conv2d
-        otherwise. Same sum, another order."""
+        otherwise. Same sum, another order.
+
+        In fp32 with autocast off: under AMP F.conv2d would return a bf16
+        sum (8 bits), not the kernel's fp32 one. TF32 still runs it on the
+        tensor cores."""
+        with torch.autocast(qi.device.type, enabled=False):
+            qi, qw = qi.float(), qw.float()
+            bias = None if bias is None else bias.float()
+            geom = self._hw_geom()
+            qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])
+            if dense or qi.shape[1] % self.mx_specs['block_size'] != 0:
+                return F.conv2d(qi, qw, bias, geom['stride'], geom['padding'],
+                                geom['dilation'], self.groups)
+            return self._channel_blocked_conv(qi, qw, bias, geom)
+
+    def _channel_blocked_conv(self, qi, qw, bias, geom):
+        """The conv as a sum over Cin blocks of `block_size` (calibration's
+        reference order). `qi` already zero-inserted, fp32."""
         bs = self.mx_specs['block_size']
-        geom = self._hw_geom()
-        qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])
         H, W = qi.shape[-2:]
         B = qi.shape[0]
         C = qi.shape[1]
         O = qw.shape[0]
         kH, kW = qw.shape[2], qw.shape[3]
         kK = kH * kW
-
-        if dense or C % bs != 0:
-            return F.conv2d(qi, qw, bias, geom['stride'], geom['padding'],
-                            geom['dilation'], self.groups)
         nb = C // bs
 
         x_unf = F.unfold(qi, (kH, kW),

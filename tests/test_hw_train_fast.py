@@ -301,30 +301,68 @@ def test_fast_grads_ste_mask_zero_saturated_lanes():
 def test_fast_counters_never_mutate_a_saved_value():
     """The fast path counts on the device (0-d tensors). A caller that saves
     a counter and subtracts later (mx_debug) must get the step's count: a
-    counter is replaced, never added to in place."""
+    counter is replaced, never added to in place. The in_exp register cuts
+    the 2^-20 rows, so its counter counts too."""
     net = nn.Sequential(nn.Conv2d(6, 16, 3, padding=1))
-    model = _model(net=net, layers=["0"], bits=32)
-    data = _data()
+    model = _model(net=net, layers=["0"], bits=32, in_exp_bits=4, in_exp_mode="always")
+    data = _data(tiny=-20)
     calibrate_hw_grids(model, data, num_batches=3, verbose=0)
     m, = _hw_layers(model)
     model.eval()
     with torch.no_grad():
         top = floor_log2(float(model(data[0]).abs().max()))
     m.e_layer_min = top - 31          # some lanes saturate the accumulator
-    m.e_qa_out -= 3                   # and the window clips the largest outputs
+    m.e_qa_out = top - 24             # and the window clips the largest outputs
     _set_path(model, "fast")
     model.train()
-    counters = ("_sat_seen_life", "_sat_seen_window", "_win_sat_seen_life")
+    counters = {
+        "_sat_seen_life": lambda: m._sat_seen_life,
+        "_sat_seen_window": lambda: m._sat_seen_window,
+        "_win_sat_seen_life": lambda: m._win_sat_seen_life,
+        "_in_exp_cut_life[0]": lambda: m._in_exp_cut_life[0],
+    }
     with torch.no_grad():
-        start = {k: int(getattr(m, k)) for k in counters}
+        start = {k: int(get()) for k, get in counters.items()}
         model(data[0])                # from here on the counters are tensors
-        saved = {k: getattr(m, k) for k in counters}
+        saved = {k: get() for k, get in counters.items()}
         first = {k: int(v) - start[k] for k, v in saved.items()}
         model(data[0])
-    for k in counters:
+    for k, get in counters.items():
         assert first[k] > 0, k
         assert int(saved[k]) == start[k] + first[k], f"{k} added to in place"
-        assert int(getattr(m, k)) == start[k] + 2 * first[k], k
+        assert int(get()) == start[k] + 2 * first[k], k
+
+
+def test_fast_equals_kernel_under_bf16_autocast():
+    """AMP: under bf16 autocast a plain F.conv2d sums in bf16 (8 bits). The
+    fast path must still give the kernel's fp32 answer, bit for bit."""
+    torch.manual_seed(5)
+    net = nn.Sequential(nn.Conv2d(64, 16, 3, padding=1))
+    model = _model(net=net, layers=["0"])
+    data = _data(cin=64)
+    calibrate_hw_grids(model, data, num_batches=3, verbose=0)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        (m, y_hw, y_fast, _), = _fast_vs_hw(model, data[0])
+    assert y_hw.dtype == y_fast.dtype == torch.float32
+    assert torch.equal(y_hw, y_fast)
+
+
+def test_window_fake_quant_takes_the_nearest_grid_point():
+    """A float sum off the accumulator grid (a product below it, or an fp32
+    rounding) goes to its nearest grid point before the window, as the
+    word it stands for; the window's own rounding comes after."""
+    m, = _hw_layers(_model(net=nn.Sequential(nn.Conv2d(6, 16, 3)), layers=["0"]))
+    e = -10
+    k = torch.tensor([3.0, -3.0, 5.0, 0.0])
+    out = (k + torch.tensor([0.4, -0.4, 0.6, -0.6])) * 2.0 ** e
+    y = m._window_fake_quant(out, e, e, 22, "floor", None)
+    assert torch.equal(y, torch.tensor([3.0, -3.0, 6.0, -1.0]) * 2.0 ** e)
+
+
+def test_signed_range():
+    from fixed_point.mx_fixed_point_hw import signed_range
+    assert signed_range(32) == (-2 ** 31, 2 ** 31 - 1)
+    assert signed_range(8) == (-128, 127)
 
 
 # ---------------------------------------------------------------------------

@@ -507,7 +507,7 @@ def static_shift_of(e_qa_out, fmt='int8'):
 def check_static_shift(e_qa_out, bits, fmt='int8', what="layer"):
     """`static_shift_of(e_qa_out)` if it fits a signed `bits` field, else raise."""
     sh = static_shift_of(e_qa_out, fmt)
-    lo, hi = -(1 << (int(bits) - 1)), (1 << (int(bits) - 1)) - 1
+    lo, hi = signed_range(bits)
     if not lo <= sh <= hi:
         raise ValueError(
             f"{what}: e_qa_out={int(e_qa_out)} needs PCU static shift {sh}, outside "
@@ -575,6 +575,13 @@ def _undilate(t, in_dil, H, W):
     """Inverse of `dilate_input` on the last two dims (keeps the real H x W)."""
     sH, sW = _pair(in_dil)
     return t[..., :(H - 1) * sH + 1:sH, :(W - 1) * sW + 1:sW]
+
+
+def signed_range(bits):
+    """(lo, hi) of a two's-complement `bits`-wide word: the accumulator
+    range, a register field. The one place that bound is written."""
+    top = 1 << (int(bits) - 1)
+    return -top, top - 1
 
 
 def _sat(x, lo, hi):
@@ -650,8 +657,7 @@ def _hw_fxp_conv2d_ref(
     qw = qw_i8.view(O, nb, bs, kK).to(torch.int64)
     Ew64 = Ew.view(O, nb, kK).to(torch.int64)  # [O, nb, kK] (flatten kH*kW)
 
-    lo = -(1 << (bits - 1))
-    hi = (1 << (bits - 1)) - 1
+    lo, hi = signed_range(bits)
     two_bias = 2 * int(mant_bias)
     e_min = int(e_layer_min)
 

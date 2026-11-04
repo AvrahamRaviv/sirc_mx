@@ -352,24 +352,30 @@ them as given; a grids file without them still loads.
 per-product int64 loop with no tensor cores (a DOF-shaped training step: 85x
 the float one on CPU). In train mode only, the same MX operands (blockify,
 block exponents, `in_exp` clamp, int input, convT zero-insert) go through
-`F.conv2d` (cuDNN, tensor cores: an MXINT8 operand is exact in TF32 and bf16),
-and what the kernel does after its sum is applied as fake-quant: the bias on
-the accumulator grid, the `bits` accumulator range, and with `out_window:
-"always"` the window itself (`_apply_out_window`: same grid, rounding and
-saturation word). The backward is the kernel's STE, `ste_mask` included, bit
-for bit. Eval (`model.eval()`) and the sim always run the kernel, whatever
-`train_path` says.
+`F.conv2d` in fp32 with autocast off (under AMP a bf16 sum would round to 8
+bits; on GPU cuDNN still uses the tensor cores through TF32, exact for MXINT8
+to MXINT12 operands, not MXINT16), and what the kernel does after its sum is
+applied as fake-quant: the bias on the accumulator grid, the `bits`
+accumulator range, and with `out_window: "always"` the window itself
+(`_apply_out_window`: same grid, rounding and saturation word). The backward
+is the kernel's STE, `ste_mask` included, bit for bit while no partial sum
+saturates (the kernel masks a lane that saturated at any product or at the
+bias add, fast only on the final sum). Eval (`model.eval()`) and the sim
+always run the kernel, whatever `train_path` says.
 
 It equals the kernel while every product sits on the accumulator grid and the
-partial sums fit fp32's 24 bits. A wider sum (a wide-range input) rounds: at
-most 1 output LSB with the window (2-11% of outputs, on an input with rows
-2^-20 below the rest), a few fp32 ulps of the layer's largest output without
-it. It never wraps, checks the range on the final sum only, and keeps a
-product below the grid (an input finer than the calibrated one, or
+partial sums fit fp32's 24 bits (measured on CPU; on GPU cuDNN may pick an FFT
+or Winograd algorithm, under `cudnn.benchmark` in particular, which does not
+sum exactly, so this is unproven there). A wider sum (a wide-range input)
+rounds: at most 1 output LSB with the window (2-11% of outputs, on an input
+with rows 2^-20 below the rest), a few fp32 ulps of the layer's largest output
+without it. It never wraps, checks the range on the final sum only, and keeps
+a product below the grid (an input finer than the calibrated one, or
 `e_layer_min` pinned high) that the kernel floors: there the two differ by up
-to one accumulator step per such product. The step reads nothing back from
-the device, except the live weight exponent base with `in_exp_mode: "always"`
-and no `e_base_w`.
+to one accumulator step per such product. The step reads nothing back from the
+device, except with `in_exp_mode: "always"`: the live weight exponent base
+when there is no `e_base_w`, and the live input max with `in_exp_anchor:
+"min"`.
 
 ```json
 "xblock_accum": {"out_window": "always", "train_path": "fast"}
