@@ -818,36 +818,44 @@ class MXConv2dHW(MXConv2d):
         return out + (y - out).detach()
 
     def _fp32_blocked_forward(self, qi, qw, bf_bias):
-        """FP32 reference conv used only while calibrating `e_layer_min`,
-        returned in the input's type (a bf16 model stays bf16)."""
+        """Float reference conv used only while calibrating `e_layer_min`.
+        train_path 'hw' (default): in the input's type under the caller's
+        autocast, as before train_path existed (a bf16 model sums in bf16).
+        'fast': the fast path's fp32 sum with autocast off, so the grids it
+        picks are the ones it trains on, cast back to the input's type."""
         sp = self.mx_specs
-        out = self._float_conv(qi, qw, bf_bias).to(qi.dtype)
+        if _get_xblock_cfg(self).get('train_path', 'hw') == 'fast':
+            out = self._float_conv(qi, qw, bf_bias).to(qi.dtype)
+        else:
+            out = self._geometry_conv(qi, qw, bf_bias)
         return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
 
     def _float_conv(self, qi, qw, bias, dense=False):
-        """Float conv of the MX operands on the geometry the kernel runs (the
-        convT zero-insert included, exact in fp32). `dense`: always F.conv2d
-        (the fast training path). Else calibration's reference: the
-        channel-blocked einsum when Cin splits into blocks, F.conv2d
-        otherwise. Same sum, another order.
-
-        In fp32 with autocast off: under AMP F.conv2d would return a bf16
-        sum (8 bits), not the kernel's fp32 one. TF32 still runs it on the
-        tensor cores. Returns fp32: the caller casts back to the input's
-        type at the end, as the kernel does after its window."""
+        """`_geometry_conv` in fp32 with autocast off: under AMP, or on a
+        bf16 model, F.conv2d would return a bf16 sum (8 bits), not the
+        kernel's fp32 one. TF32 still runs it on the tensor cores. Returns
+        fp32: the caller casts back to the input's type at the end, as the
+        kernel does after its window."""
         with torch.autocast(qi.device.type, enabled=False):
-            qi, qw = qi.float(), qw.float()
-            bias = None if bias is None else bias.float()
-            geom = self._hw_geom()
-            qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])
-            if dense or qi.shape[1] % self.mx_specs['block_size'] != 0:
-                return F.conv2d(qi, qw, bias, geom['stride'], geom['padding'],
-                                geom['dilation'], self.groups)
-            return self._channel_blocked_conv(qi, qw, bias, geom)
+            return self._geometry_conv(qi.float(), qw.float(),
+                                       None if bias is None else bias.float(), dense)
+
+    def _geometry_conv(self, qi, qw, bias, dense=False):
+        """Conv of the MX operands on the geometry the kernel runs (the
+        convT zero-insert included, exact). `dense`: always F.conv2d (the
+        fast training path). Else calibration's reference: the
+        channel-blocked einsum when Cin splits into blocks, F.conv2d
+        otherwise. Same sum, another order."""
+        geom = self._hw_geom()
+        qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])
+        if dense or qi.shape[1] % self.mx_specs['block_size'] != 0:
+            return F.conv2d(qi, qw, bias, geom['stride'], geom['padding'],
+                            geom['dilation'], self.groups)
+        return self._channel_blocked_conv(qi, qw, bias, geom)
 
     def _channel_blocked_conv(self, qi, qw, bias, geom):
         """The conv as a sum over Cin blocks of `block_size` (calibration's
-        reference order). `qi` already zero-inserted, fp32."""
+        reference order). `qi` already zero-inserted."""
         bs = self.mx_specs['block_size']
         H, W = qi.shape[-2:]
         B = qi.shape[0]

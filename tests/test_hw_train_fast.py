@@ -273,19 +273,21 @@ def test_fast_grads_equal_kernel_ste(net, layers, xblock):
         assert torch.equal(g_hw[k], g_fast[k]), k
 
 
+@pytest.mark.parametrize("sign", [1, -1], ids=["upper", "lower"])
 @pytest.mark.parametrize("ste_mask", [True, False])
-def test_fast_grads_on_saturated_lanes(ste_mask):
+def test_fast_grads_on_saturated_lanes(ste_mask, sign):
     """A 32b accumulator on a fine grid saturates some lanes: with ste_mask
     both paths zero their gradient there, without it both let it through.
-    All operands positive, so the kernel's sum only grows: a lane saturates
+    Positive input, weights and bias all of one sign, so the kernel's sum
+    only grows (upper bound) or only falls (lower bound): a lane saturates
     at a partial sum exactly when the final sum saturates (with mixed signs
     the kernel also masks lanes that only a partial sum took out of range,
     fast does not: see README)."""
     torch.manual_seed(0)
     net = nn.Sequential(nn.Conv2d(6, 16, 3, padding=1))
     with torch.no_grad():
-        net[0].weight.abs_()
-        net[0].bias.abs_()
+        net[0].weight.abs_().mul_(sign)
+        net[0].bias.abs_().mul_(sign)
     model = _model(net=net, layers=["0"], bits=32, ste_mask=ste_mask, out_window="off")
     data = [x.abs() for x in _data()]
     calibrate_hw_grids(model, data, num_batches=3, verbose=0)
@@ -302,8 +304,8 @@ def test_fast_grads_on_saturated_lanes(ste_mask):
     for k in g_hw:
         assert torch.equal(g_hw[k], g_fast[k]), k
     (_, y_hw, y_fast, _), = _fast_vs_hw(model, data[0])
-    hi = (2 ** 31 - 1) * 2.0 ** m.e_layer_min
-    sat = y_hw.abs() >= hi
+    bound = (2 ** 31 - 1 if sign > 0 else -2 ** 31) * 2.0 ** m.e_layer_min
+    sat = y_hw == bound                                        # on that bound
     assert sat.any() and torch.equal(y_hw[sat], y_fast[sat])   # clamped alike
 
 
@@ -356,10 +358,12 @@ def test_fast_equals_kernel_under_bf16_autocast():
     assert torch.equal(y_hw, y_fast)
 
 
-def test_bf16_model_calibrates_and_fast_equals_kernel():
-    """A model cast to bf16: calibration's reference and the fast path give
-    the input's type back, as the kernel does, and fast equals the kernel."""
-    model = _model().to(torch.bfloat16)
+@pytest.mark.parametrize("calib_path", ["hw", "fast"])
+def test_bf16_model_calibrates_and_fast_equals_kernel(calib_path):
+    """A model cast to bf16, calibrated with either train_path: calibration's
+    reference and the fast path give the input's type back, as the kernel
+    does, and fast equals the kernel."""
+    model = _model(train_path=calib_path).to(torch.bfloat16)
     data = [x.to(torch.bfloat16) for x in _data()]
     calibrate_hw_grids(model, data, num_batches=3, verbose=0)
     rows = _fast_vs_hw(model, data[0])
@@ -369,20 +373,85 @@ def test_bf16_model_calibrates_and_fast_equals_kernel():
         assert torch.equal(y_hw, y_fast), m._mx_layer_name
 
 
-@pytest.mark.parametrize("cin", [64, 6], ids=["einsum", "conv2d"])
-def test_calibration_reference_ignores_autocast(cin):
-    """Calibration's float reference sums in fp32 under bf16 autocast too:
-    the einsum branch (Cin splits into 32-blocks) and the F.conv2d one."""
-    m, = _hw_layers(_model(net=nn.Sequential(nn.Conv2d(cin, 16, 3, padding=1)),
-                           layers=["0"]))
+def test_bf16_model_casts_after_the_window():
+    """bf16 model, output grid 7 bits below the largest output: the window
+    word fits bf16, the fp32 sum does not. The window must floor the fp32
+    sum (as the kernel floors its integer one) and cast after; casting
+    first rounds the sum to 8 bits and moves words up one step."""
+    torch.manual_seed(2)
+    model = _model(net=nn.Sequential(nn.Conv2d(64, 16, 3, padding=1)),
+                   layers=["0"]).to(torch.bfloat16)
+    data = [x.to(torch.bfloat16) for x in _data(cin=64)]
+    calibrate_hw_grids(model, data, num_batches=3, verbose=0)
+    m, = _hw_layers(model)
+    model.eval()
+    with torch.no_grad():
+        m.e_qa_out = floor_log2(float(model(data[0]).abs().max())) - 7
+    (m, y_hw, y_fast, _), = _fast_vs_hw(model, data[0])
+    assert y_fast.dtype == torch.bfloat16
+    assert torch.equal(y_hw, y_fast)
+
+
+def _reference_operands(cin, dtype=torch.float32):
+    """MXINT8-grid operands for calibration's float reference."""
     g = torch.Generator().manual_seed(4)
     qi = torch.randint(-127, 128, (1, cin, 8, 16), generator=g) * 2.0 ** -7
     qw = torch.randint(-127, 128, (16, cin, 3, 3), generator=g) * 2.0 ** -9
     b = torch.randn(16, generator=g)
+    return qi.to(dtype), qw.to(dtype), b.to(dtype)
+
+
+def _reference_layer(cin, **xblock):
+    m, = _hw_layers(_model(net=nn.Sequential(nn.Conv2d(cin, 16, 3, padding=1)),
+                           layers=["0"], **xblock))
+    return m
+
+
+@pytest.mark.parametrize("cin", [64, 6], ids=["einsum", "conv2d"])
+def test_fast_calibration_reference_ignores_autocast(cin):
+    """train_path 'fast': calibration's float reference is the fast path's
+    fp32 sum under bf16 autocast too: the einsum branch (Cin splits into
+    32-blocks) and the F.conv2d one."""
+    m = _reference_layer(cin, train_path="fast")
+    qi, qw, b = _reference_operands(cin)
     ref = m._fp32_blocked_forward(qi, qw, b)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         amp = m._fp32_blocked_forward(qi, qw, b)
     assert amp.dtype == torch.float32 and torch.equal(ref, amp)
+
+
+def _main_reference(m, qi, qw, b):
+    """Calibration's reference as 6c97122 computes it (before train_path):
+    the sum in the operands' type under the caller's autocast, the einsum
+    over 32-channel blocks when Cin splits, else F.conv2d."""
+    from microxcaling.mx.elemwise_ops import quantize_elemwise_op
+    B, C, H, W = qi.shape
+    if C % 32:
+        out = torch.nn.functional.conv2d(qi, qw, b, 1, 1)
+    else:
+        x = torch.nn.functional.unfold(qi, (3, 3), padding=1).view(B, C // 32, 32, 9, H * W)
+        out = torch.einsum('bnkpl,onkp->bol', x, qw.view(16, C // 32, 32, 9))
+        out = out.view(B, 16, H, W) + b.view(1, -1, 1, 1)
+    sp = m.mx_specs
+    return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
+
+
+@pytest.mark.parametrize("context", ["bf16_model", "amp"])
+@pytest.mark.parametrize("cin", [64, 6], ids=["einsum", "conv2d"])
+def test_hw_calibration_reference_is_mains(cin, context):
+    """train_path 'hw' (default): calibration's reference is bit for bit the
+    one before train_path existed, on a bf16 model and under AMP too (the
+    owner's rule: existing configs bit-identical)."""
+    m = _reference_layer(cin)
+    if context == "bf16_model":
+        m = m.to(torch.bfloat16)
+        qi, qw, b = _reference_operands(cin, torch.bfloat16)
+        ref, want = m._fp32_blocked_forward(qi, qw, b), _main_reference(m, qi, qw, b)
+    else:
+        qi, qw, b = _reference_operands(cin)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            ref, want = m._fp32_blocked_forward(qi, qw, b), _main_reference(m, qi, qw, b)
+    assert ref.dtype == want.dtype and torch.equal(ref, want)
 
 
 def test_window_fake_quant_takes_the_nearest_grid_point():

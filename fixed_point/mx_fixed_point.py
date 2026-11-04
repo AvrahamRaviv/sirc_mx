@@ -229,6 +229,7 @@ XBLOCK_ACCUM_DEFAULTS = {
     # run the bit-exact HW kernel): 'hw' (the kernel, as eval) or 'fast' (same
     # MX operands, float conv, accumulator range + bias grid + output window
     # as fake-quant, same STE backward; no accumulator wrap, fp32 sum order).
+    # 'fast' also makes calibrate_hw_grids' float reference that fp32 sum.
     "train_path": "hw",
 }
 
