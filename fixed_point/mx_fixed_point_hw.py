@@ -429,7 +429,7 @@ def floor_log2(x):
     return math.frexp(float(x))[1] - 1
 
 
-def clamp_block_exp(q, e_base, exp_bits, fmt='int8', round='nearest'):
+def clamp_block_exp(q, e_base, exp_bits, fmt='int8', round='nearest', sync=True):
     """Model a `exp_bits`-wide HW shared-exponent register on an MX tensor.
 
     Allowed block exponents: [e_base, e_base + 2^exp_bits - 1]. A block
@@ -441,7 +441,8 @@ def clamp_block_exp(q, e_base, exp_bits, fmt='int8', round='nearest'):
     value can differ from rounding the float once by one step at a tie.)
     `round='truncate'` drops the bits instead (toward zero, the HW emit).
 
-    Returns (clamped tensor, number of changed elements).
+    Returns (clamped tensor, number of changed elements): an int, or with
+    `sync=False` a 0-d tensor, so the caller does not wait on the device.
     """
     _, mant_bias, max_val, _ = _int_format_params(fmt)
     step = 2.0 ** (int(e_base) - mant_bias)
@@ -450,7 +451,8 @@ def clamp_block_exp(q, e_base, exp_bits, fmt='int8', round='nearest'):
     half = 0.0 if round == "truncate" else 0.5
     y = torch.sign(q) * torch.floor(q.abs() / step + half) * step
     y = y.clamp(-hi, hi)
-    return y, int((y != q).sum().item())
+    changed = (y != q).sum()
+    return y, (int(changed.item()) if sync else changed)
 
 
 def block_absmax(x, bs, blockify):

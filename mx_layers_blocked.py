@@ -32,7 +32,8 @@ from microxcaling.mx.elemwise_ops import quantize_elemwise_op
 from fixed_point.mx_fixed_point import (cross_block_accumulate_from_specs, _get_xblock_cfg,
                                         overflow_raises)
 from fixed_point.mx_fixed_point_hw import (hw_fxp_conv2d, resolve_out_window_bits,
-                                           out_window_sat_word,
+                                           out_window_sat_word, _apply_out_window,
+                                           _bias_to_grid,
                                            clamp_block_exp, floor_log2, in_exp_on,
                                            dilate_input, PLAParams, pla_bins, pla_multipliers,
                                            block_exp_range, check_block_exp,
@@ -269,6 +270,10 @@ class MXConv2dHW(MXConv2d):
         the PCU static shift), `in_mode` 'int' (per-tensor int8 input, the
         first layer: q = round(x / in_scale), the scale folded into the
         weights, conv(q, W * s) == conv(q * s, W)).
+      - `xblock_accum.train_path` 'fast' (default 'hw'): train mode runs a
+        float conv on the same MX operands with the kernel's back half as
+        fake-quant and its STE backward (`_fast_train_forward`); eval always
+        runs the kernel.
     """
 
     def weight_exp_base(self):
@@ -553,12 +558,14 @@ class MXConv2dHW(MXConv2d):
         if cal is not None:
             cal.update(qi, qw, bs, fmt=a_fmt,
                        act_blockify=act_blockify, weight_blockify=weight_blockify)
-            out = self._fp32_blocked_forward(qi, qw, bf_bias, H, W)
+            out = self._fp32_blocked_forward(qi, qw, bf_bias)
             # With PLA the window sees the activated output.
             cal.update_out(self._pla_float(out) if self.pla_on() else out)
             return out
 
         cfg = _get_xblock_cfg(self)
+        # train_path 'fast': training only, never eval (see _fast_train_forward).
+        fast = self.training and cfg.get('train_path', 'hw') == 'fast'
         exp_mode = cfg.get('in_exp_mode', 'off')
         if in_exp_on(cfg) and (exp_mode == 'always'
                                or (exp_mode == 'infer' and not self.training)):
@@ -599,10 +606,12 @@ class MXConv2dHW(MXConv2d):
             if int_in:
                 na = 0                               # HW int input: no block exponent
             else:
-                ca, na = clamp_block_exp(qi.detach(), base_a, exp_bits, a_fmt, rnd)
+                ca, na = clamp_block_exp(qi.detach(), base_a, exp_bits, a_fmt, rnd,
+                                         sync=not fast)
                 qi = qi + (ca - qi).detach()         # STE: grads unchanged
             if base_w is not None:
-                cw, nw = clamp_block_exp(qw.detach(), base_w, exp_bits, w_fmt, rnd)
+                cw, nw = clamp_block_exp(qw.detach(), base_w, exp_bits, w_fmt, rnd,
+                                         sync=not fast)
                 qw = qw + (cw - qw).detach()
             else:
                 nw = 0
@@ -655,92 +664,173 @@ class MXConv2dHW(MXConv2d):
                 f"stride={tuple(self.stride)} pad={tuple(self.padding)} | "
                 f"bits={cfg['bits']} sat_mode={cfg['sat_mode']} "
                 f"e_layer_min={int(e_min)} backend={cfg['backend']} "
-                f"out_window={win_mode} e_qa_out={self.e_qa_out}"
+                f"out_window={win_mode} e_qa_out={self.e_qa_out} "
+                f"train_path={cfg.get('train_path', 'hw')}"
             )
             self._hw_logged = True
 
-        stats = {"want_acc": True} if self._tap_acc else {}
-        geom = self._hw_geom()
-        out = hw_fxp_conv2d(
-            qi, qw, bf_bias,
-            e_layer_min=int(e_min),
-            bs=bs,
-            bits=cfg['bits'],
-            sat_mode=cfg['sat_mode'],
-            ste_mask=cfg['ste_mask'],
-            stride=geom['stride'],
-            padding=geom['padding'],
-            dilation=geom['dilation'],
-            in_dil=geom['in_dil'],
-            in_extra=geom['in_extra'],
-            backend=cfg['backend'],
-            stats_sink=stats,
-            fmt=a_fmt,
-            act_blockify=act_blockify,
-            weight_blockify=weight_blockify,
-            npe_triton_variant=cfg.get('npe_triton_variant', 'reuse'),
-            e_qa_out=e_qa_out,
-            win_bits=resolve_out_window_bits(cfg, a_fmt) if apply_win else None,
-            out_round=cfg.get('out_round', 'floor'),
-            pla=self.pla_params(int(e_min)) if apply_pla else None,
-            bias_round=cfg.get('bias_round', 'even'),
-            sat_word=out_window_sat_word(cfg, a_fmt) if apply_win else None,
-        )
-        if self._tap_acc:
-            self._last_acc = stats.get('acc')
-            self._last_sat = stats.get('sat_map')
-            self._last_win = stats.get('win')
-            self._last_win_sat = stats.get('win_sat_map')
-        self._win_sat_seen_life += int(stats.get('win_sat_count', 0))
-        sat_count = int(stats.get('sat_count', 0))
-        total = int(stats.get('total', 0))
-        if raise_over and sat_count:
-            raise RuntimeError(
-                f"MXConv2dHW {name}: {sat_count}/{total} outputs overflowed the "
-                f"{cfg['bits']}b accumulator (e_layer_min={int(e_min)}). HW wraps "
-                f"(PTQ contract violation, xblock_accum.overflow 'raise').")
-        if raise_win and stats.get('win_sat_count', 0):
-            raise RuntimeError(
-                f"MXConv2dHW {name}: {int(stats['win_sat_count'])}/{total} outputs "
-                f"outside the {resolve_out_window_bits(cfg, a_fmt)}b output window "
-                f"(e_qa_out={e_qa_out}, xblock_accum.overflow 'raise'). Recalibrate, "
-                f"raise out_margin_bits, or set overflow_saturate [\"out_window\"] "
-                f"(HW saturates the window).")
-        self._fwd_count += 1
-        self._sat_total_life += total
-        self._sat_seen_life += sat_count
-        self._sat_total_window += total
-        self._sat_seen_window += sat_count
-
-        if verbose >= 2 and sat_count > 0:
-            pct = 100.0 * sat_count / max(total, 1)
-            print(
-                f"[MXConv2dHW {name}] saturated {sat_count}/{total} "
-                f"outputs ({pct:.2f}%) this forward"
+        win_bits = resolve_out_window_bits(cfg, a_fmt) if apply_win else None
+        sat_word = out_window_sat_word(cfg, a_fmt) if apply_win else None
+        if fast:
+            out, sat_count, total = self._fast_train_forward(
+                qi, qw, bf_bias, int(e_min), cfg, e_qa_out, win_bits, sat_word)
+        else:
+            stats = {"want_acc": True} if self._tap_acc else {}
+            geom = self._hw_geom()
+            out = hw_fxp_conv2d(
+                qi, qw, bf_bias,
+                e_layer_min=int(e_min),
+                bs=bs,
+                bits=cfg['bits'],
+                sat_mode=cfg['sat_mode'],
+                ste_mask=cfg['ste_mask'],
+                stride=geom['stride'],
+                padding=geom['padding'],
+                dilation=geom['dilation'],
+                in_dil=geom['in_dil'],
+                in_extra=geom['in_extra'],
+                backend=cfg['backend'],
+                stats_sink=stats,
+                fmt=a_fmt,
+                act_blockify=act_blockify,
+                weight_blockify=weight_blockify,
+                npe_triton_variant=cfg.get('npe_triton_variant', 'reuse'),
+                e_qa_out=e_qa_out,
+                win_bits=win_bits,
+                out_round=cfg.get('out_round', 'floor'),
+                pla=self.pla_params(int(e_min)) if apply_pla else None,
+                bias_round=cfg.get('bias_round', 'even'),
+                sat_word=sat_word,
             )
-        elif verbose >= 1:
-            sample_every = int(cfg_early.get('verbose_sample_every', 100))
-            if self._fwd_count % sample_every == 0 and self._sat_seen_window > 0:
-                pct = 100.0 * self._sat_seen_window / max(self._sat_total_window, 1)
-                print(
-                    f"[MXConv2dHW {name}] sat sample over last {sample_every} "
-                    f"forwards: {self._sat_seen_window}/{self._sat_total_window} "
-                    f"outputs ({pct:.3f}%)"
-                )
-                self._sat_seen_window = 0
-                self._sat_total_window = 0
+            if self._tap_acc:
+                self._last_acc = stats.get('acc')
+                self._last_sat = stats.get('sat_map')
+                self._last_win = stats.get('win')
+                self._last_win_sat = stats.get('win_sat_map')
+            self._win_sat_seen_life = (self._win_sat_seen_life
+                                       + int(stats.get('win_sat_count', 0)))
+            sat_count = int(stats.get('sat_count', 0))
+            total = int(stats.get('total', 0))
+            if raise_over and sat_count:
+                raise RuntimeError(
+                    f"MXConv2dHW {name}: {sat_count}/{total} outputs overflowed the "
+                    f"{cfg['bits']}b accumulator (e_layer_min={int(e_min)}). HW wraps "
+                    f"(PTQ contract violation, xblock_accum.overflow 'raise').")
+            if raise_win and stats.get('win_sat_count', 0):
+                raise RuntimeError(
+                    f"MXConv2dHW {name}: {int(stats['win_sat_count'])}/{total} outputs "
+                    f"outside the {win_bits}b output window "
+                    f"(e_qa_out={e_qa_out}, xblock_accum.overflow 'raise'). Recalibrate, "
+                    f"raise out_margin_bits, or set overflow_saturate [\"out_window\"] "
+                    f"(HW saturates the window).")
+        self._count_sat(sat_count, total, name, cfg_early)
 
         out = quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
         if apply_pla:
             out._pla_folded = True      # the folded activation passes it on
         return out
 
-    def _fp32_blocked_forward(self, qi, qw, bf_bias, H, W):
+    def _count_sat(self, sat_count, total, name, cfg):
+        """Accumulator saturation counters and their sampled log. `sat_count`
+        is an int, or a 0-d tensor (fast path): it is read on the host only
+        when a log line prints it, so counting never waits on the device.
+        A tensor counter is replaced, never added to in place: a caller that
+        saved it (mx_debug) keeps its value."""
+        self._fwd_count += 1
+        self._sat_total_life += total
+        self._sat_seen_life = self._sat_seen_life + sat_count
+        self._sat_total_window += total
+        self._sat_seen_window = self._sat_seen_window + sat_count
+
+        verbose = int(cfg.get('verbose', 1))
+        if verbose >= 2 and sat_count > 0:
+            pct = 100.0 * int(sat_count) / max(total, 1)
+            print(
+                f"[MXConv2dHW {name}] saturated {int(sat_count)}/{total} "
+                f"outputs ({pct:.2f}%) this forward"
+            )
+        elif verbose >= 1:
+            sample_every = int(cfg.get('verbose_sample_every', 100))
+            if self._fwd_count % sample_every == 0 and self._sat_seen_window > 0:
+                seen = int(self._sat_seen_window)
+                pct = 100.0 * seen / max(self._sat_total_window, 1)
+                print(
+                    f"[MXConv2dHW {name}] sat sample over last {sample_every} "
+                    f"forwards: {seen}/{self._sat_total_window} "
+                    f"outputs ({pct:.3f}%)"
+                )
+                self._sat_seen_window = 0
+                self._sat_total_window = 0
+
+    def _fast_train_forward(self, qi, qw, bf_bias, e_min, cfg, e_qa_out, win_bits,
+                            sat_word):
+        """xblock_accum.train_path 'fast', training only. The HW path's MX
+        operands (blockify, block exponents, in_exp clamp) go through a float
+        conv (cuDNN, tensor cores) instead of the bit-exact kernel; what the
+        kernel does after its sum is applied to the float result as
+        fake-quant: the bias on the accumulator grid 2^e_min, the `bits`
+        accumulator range, and with the window on `_apply_out_window` itself.
+        Backward is the kernel's STE: the conv's gradient, zero on saturated
+        lanes with ste_mask; the window and bias grid pass it through.
+
+        It differs from the kernel only in the sum: the range is checked on
+        the final sum (the kernel saturates per product, HW wraps), a product
+        below the grid is not floored, and fp32 adds in another order (exact
+        while the partial sums fit 24 bits). An MXINT8 (or narrower) operand
+        is exact in TF32 and bf16, so tensor cores change nothing else. No
+        host sync.
+        Returns (out, saturated count as a 0-d tensor, total)."""
+        scale = 2.0 ** e_min
+        bias = None
+        if bf_bias is not None:
+            half_up = cfg.get('bias_round', 'even') == 'half_up'
+            b_grid = _bias_to_grid(bf_bias, e_min, half_up, bf_bias.device)
+            bias = bf_bias + (b_grid.to(bf_bias.dtype) * scale - bf_bias).detach()
+        out = self._float_conv(qi, qw, bias, dense=True)
+        top = 1 << (int(cfg['bits']) - 1)
+        lo, hi = -top * scale, (top - 1) * scale
+        sat = (out < lo) | (out > hi)
+        clamped = out.clamp(lo, hi)
+        if cfg['ste_mask']:
+            out = torch.where(sat, clamped.detach(), out)
+        else:
+            out = out + (clamped - out).detach()
+        if e_qa_out is not None:
+            out = self._window_fake_quant(out, e_min, e_qa_out, win_bits,
+                                          cfg.get('out_round', 'floor'), sat_word)
+        if self._tap_acc:               # the sim taps are the kernel's; none here
+            self._last_acc = self._last_sat = self._last_win = self._last_win_sat = None
+        return out, sat.sum(), sat.numel()
+
+    def _window_fake_quant(self, out, e_acc, e_qa_out, win_bits, out_round, sat_word):
+        """The output window on a float result on the accumulator grid
+        2^e_acc: the word through `_apply_out_window` (the kernel's window,
+        the one implementation), back to float, STE. Counts saturated
+        outputs as a tensor (replaced, not added to in place: _count_sat)."""
+        scale = 2.0 ** e_acc
+        # The float sum on its integer grid (exact: |acc| < 2^bits <= 2^53).
+        acc = torch.round(out.detach().double() / scale).to(torch.int64)
+        word, win_sat = _apply_out_window(acc, e_acc, e_qa_out, win_bits, out_round,
+                                          sat_word)
+        self._win_sat_seen_life = self._win_sat_seen_life + win_sat.sum()
+        y = word.to(out.dtype) * 2.0 ** e_qa_out
+        return out + (y - out).detach()
+
+    def _fp32_blocked_forward(self, qi, qw, bf_bias):
         """FP32 reference conv used only while calibrating `e_layer_min`."""
         sp = self.mx_specs
-        bs = sp['block_size']
+        out = self._float_conv(qi, qw, bf_bias)
+        return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
+
+    def _float_conv(self, qi, qw, bias, dense=False):
+        """Float conv of the MX operands on the geometry the kernel runs (the
+        convT zero-insert included, exact in fp32). `dense`: always F.conv2d
+        (the fast training path). Else calibration's reference: the
+        channel-blocked einsum when Cin splits into blocks, F.conv2d
+        otherwise. Same sum, another order."""
+        bs = self.mx_specs['block_size']
         geom = self._hw_geom()
-        qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])   # exact in fp32
+        qi = dilate_input(qi, geom['in_dil'], geom['in_extra'])
         H, W = qi.shape[-2:]
         B = qi.shape[0]
         C = qi.shape[1]
@@ -748,13 +838,9 @@ class MXConv2dHW(MXConv2d):
         kH, kW = qw.shape[2], qw.shape[3]
         kK = kH * kW
 
-        # NPE (or any non-divisible Cin): the channel-blocked reshape below does
-        # not apply; a plain conv is an equivalent FP32 reference for producing
-        # downstream activations during calibration.
-        if C % bs != 0:
-            out = F.conv2d(qi, qw, bf_bias, geom['stride'], geom['padding'],
-                           geom['dilation'], self.groups)
-            return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
+        if dense or C % bs != 0:
+            return F.conv2d(qi, qw, bias, geom['stride'], geom['padding'],
+                            geom['dilation'], self.groups)
         nb = C // bs
 
         x_unf = F.unfold(qi, (kH, kW),
@@ -772,7 +858,6 @@ class MXConv2dHW(MXConv2d):
         H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
         out = out.view(B, O, H_out, W_out)
-        if bf_bias is not None:
-            out = out + bf_bias.view(1, -1, 1, 1)
-        out = quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
+        if bias is not None:
+            out = out + bias.view(1, -1, 1, 1)
         return out

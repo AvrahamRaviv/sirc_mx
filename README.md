@@ -347,6 +347,34 @@ and wrong for PReLU. The grids file carries `pla_frac`, `pla_m_pos`,
 them as given; a grids file without them still loads.
 `configs/mx_config_dof_run_win_cal_pla.json` is the convT run config with PLA on.
 
+`xblock_accum.train_path: "fast"` (default `"hw"`) trains the HW layers
+(`MXConv2dHW`, `MXConvTranspose2dHW`) without the bit-exact kernel, a
+per-product int64 loop with no tensor cores (a DOF-shaped training step: 85x
+the float one on CPU). In train mode only, the same MX operands (blockify,
+block exponents, `in_exp` clamp, int input, convT zero-insert) go through
+`F.conv2d` (cuDNN, tensor cores: an MXINT8 operand is exact in TF32 and bf16),
+and what the kernel does after its sum is applied as fake-quant: the bias on
+the accumulator grid, the `bits` accumulator range, and with `out_window:
+"always"` the window itself (`_apply_out_window`: same grid, rounding and
+saturation word). The backward is the kernel's STE, `ste_mask` included, bit
+for bit. Eval (`model.eval()`) and the sim always run the kernel, whatever
+`train_path` says.
+
+It equals the kernel while every product sits on the accumulator grid and the
+partial sums fit fp32's 24 bits. A wider sum (a wide-range input) rounds: at
+most 1 output LSB with the window (2-11% of outputs, on an input with rows
+2^-20 below the rest), a few fp32 ulps of the layer's largest output without
+it. It never wraps, checks the range on the final sum only, and keeps a
+product below the grid (an input finer than the calibrated one, or
+`e_layer_min` pinned high) that the kernel floors: there the two differ by up
+to one accumulator step per such product. The step reads nothing back from
+the device, except the live weight exponent base with `in_exp_mode: "always"`
+and no `e_base_w`.
+
+```json
+"xblock_accum": {"out_window": "always", "train_path": "fast"}
+```
+
 HW-exact switches (all off by default, match the NPE emulator):
 `mant_round: "truncate"`, `overflow: "raise"`, `bias_round: "half_up"`,
 `out_round: "nearest"`, `in_exp_anchor: "min"`, `static_shift_bits: 7`

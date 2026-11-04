@@ -22,6 +22,7 @@ _VALID_BIAS_ROUND = ("even", "half_up")
 _VALID_IN_EXP_ANCHOR = ("max", "min")
 _VALID_IN_MODE = ("mx", "int")
 _VALID_IN_INT_SCALE = ("free", "pot")
+_VALID_TRAIN_PATH = ("hw", "fast")
 
 
 def validate_xblock_accum_bits(bits):
@@ -224,6 +225,11 @@ XBLOCK_ACCUM_DEFAULTS = {
                                   # in_scale (calibrated)
     "in_int_scale": "free",       # in_mode 'int' calibration: 'free' (max|x| / 127)
                                   # or 'pot' (smallest 2^k with max|x| / 2^k <= 127)
+    # Training forward of MXConv2dHW (train mode only; eval and the sim always
+    # run the bit-exact HW kernel): 'hw' (the kernel, as eval) or 'fast' (same
+    # MX operands, float conv, accumulator range + bias grid + output window
+    # as fake-quant, same STE backward; no accumulator wrap, fp32 sum order).
+    "train_path": "hw",
 }
 
 
@@ -406,7 +412,8 @@ def normalize_xblock_accum(value):
                            ("bias_round", _VALID_BIAS_ROUND),
                            ("in_exp_anchor", _VALID_IN_EXP_ANCHOR),
                            ("in_mode", _VALID_IN_MODE),
-                           ("in_int_scale", _VALID_IN_INT_SCALE)):
+                           ("in_int_scale", _VALID_IN_INT_SCALE),
+                           ("train_path", _VALID_TRAIN_PATH)):
             if cfg[key] not in valid:
                 raise ValueError(f"xblock_accum.{key} must be in {valid}, "
                                  f"got {cfg[key]!r}")
