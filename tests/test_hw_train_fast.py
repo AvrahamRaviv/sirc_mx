@@ -273,12 +273,21 @@ def test_fast_grads_equal_kernel_ste(net, layers, xblock):
         assert torch.equal(g_hw[k], g_fast[k]), k
 
 
-def test_fast_grads_ste_mask_zero_saturated_lanes():
+@pytest.mark.parametrize("ste_mask", [True, False])
+def test_fast_grads_on_saturated_lanes(ste_mask):
     """A 32b accumulator on a fine grid saturates some lanes: with ste_mask
-    both paths zero their gradient."""
+    both paths zero their gradient there, without it both let it through.
+    All operands positive, so the kernel's sum only grows: a lane saturates
+    at a partial sum exactly when the final sum saturates (with mixed signs
+    the kernel also masks lanes that only a partial sum took out of range,
+    fast does not: see README)."""
+    torch.manual_seed(0)
     net = nn.Sequential(nn.Conv2d(6, 16, 3, padding=1))
-    model = _model(net=net, layers=["0"], bits=32, ste_mask=True, out_window="off")
-    data = _data()
+    with torch.no_grad():
+        net[0].weight.abs_()
+        net[0].bias.abs_()
+    model = _model(net=net, layers=["0"], bits=32, ste_mask=ste_mask, out_window="off")
+    data = [x.abs() for x in _data()]
     calibrate_hw_grids(model, data, num_batches=3, verbose=0)
     m, = _hw_layers(model)
     model.eval()
@@ -345,6 +354,35 @@ def test_fast_equals_kernel_under_bf16_autocast():
         (m, y_hw, y_fast, _), = _fast_vs_hw(model, data[0])
     assert y_hw.dtype == y_fast.dtype == torch.float32
     assert torch.equal(y_hw, y_fast)
+
+
+def test_bf16_model_calibrates_and_fast_equals_kernel():
+    """A model cast to bf16: calibration's reference and the fast path give
+    the input's type back, as the kernel does, and fast equals the kernel."""
+    model = _model().to(torch.bfloat16)
+    data = [x.to(torch.bfloat16) for x in _data()]
+    calibrate_hw_grids(model, data, num_batches=3, verbose=0)
+    rows = _fast_vs_hw(model, data[0])
+    assert len(rows) == 4
+    for m, y_hw, y_fast, _ in rows:
+        assert y_hw.dtype == y_fast.dtype == torch.bfloat16, m._mx_layer_name
+        assert torch.equal(y_hw, y_fast), m._mx_layer_name
+
+
+@pytest.mark.parametrize("cin", [64, 6], ids=["einsum", "conv2d"])
+def test_calibration_reference_ignores_autocast(cin):
+    """Calibration's float reference sums in fp32 under bf16 autocast too:
+    the einsum branch (Cin splits into 32-blocks) and the F.conv2d one."""
+    m, = _hw_layers(_model(net=nn.Sequential(nn.Conv2d(cin, 16, 3, padding=1)),
+                           layers=["0"]))
+    g = torch.Generator().manual_seed(4)
+    qi = torch.randint(-127, 128, (1, cin, 8, 16), generator=g) * 2.0 ** -7
+    qw = torch.randint(-127, 128, (16, cin, 3, 3), generator=g) * 2.0 ** -9
+    b = torch.randn(16, generator=g)
+    ref = m._fp32_blocked_forward(qi, qw, b)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        amp = m._fp32_blocked_forward(qi, qw, b)
+    assert amp.dtype == torch.float32 and torch.equal(ref, amp)
 
 
 def test_window_fake_quant_takes_the_nearest_grid_point():
@@ -437,6 +475,24 @@ def test_fast_training_step_reads_nothing_back():
     assert hw.n >= 4                    # the kernel path counts on the host
     m = _hw_layers(model)[0]
     assert m._fwd_count == 2 and m._sat_total_life > 0
+
+
+def test_fast_saturation_log_reads_once_per_sample():
+    """verbose 1: the saturation log reads the device counter once per layer
+    every `verbose_sample_every` forwards, never in between (README)."""
+    model = _model(train_path="fast", verbose=1, verbose_sample_every=4)
+    data = _data()
+    calibrate_hw_grids(model, data, num_batches=3, verbose=0)
+    model.train()
+    for m in _hw_layers(model):
+        m._fwd_count = 0
+    reads = []
+    with torch.no_grad():
+        for _ in range(4):
+            with _Reads() as r:
+                model(data[0])
+            reads.append(r.n)
+    assert reads == [0, 0, 0, len(_hw_layers(model))]
 
 
 def test_fast_shared_layer_called_twice():

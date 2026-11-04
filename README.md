@@ -373,9 +373,14 @@ without it. It never wraps, checks the range on the final sum only, and keeps
 a product below the grid (an input finer than the calibrated one, or
 `e_layer_min` pinned high) that the kernel floors: there the two differ by up
 to one accumulator step per such product. The step reads nothing back from the
-device, except with `in_exp_mode: "always"`: the live weight exponent base
+device, except with `in_exp_mode: "always"` (the live weight exponent base
 when there is no `e_base_w`, and the live input max with `in_exp_anchor:
-"min"`.
+"min"`) and for the saturation log: at `verbose` 1 (the default) once per
+`verbose_sample_every` (100) forwards per layer, at `verbose` 2 every step;
+`verbose` 0 reads nothing. Both paths return the input's type (a bf16 model
+stays bf16), after the window. Calibration's float reference
+(`calibrate_hw_grids`) also sums in fp32 with autocast off, so the grids it
+picks do not depend on AMP.
 
 ```json
 "xblock_accum": {"out_window": "always", "train_path": "fast"}

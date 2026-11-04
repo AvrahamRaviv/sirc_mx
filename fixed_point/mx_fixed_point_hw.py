@@ -579,7 +579,9 @@ def _undilate(t, in_dil, H, W):
 
 def signed_range(bits):
     """(lo, hi) of a two's-complement `bits`-wide word: the accumulator
-    range, a register field. The one place that bound is written."""
+    range, a register field. Used by the reference kernel, check_static_shift
+    and the fast training path; the triton kernels
+    (mx_fixed_point_hw_triton.py) and mx_debug.py still write it by hand."""
     top = 1 << (int(bits) - 1)
     return -top, top - 1
 

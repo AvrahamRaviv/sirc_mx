@@ -800,7 +800,8 @@ class MXConv2dHW(MXConv2d):
                                           cfg.get('out_round', 'floor'), sat_word)
         if self._tap_acc:               # the sim taps are the kernel's; none here
             self._last_acc = self._last_sat = self._last_win = self._last_win_sat = None
-        return out, sat.sum(), sat.numel()
+        # Back to the input's type after the window, as the kernel does.
+        return out.to(qi.dtype), sat.sum(), sat.numel()
 
     def _window_fake_quant(self, out, e_acc, e_qa_out, win_bits, out_round, sat_word):
         """The output window on a float result on the accumulator grid
@@ -817,9 +818,10 @@ class MXConv2dHW(MXConv2d):
         return out + (y - out).detach()
 
     def _fp32_blocked_forward(self, qi, qw, bf_bias):
-        """FP32 reference conv used only while calibrating `e_layer_min`."""
+        """FP32 reference conv used only while calibrating `e_layer_min`,
+        returned in the input's type (a bf16 model stays bf16)."""
         sp = self.mx_specs
-        out = self._float_conv(qi, qw, bf_bias)
+        out = self._float_conv(qi, qw, bf_bias).to(qi.dtype)
         return quantize_elemwise_op(out, mx_specs=sp, round=sp['round_output'])
 
     def _float_conv(self, qi, qw, bias, dense=False):
@@ -831,7 +833,8 @@ class MXConv2dHW(MXConv2d):
 
         In fp32 with autocast off: under AMP F.conv2d would return a bf16
         sum (8 bits), not the kernel's fp32 one. TF32 still runs it on the
-        tensor cores."""
+        tensor cores. Returns fp32: the caller casts back to the input's
+        type at the end, as the kernel does after its window."""
         with torch.autocast(qi.device.type, enabled=False):
             qi, qw = qi.float(), qw.float()
             bias = None if bias is None else bias.float()
