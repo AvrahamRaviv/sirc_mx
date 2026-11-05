@@ -370,9 +370,12 @@ It equals the kernel while every product sits on the accumulator grid and the
 partial sums fit fp32's 24 bits (measured on CPU; on GPU cuDNN may pick an FFT
 or Winograd algorithm, under `cudnn.benchmark` in particular, which does not
 sum exactly, so this is unproven there). A wider sum (a wide-range input)
-rounds: at most 1 output LSB with the window (about 1-11% of outputs, on an
-input with rows 2^-20 below the rest), a few fp32 ulps of the layer's largest
-output without it. It never wraps, checks the range on the final sum only, and
+rounds. Measured on CPU, one seed, on a 256-channel 3x3 layer whose input has
+its top 2 rows 2^-20 below the rest, at 16x20 to 128x224: with the window, up
+to 2 output LSB (2 only at 16x20 with `out_round: "nearest"`, 1 elsewhere) on
+0.7-11.4% of outputs; without it, up to 5 fp32 ulps of the layer's largest
+output, on about half of them. These are measurements, not a bound. It never
+wraps, checks the range on the final sum only, and
 keeps a product below the grid (an input finer than the calibrated one, or
 `e_layer_min` pinned high) that the kernel floors: there the two differ by up
 to one accumulator step per such product. The step reads nothing back from the
