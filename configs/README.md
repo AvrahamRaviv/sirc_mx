@@ -87,8 +87,10 @@ for an input layer (`is_input_layer`); the sim's layer is not one, so
 Exponent width: `mx_specs.scale_bits` drives both sides. ALG decodes the
 exponent code as `E + 2^(n-1)-1`. HW maps the config to their `mx_type`
 `mx-e{scale_bits}bm{N}` (e4bm8, e6bm8, e8bm8; the wrap mask comes with the
-type) and `block_size`, and refuses a type they don't have. The NPE width is
-4 bits: `--config mx_config_npe_e4.json`.
+type) and `block_size`, and refuses a type they don't have. Conv runs int8
+mantissas only: their `mx-e4bm16` is the warp weight lane, and their conv on
+it gives wrong numbers without an error, so `hw_format` refuses it. The NPE
+width is 4 bits: `--config mx_config_npe_e4.json`.
 Accumulator width: `xblock_accum.bits`, one of their `SUPPORTED_ACC_WIDTHS`
 (46, 48, 54, 56), else refused. Fixed inside their code (their API has no
 parameter): PCU clamp 24 bits (`main_HW.HW_FIXED`).

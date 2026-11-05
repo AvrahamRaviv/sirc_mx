@@ -112,6 +112,22 @@ def test_exponent_width_comes_from_config():
         HW.hw_format(e5)
 
 
+def test_hw_conv_refuses_non_int8_mantissa():
+    """Their factory has mx-e4bm16 (the warp weight lane); their conv on it
+    returns numbers ~30x off instead of raising, so an int16 conv with a 4-bit
+    register is refused, whichever field gives the 4 bits, and run() refuses
+    it before reaching their conv."""
+    i16 = dict(E4["mx_specs"], a_elem_format="int16", w_elem_format="int16")
+    by_scale_bits = dict(i16, scale_bits=4)
+    by_register = dict(i16, scale_bits=8, xblock_accum=dict(
+        i16["xblock_accum"], in_exp_mode="infer", in_exp_bits=4))
+    for sp in (by_scale_bits, by_register):
+        with pytest.raises(NotImplementedError, match="int16.*warp lane"):
+            HW.hw_format({"mx_specs": sp})
+    with pytest.raises(NotImplementedError, match="warp lane"):
+        HW.run(C.build("conv1x1"), {**E4, "mx_specs": by_scale_bits})
+
+
 def test_hw_acc_width_comes_from_config():
     """xblock_accum.bits sets their accumulator width; unsupported widths are
     refused."""

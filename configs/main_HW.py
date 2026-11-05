@@ -58,15 +58,22 @@ HW_FIXED = {
 }
 
 
+# Their conv mantissa lane: mx_format says the 16-bit sibling (mx-e4bm16) is
+# for the warp pipe's bilinear weights, not conv.
+CONV_MANTISSA_BITS = 8
+
+
 def hw_format(cfg):
     """Config mx_specs -> npe_mx_emu (mx_type, block_size).
 
     mx_type is their name "mx-e{bits}bm{mantissa bits}"; the exponent wrap
     mask comes with it (their MXTensorConfig.overflow_mask). bits = the NPE
     shared-exponent register: xblock_accum.in_exp_bits when the lib models
-    that register (in_exp_mode on), else mx_specs.scale_bits. Refused when
-    their code can't run it as configured, rather than silently running
-    something else.
+    that register (in_exp_mode on), else mx_specs.scale_bits. Conv runs on
+    their 8-bit mantissa lane only (CONV_MANTISSA_BITS): their factory also has
+    mx-e4bm16, but that lane is for the warp weights, and their conv on it gives
+    wrong numbers instead of an error. Refused when their code can't run it as
+    configured, rather than silently running something else.
     """
     sp = cfg["mx_specs"]
     a, w = sp["a_elem_format"], sp["w_elem_format"]
@@ -75,6 +82,10 @@ def hw_format(cfg):
     xa = sp.get("xblock_accum") if isinstance(sp.get("xblock_accum"), dict) else {}
     reg = xa.get("in_exp_bits") if xa.get("in_exp_mode", "off") != "off" else None
     ebits, mbits = int(reg if reg is not None else sp["scale_bits"]), int(a[3:])
+    if mbits != CONV_MANTISSA_BITS:
+        raise NotImplementedError(
+            f"HW conv: {a} needs a {mbits}-bit mantissa lane; npe_mx_emu conv "
+            f"runs int{CONV_MANTISSA_BITS} only (their e4bm16 is the warp lane)")
     mx_type = f"mx-e{ebits}bm{mbits}"
     if mx_type not in mx_config_factory:
         raise NotImplementedError(
