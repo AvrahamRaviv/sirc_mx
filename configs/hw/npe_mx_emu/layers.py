@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from npe_mx_emu.calib import LayerMXQParams, build_c_struct_arr
-from npe_mx_emu.hw_pipe import MXConv2D_Loops
-from npe_mx_emu.mx_format import base_mx_quantizer, input_mx_quantizer
+from npe_mx_emu.calib import LayerMXQParams, build_c_struct_arr, build_warp_c_struct_arr
+from npe_mx_emu.hw_pipe import MXAdd_Loops, MXConv2D_Loops, MXDepthwise2D_Loops, MXWarp_Loops, \
+    frac_bits_pair
+from npe_mx_emu.mx_format import MXTensor, base_mx_quantizer, input_mx_quantizer, mantissa_offset, \
+    mx_config_factory
 
 
 class CalibratedMXConv2d(nn.Module):
@@ -105,3 +110,405 @@ class CalibratedMXConv2d(nn.Module):
             mx = base_mx_quantizer(x_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
         out_raw = self.mx_conv(mx)
         return out_raw
+
+
+class CalibratedMXDepthwiseConv2d(nn.Module):
+    """MX depthwise conv layer driven by observer-derived LayerMXQParams.
+
+    Depthwise on the NPE (HW answer, algo Q8): each channel is a separate
+    kernel on the same MAC grid and the same MX integer data path --
+    out_c = in_c (*) w_c, no cross-channel terms.  One padded weight block
+    per channel filter.  forward() takes a plain float torch.Tensor and
+    returns the raw integer accumulator output; the float value is
+    ``output * 2**-output_scale_log2``.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        min_val: float = -1.0,
+        max_val: float = 1.0,
+        qparams: "LayerMXQParams | None" = None,
+    ):
+        super(CalibratedMXDepthwiseConv2d, self).__init__()
+        if qparams is None:
+            raise ValueError("qparams (LayerMXQParams) is required")
+        self.qparams = qparams
+
+        self.mx_dw = MXDepthwise2D_Loops(
+            channels=channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            min_val=min_val,
+            max_val=max_val,
+        )
+
+    @classmethod
+    def from_torch_conv(cls, conv: nn.Conv2d, qparams: LayerMXQParams) -> "CalibratedMXDepthwiseConv2d":
+        if conv.groups != conv.in_channels or conv.out_channels != conv.in_channels:
+            raise ValueError(
+                "from_torch_conv expects a depthwise nn.Conv2d "
+                "(groups == in_channels == out_channels)"
+            )
+        kernel_size = conv.kernel_size[0] if conv.kernel_size[0] == conv.kernel_size[1] else conv.kernel_size
+        stride = conv.stride[0] if conv.stride[0] == conv.stride[1] else conv.stride
+        padding = conv.padding[0] if conv.padding[0] == conv.padding[1] else conv.padding
+        layer = cls(
+            channels=conv.in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            qparams=qparams,
+        )
+        with torch.no_grad():
+            layer.mx_dw.weight.copy_(conv.weight)
+            layer.mx_dw.bias.copy_(conv.bias)
+        return layer
+
+    @property
+    def weight(self):
+        return self.mx_dw.weight
+
+    @property
+    def bias(self):
+        return self.mx_dw.bias
+
+    @property
+    def output_scale_log2(self) -> int:
+        return self.qparams.output_scale_log2
+
+    def calibrate(self):
+        """(Re)quantize weights and rebuild the PCU c_structs. Idempotent."""
+        qp = self.qparams
+        self.mx_dw.load_mx_weight(
+            block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.w_cal
+        )
+        self.mx_dw.load_c_struct(
+            build_c_struct_arr(qp, self.mx_dw.bias.data, self.mx_dw.channels)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mx_dw.mx_weight is None:
+            self.calibrate()
+
+        qp = self.qparams
+        x_scaled = x * 2.0 ** qp.x_cal
+        if qp.is_input_layer:
+            # The round-to-integer of x*2^cal happens exactly ONCE in the
+            # network, at the first layer (HW-confirmed, algo table Q3): the
+            # BCU shifters are unsigned/left-only, so operands must sit at a
+            # scale whose exponents are all non-negative -- i.e. integers.
+            mx = input_mx_quantizer(x_scaled.round(), block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+        else:
+            # Intermediate layers: NO pre-round -- the activation arrives in
+            # integer domain from the PCU (its shift_right realigns the scale
+            # between layers), and the MX quantizer's own per-block truncate
+            # is the only integer-ization.  A float boundary tensor therefore
+            # goes straight into the quantizer.
+            mx = base_mx_quantizer(x_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+        out_raw = self.mx_dw(mx)
+        return out_raw
+
+
+class CalibratedMXAdd(nn.Module):
+    """MX elementwise-add layer driven by observer-derived LayerMXQParams.
+
+    forward() takes two plain float torch.Tensors (like torch.add) and returns
+    the raw integer accumulator output; the float value is
+    ``output * 2**-output_scale_log2``.  Both inputs share the layer qparams
+    (residual scales must be pre-aligned before the add, as on HW).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        min_val: float = -1.0,
+        max_val: float = 1.0,
+        qparams: "LayerMXQParams | None" = None,
+    ):
+        super(CalibratedMXAdd, self).__init__()
+        if qparams is None:
+            raise ValueError("qparams (LayerMXQParams) is required")
+        self.qparams = qparams
+
+        self.mx_add = MXAdd_Loops(
+            channels=channels,
+            min_val=min_val,
+            max_val=max_val,
+        )
+
+    @property
+    def weight(self):
+        return self.mx_add.weight
+
+    @property
+    def bias(self):
+        return self.mx_add.bias
+
+    @property
+    def output_scale_log2(self) -> int:
+        return self.qparams.output_scale_log2
+
+    def set_scale(self, scale: torch.Tensor):
+        """Optional per-channel float scale, replacing the default ones vector:
+        out_c = scale_c * (A_c + B_c).  Takes effect on the next calibrate().
+        Calibrate its w_cal with MXObserver(mode="mx", per_row_flatten=True)
+        over ``layer.weight`` after setting -- same rule as conv weights (no
+        negative block exponents, so scales below 1 need a larger w_cal).
+        """
+        scale = torch.as_tensor(scale, dtype=self.mx_add.weight.dtype, device=self.mx_add.weight.device)
+        if scale.numel() != self.mx_add.channels:
+            raise ValueError(f"scale has {scale.numel()} channels, layer expects {self.mx_add.channels}")
+        with torch.no_grad():
+            self.mx_add.weight.data[:, 0, 0, :] = scale.reshape(-1, 1)
+
+    def calibrate(self):
+        """(Re)quantize the ones/scale vector and rebuild the PCU c_structs. Idempotent."""
+        qp = self.qparams
+        self.mx_add.load_mx_weight(
+            block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.w_cal
+        )
+        self.mx_add.load_c_struct(
+            build_c_struct_arr(qp, self.mx_add.bias.data, self.mx_add.channels)
+        )
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if self.mx_add.mx_weight is None:
+            self.calibrate()
+
+        qp = self.qparams
+        x_scaled = x * 2.0 ** qp.x_cal
+        y_scaled = y * 2.0 ** qp.x_cal
+        if qp.is_input_layer:
+            # Same single round-to-integer rule as CalibratedMXConv2d (algo Q3),
+            # applied to each of the two input streams.
+            mx_a = input_mx_quantizer(x_scaled.round(), block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+            mx_b = input_mx_quantizer(y_scaled.round(), block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+        else:
+            mx_a = base_mx_quantizer(x_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+            mx_b = base_mx_quantizer(y_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+        out_raw = self.mx_add(mx_a, mx_b)
+        return out_raw
+
+
+def pack_warp_reference(reference: torch.Tensor, mx_type: str = "mx-e4bm8", block_size: int = 32) -> MXTensor:
+    """Pack the warp reference as uint8 with zero exponents (plain INT).
+
+    The reference is NOT quantized to MX: just ``round + clamp`` into the
+    uint8 range and store with an all-zero exponent field (the first-layer
+    integer-input rule).  ``e_min_layer = mantissa_offset`` (calibrate_offset
+    0) so the PCU's effective shift becomes ``out_cal - (frx + fry)``.
+
+    Padding/blocking along W mirrors the activation quantizers
+    (``[B, C, H, num_blocks, block_size]``), which is what
+    ``align_mx_to_elements`` consumes.
+
+    Returns:
+        MXTensor with ``data`` = int values in [0, 255], zero ``shared_exp``.
+    """
+    cfg = mx_config_factory[mx_type]
+    if reference.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        # integer reference (sensor format): only clamp, rounding is a no-op
+        q = reference.clamp(0, 255).long()
+    else:
+        q = torch.round(reference).clamp(0, 255).long()
+    W = q.shape[-1]
+    num_blocks = math.ceil(W / block_size)
+    pad = num_blocks * block_size - W
+    if pad:
+        q = F.pad(q, (0, pad), mode="constant", value=0)
+    # blocks = q.view(*q.shape[:-1], num_blocks, block_size)
+    blocks = q
+    return MXTensor(
+        shared_exp=torch.zeros(blocks.shape[:-1], dtype=torch.long),
+        data=blocks,
+        original_shape=tuple(reference.shape),
+        exponent_bits=cfg.exponent_bits,
+        mantissa_bits=cfg.mantissa_bits,
+        e_min_layer=torch.tensor(mantissa_offset(mx_type)),
+        calibrate_offset=torch.tensor(0),
+    )
+
+
+def grid_quantization(
+    grid,
+    grid_bit_width: int
+):
+
+    delta_grid = grid
+    max_motion = torch.ceil(torch.abs(delta_grid.reshape((-1, 2))).max(dim=0).values)
+    frac_bits = grid_bit_width - torch.floor(torch.log2(max_motion)) - 2
+    # TODO add assertions to avoid 0 frac bits and more than 8 frac bits
+    delta_grid = torch.round(delta_grid * frac_bits.exp2()).to(torch.int16)
+    delta_grid = delta_grid.permute(2, 0, 1)[None, ...]
+    
+    return delta_grid, max_motion, frac_bits.reshape(1, 2, 1, 1)
+
+
+def pack_warp_grid(coords: torch.Tensor, grid_bit_width: int = 16,
+                   mx_type: str = "mx-e4bm16") -> tuple:
+    """Pack warp sample coordinates into the int16 fixed-point grid (mx-e4bm16).
+
+    This is the notebook's ``grid_quantization``: the grid holds the ABSOLUTE
+    sample position in pixels, quantized per axis with adaptive fraction bits
+
+        frac_bits_axis = grid_bit_width - floor(log2(ceil(max|coord_axis|))) - 2
+
+    so the fixed-point word ``q = round(coord * 2**frac)`` fits the wide
+    (16-bit) lane by construction.  The exponent field is all zero -- the
+    value lives in the mantissa ("NOT MX INT BUT INT").
+
+    The TRC weights are exact over ``2**(frx + fry)`` and must fit the 16-bit
+    weight lane, so the total fraction bits are capped at
+    ``min(grid_bit_width - 2, 14)``.  On small frames both axes are reduced
+    as evenly as possible, which keeps the x/y quantization error balanced.
+
+    Args:
+        coords: float tensor [B, 2, H_out, W_out] absolute sample coordinates
+                (channel 0 = x columns, channel 1 = y rows).
+
+    Returns:
+        (mx_grid, frac_bits): mx_grid an ``mx-e4bm16`` MXTensor whose data is
+        int16 [B, 2, H_out, W_out]; frac_bits an int tensor [frx, fry].
+    """
+
+    quantized_grid, max_motion, frac_bits = grid_quantization(
+        coords[0],
+        grid_bit_width
+    )
+
+    cfg = mx_config_factory[mx_type]
+
+    # per-axis adaptive fraction bits (same rule as the notebook grid_quantization)
+
+    mx_grid = MXTensor(
+        shared_exp=torch.zeros_like(quantized_grid),                 # plain INT: zero exponent
+        data=quantized_grid,
+        original_shape=tuple(quantized_grid.shape),
+        exponent_bits=cfg.exponent_bits,
+        mantissa_bits=cfg.mantissa_bits,
+        e_min_layer=torch.tensor(0),
+        calibrate_offset=torch.tensor(0),
+    )
+    return mx_grid, frac_bits
+
+def grid_sample(tensor: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """Given an input and a flow-field grid, computes the output using input
+    values and pixel locations from grid.
+
+    Args:
+        tensor: (N, C, H_in, W_in) tensor
+        grid: (N, H_out, W_out, 2) tensor in the range of [-1, 1]
+
+    Returns:
+        (N, C, H_out, W_out) tensor
+
+    See `torch.nn.functional.grid_sample`.
+    """
+    b, c, h, w = tensor.shape
+    b_, h_out, w_out, w_ = grid.shape
+    assert b == b_ and w_ == 2
+    out = []
+    for (t, g) in zip(tensor, grid):
+        x_ = 0.5 * (w - 1) * (g[..., 0].reshape(-1) + 1)
+        y_ = 0.5 * (h - 1) * (g[..., 1].reshape(-1) + 1)
+        ix = torch.floor(x_).clamp(0, w - 2).long()
+        iy = torch.floor(y_).clamp(0, h - 2).long()
+        dx = x_ - ix
+        dy = y_ - iy
+        out.append((1 - dx) * (1 - dy) * t[..., iy, ix]
+                   + dx * (1 - dy) * t[..., iy, ix + 1]
+                   + (1 - dx) * dy * t[..., iy + 1, ix]
+                   + dx * dy * t[..., iy + 1, ix + 1])
+    return torch.cat(out, dim=0).reshape(b, c, h_out, w_out)
+
+
+def sw_warp(ref, grid):
+    new_h, new_w = grid.shape[-3:-1]
+    orig_h, orig_w = ref.shape[-2:]
+    grid_norm_scale = 2 / torch.tensor([orig_w - 1, orig_h - 1], dtype=torch.float64).reshape((1, 1, 1, -1))
+    grid_normed = grid_norm_scale * grid - 1
+    expected = grid_sample(ref, grid_normed)
+
+    return expected
+
+class CalibratedMXWarp(nn.Module):
+    """Warp layer driven by LayerMXQParams through the TRC-based NPE pipe.
+
+    HW scheme (HW_WARP.md): the TRC stage generates the four reference read
+    addresses and the four bilinear weights from the int16 fixed-point grid
+    (``q = round(coord * 2**frac)``, ``mx-e4bm16``, zero exponent); TRU-A
+    fetches the four corners; TRU-W carries the TRC weights (integers over
+    ``2**(frx+fry)`` -- the mxint16 mantissa is required because the weight
+    spans up to 2**14, which does not fit mxint8); the BCU MACs the four
+    pixel/weight terms; the PCU divides by ``2**(frx+fry)``, rounds and
+    reluxes.
+
+    forward() takes plain float tensors: ``reference`` [B, C, H_in, W_in] in
+    uint8 units and ``coords`` [B, 2, H_out, W_out] ABSOLUTE sample positions
+    in pixels (channel 0 = x, 1 = y); returns the raw integer output (the
+    warped value when ``qparams.out_cal == 0``); the float value is
+    ``output * 2**-output_scale_log2``.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        grid_bit_width: int = 16,
+        acc_bit_width: int = 48,
+        qparams: "LayerMXQParams | None" = None,
+    ):
+        super(CalibratedMXWarp, self).__init__()
+        if qparams is None:
+            raise ValueError("qparams (LayerMXQParams) is required")
+        self.qparams = qparams
+        self.grid_bit_width = grid_bit_width
+
+        self.mx_warp = MXWarp_Loops(channels=channels, acc_bit_width=acc_bit_width)
+
+        # calibrated per grid fraction bits (data-dependent)
+        self._frac_key = None
+        self.is_calibrate = True
+
+    @property
+    def bias(self):
+        return self.mx_warp.bias
+
+    @property
+    def output_scale_log2(self) -> int:
+        return self.qparams.output_scale_log2
+
+    def calibrate(self, frac_bits=(7, 7)):
+        """(Re)build the warp PCU c_structs for these grid fraction bits. Idempotent.
+
+        The fraction bits are data-dependent (they come from the coordinate
+        magnitude), so ``forward`` calls this automatically whenever they
+        change; call it directly only to pre-calibrate or to override.
+        """
+        self.mx_warp.load_c_struct(
+            build_warp_c_struct_arr(
+                self.qparams,
+                self.mx_warp.bias.data,
+                self.mx_warp.channels,
+                frac_bits=frac_bits,
+            )
+        )
+        self._frac_key = tuple(int(v) for v in frac_bits_pair(frac_bits))
+
+    def forward(self, reference: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        qp = self.qparams
+        mx_ref = pack_warp_reference(reference, mx_type=qp.mx_type)
+        mx_grid, frac_bits = pack_warp_grid(coords, grid_bit_width=self.grid_bit_width)
+
+        # if self.is_calibrate:
+        #     key = tuple(int(v) for v in frac_bits)
+        #     if key != self._frac_key:
+        #         self.calibrate(frac_bits)
+        #     # return sw_warp(reference, coords)
+        out = self.mx_warp(mx_ref, mx_grid, frac_bits)
+        out_dq = out / 2.**frac_bits.sum() # workaround because I need to absorb the scale from this into the pcu (c_struct) 
+        return out_dq 

@@ -14,9 +14,9 @@ conv), and **warp**.
 | `cases.py` | the case table: one op per case, tiny shapes, fixed seed. Also `Warp`, the float spec of the warp |
 | `taps.py` | `tap(taps, name, t)` logs a value at any point; `show(taps)` prints them in order |
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
-| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv runs on their code (incl. PLA via a labelled bins stand-in). convT and warp are still placeholders (their emulator has neither yet) |
+| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv runs on their code (incl. PLA via a labelled bins stand-in). convT and warp are still placeholders: their emulator has no convT, and its warp (`CalibratedMXWarp`, `MXWarp_Loops`) is not wired in yet |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop |
-| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `EL_nb/` their notebooks |
+| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
 | `mx_config_npe_e4_pla.json` | npe_e4 + output window + PLA in HW bin form, `hw_grids` for `conv_prelu`, `conv_relu`, `conv_prelu_negb` |

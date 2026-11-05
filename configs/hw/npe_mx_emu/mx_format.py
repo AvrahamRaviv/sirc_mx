@@ -30,6 +30,11 @@ mx_config_factory = dict()
 mx_config_factory['mx-e4bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(4), overflow_mask=0xF)
 mx_config_factory['mx-e6bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(6), overflow_mask=0x3F)
 mx_config_factory['mx-e8bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(8), overflow_mask=0xFF)
+# 16-bit mantissa sibling used by the warp pipe: the TRC bilinear weights are
+# exact integers over 2**(frx+fry) (up to 2**14 = 16384) and cannot fit the
+# 8-bit mantissa lane.  Same 4-bit exponent width -> identical exponent
+# handling; only the data lane is wider.
+mx_config_factory['mx-e4bm16'] = MXTensorConfig(mantissa_bits=torch.tensor(16), exponent_bits=torch.tensor(4), overflow_mask=0xF)
 
 
 @dataclass
@@ -41,12 +46,6 @@ class MXTensor:
     mantissa_bits: torch.Tensor
     e_min_layer: torch.Tensor
     calibrate_offset: torch.Tensor
-
-
-mx_config_factory = dict()
-mx_config_factory['mx-e4bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(4), overflow_mask=0xF)
-mx_config_factory['mx-e6bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(6), overflow_mask=0x3F)
-mx_config_factory['mx-e8bm8'] = MXTensorConfig(mantissa_bits=torch.tensor(8), exponent_bits=torch.tensor(8), overflow_mask=0xFF)
 
 
 def mantissa_offset(mx_type: str = "mx-e4bm8") -> int:
@@ -97,11 +96,17 @@ def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx
 
     divisor = torch.exp2(shift_sat.unsqueeze(-1).float())
     data = blocks / divisor
-    if mx_config_factory[mx_type].mantissa_bits == 8:
+    if int(mx_config_factory[mx_type].mantissa_bits) == 8:
         preserve_lsb = 0xff
         preserve_sign = 0xffff_ff00
+    elif int(mx_config_factory[mx_type].mantissa_bits) == 16:
+        preserve_lsb = 0xffff
+        preserve_sign = 0xffff_0000
     else:
-        raise NotImplementedError("mx-int16 is not supported right now")  # handle both 8 (and 16 bit scenario (0xffff) in the future TODO)
+        raise NotImplementedError(
+            f"mantissa width {int(mx_config_factory[mx_type].mantissa_bits)} not supported "
+            f"(only 8 and 16)"
+        )
     data = data.int()
 
     data_sign = data < 0
@@ -120,9 +125,12 @@ def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx
     )
 
 
-def input_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx-e4bm8", input_type : int = 8, calibrate_offset : int = 6) -> MXTensor:
+def input_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx-e4bm8", input_type : "int | None" = None, calibrate_offset : int = 6) -> MXTensor:
     """First-layer integer input quantizer.  Same truncate-toward-zero
-    convention as base_mx_quantizer (HW-confirmed, algo table Q2)."""
+    convention as base_mx_quantizer (HW-confirmed, algo table Q2).
+
+    ``input_type`` selects the integer lane width (8 or 16); when None it is
+    taken from the mx_type mantissa width (e.g. ``mx-e4bm16`` -> 16)."""
 
     x_scaled = x  # offset to enssure unsigned exponenet (exponent shifted left)
     # 1. Pad to a multiple of block_size
@@ -152,11 +160,18 @@ def input_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "m
     shift_sat = log2_scale
 
     # overflow handling
-    if input_type:
+    if input_type is None:
+        input_type = int(mx_config_factory[mx_type].mantissa_bits)
+    if input_type == 8:
         preserve_lsb = 0xff
         preserve_sign = 0xffff_ff00
+    elif input_type == 16:
+        preserve_lsb = 0xffff
+        preserve_sign = 0xffff_0000
     else:
-        raise NotImplementedError("Missing 16-bit input implementation")  # handle both 8 (and 16 bit scenario (0xffff) in the future TODO)
+        raise NotImplementedError(
+            f"missing {input_type}-bit input implementation (only 8 and 16)"
+        )
 
     data = blocks.int()
     data_sign = data < 0

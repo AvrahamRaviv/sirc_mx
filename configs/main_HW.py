@@ -5,7 +5,8 @@ HW code lives in hw/npe_mx_emu/, copied verbatim from the HW team - never
 edited here. This file only wires it in: it builds their layer, calls their
 calibration and forward, and taps what their code produced (via a forward
 pre-hook and a pass-through wrapper on their bcu - no logic of theirs is
-reimplemented). Status, per their guide: conv done; warp, convT not yet.
+reimplemented). Status: conv wired in; their warp exists but is not wired in
+yet; they have no convT.
 
 Same interface as main_ALG:
 

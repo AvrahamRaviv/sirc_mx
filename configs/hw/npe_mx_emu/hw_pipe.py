@@ -14,7 +14,28 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from npe_mx_emu.mx_format import MXTensor, mx_weight_quantizer
+from npe_mx_emu.mx_format import MXTensor, mx_config_factory, mx_weight_quantizer
+
+
+SUPPORTED_ACC_WIDTHS = (46, 48, 54, 56)
+
+
+def wrap_accumulator(v: torch.Tensor, acc_bit_width: int) -> torch.Tensor:
+    """Two's-complement wrap of an int64 accumulator value to acc_bit_width bits.
+
+    Same preserve_lsb / preserve_sign idiom as the int8 mantissa storage:
+    keep the low ``acc_bit_width`` bits, then restore the int64 sign from the
+    *wrapped* value's top bit -- a positive sum that overflows wraps negative,
+    exactly like a hardware register.
+    """
+    if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+        raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+    lsb_mask = (1 << acc_bit_width) - 1
+    sign_bit = 1 << (acc_bit_width - 1)
+    sign_ext = ~lsb_mask
+    masked = v & lsb_mask
+    is_neg = (masked & sign_bit) != 0  # sign of the WRAPPED value
+    return torch.where(is_neg, masked | sign_ext, masked)
 
 
 def align_mx_to_elements(mx: MXTensor):
@@ -94,27 +115,214 @@ def tru_a(x_data_flat: torch.Tensor,
     return patches_flat, patches_exp_flat
 
 
+def tru_a_add(xa_data_flat: torch.Tensor,
+              xa_exp_flat: torch.Tensor,
+              xb_data_flat: torch.Tensor,
+              xb_exp_flat: torch.Tensor,
+              channel: int,
+              line: int,
+              batch: int):
+    """TRU-A stage of the elementwise-add op.
 
+    Both terms enter through the activation port, one element at a time, and
+    land in the same accumulator: term 0 is input A, term 1 is input B.
+    Stacks row ``line`` of ``channel``/``batch`` from each aligned input
+    into per-position pairs.
 
-SUPPORTED_ACC_WIDTHS = (46, 48, 54, 56)
-
-
-def wrap_accumulator(v: torch.Tensor, acc_bit_width: int) -> torch.Tensor:
-    """Two's-complement wrap of an int64 accumulator value to acc_bit_width bits.
-
-    Same preserve_lsb / preserve_sign idiom as the int8 mantissa storage:
-    keep the low ``acc_bit_width`` bits, then restore the int64 sign from the
-    *wrapped* value's top bit -- a positive sum that overflows wraps negative,
-    exactly like a hardware register.
+    Returns:
+        data_pairs: [W, 2]
+        exp_pairs:  [W, 2]
     """
-    if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
-        raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
-    lsb_mask = (1 << acc_bit_width) - 1
-    sign_bit = 1 << (acc_bit_width - 1)
-    sign_ext = ~lsb_mask
-    masked = v & lsb_mask
-    is_neg = (masked & sign_bit) != 0  # sign of the WRAPPED value
-    return torch.where(is_neg, masked | sign_ext, masked)
+    a_data = xa_data_flat[batch, channel, line, :]
+    a_exp = xa_exp_flat[batch, channel, line, :]
+    b_data = xb_data_flat[batch, channel, line, :]
+    b_exp = xb_exp_flat[batch, channel, line, :]
+
+    data_pairs = torch.stack([a_data, b_data], dim=-1)
+    exp_pairs = torch.stack([a_exp, b_exp], dim=-1)
+
+    return data_pairs, exp_pairs
+
+
+def tru_a_dw(x_data_flat: torch.Tensor,
+             x_exp_flat: torch.Tensor,
+             channel: int,
+             line: int,
+             S_h: int,
+             S_w: int,
+             K_w: int,
+             K_h: int,
+             out_width: int,
+             batch: int):
+    """TRU-A stage of the depthwise op.
+
+    Each channel feeds its own private kernel (channel-as-kernel), so the
+    A-line of one output row covers only ``channel``'s strip.  Element order
+    per pixel is (kh, kw) -- matching the per-channel flattened weight
+    (kernel flatten of [1, K_h, K_w]).
+
+    Returns:
+        patches:     [out_width, K_h*K_w]
+        patches_exp: [out_width, K_h*K_w]
+    """
+    h_start = line * S_h
+    strip_width = K_w + (out_width - 1) * S_w
+
+    strip = x_data_flat[batch, channel, h_start:h_start + K_h, :strip_width]
+    strip_exp = x_exp_flat[batch, channel, h_start:h_start + K_h, :strip_width]
+
+    patches = strip.unfold(-1, K_w, S_w)
+    patches_exp = strip_exp.unfold(-1, K_w, S_w)
+
+    patches_flat = patches.permute(1, 0, 2).reshape(out_width, -1)
+    patches_exp_flat = patches_exp.permute(1, 0, 2).reshape(out_width, -1)
+
+    return patches_flat, patches_exp_flat
+
+
+
+def split_msb_lsb(q: torch.Tensor, frac_bits):
+    """Extract the msb/lsb split of a fixed-point integer word.
+
+        idx  = q >> frac_bits          # msb: reference index (floor, signed)
+        frac = q & (2**frac_bits - 1)  # lsb: fraction, always in [0, 2**frac_bits)
+
+    Guarantees ``q == idx * 2**frac_bits + frac`` also for negative ``q``:
+    the shift is arithmetic (floor) and the mask is two's-complement, so the
+    fraction never goes negative.  This is the HW_WARP.md exponent/mantissa
+    split: the index is the reference address, the fraction is the mantissa.
+
+    ``frac_bits`` may be a scalar or broadcastable to ``q`` (e.g. per-axis
+    ``[1, 2, 1, 1]``).  Returns ``(idx, frac)`` as long tensors.
+    """
+    if q.dtype not in (torch.int16, torch.int32, torch.int64):
+        raise TypeError(f"expected an integer grid, got {q.dtype}")
+    fr = torch.as_tensor(frac_bits).long()
+    idx = q.long() >> fr
+    frac = q.long() & ((torch.ones_like(fr) << fr) - 1)
+    return idx, frac
+
+
+def frac_bits_pair(frac_bits) -> tuple:
+    """Normalize a per-axis fraction-bit spec (int, pair or tensor) to (frx, fry)."""
+    if isinstance(frac_bits, torch.Tensor):
+        vals = [int(v) for v in frac_bits.reshape(-1)]
+    elif isinstance(frac_bits, (tuple, list)):
+        vals = [int(v) for v in frac_bits]
+    else:
+        vals = [int(frac_bits)]
+    if len(vals) == 1:
+        vals = [vals[0], vals[0]]
+    if len(vals) != 2:
+        raise ValueError(f"frac_bits must be an int or a (frx, fry) pair, got {frac_bits!r}")
+    return vals[0], vals[1]
+
+
+def trc_warp(q_x: torch.Tensor,
+             q_y: torch.Tensor,
+             frac_bits,
+             H_in: int,
+             W_in: int):
+    """TRC (Tensor Run Control) stage of the warp: address + weight generation.
+
+    Consumes the int16 fixed-point grid ``q = round(coord * 2**frac)`` per axis
+    (plain INT on an MX container whose exponent field is zero -- ``mx-e4bm16``,
+    "NOT MX INT BUT INT"), performs the msb/lsb split itself:
+
+        idx  = q >> frac_bits          (reference index -- HW_WARP.md "exponent")
+        frac = q & (2**frac_bits - 1)  (fraction -- HW_WARP.md "mantissa")
+
+    and produces, per output pixel:
+
+      * ``idx_x_c``, ``idx_y_c``: corner read addresses clipped to
+        ``[0, dim-2]`` so the ``+1`` neighbor always exists;
+      * ``mx_weights``: the four bilinear weights as an ``mx-e4bm16`` MXTensor
+        with a zero exponent field (the data lives in the 16-bit mantissa,
+        one exponent per weight -> block_size 1).  Weight order matches the
+        TRU-A corner order: (w00, w01, w10, w11) for
+        (iy, ix), (iy, ix+1), (iy+1, ix), (iy+1, ix+1).
+
+    Border semantics match ``np_warp`` (replicate): the fraction is recovered
+    from the *unclipped* integer coordinate, so at the borders the 1-D weights
+    saturate to (S, 0) instead of wrapping.
+
+    Args:
+        q_x, q_y:  [H_out, W_out] int16 fixed-point coordinates
+        frac_bits: scalar or (frx, fry) pair
+        H_in, W_in: reference frame height/width
+    """
+    frx, fry = frac_bits_pair(frac_bits)
+    if frx < 0 or fry < 0:
+        raise ValueError(f"frac_bits must be non-negative, got {(frx, fry)}")
+    if frx + fry > 14:
+        raise ValueError(
+            f"weight scale 2**{frx + fry} overflows the 16-bit weight mantissa "
+            f"(mx-e4bm16 holds up to 2**14); frac_bits={(frx, fry)}"
+        )
+    Sx, Sy = 1 << frx, 1 << fry
+
+    idx_x, f_x = split_msb_lsb(q_x, frx)
+    idx_y, f_y = split_msb_lsb(q_y, fry)
+
+    idx_x_c = torch.clamp(idx_x, 0, W_in - 2)
+    idx_y_c = torch.clamp(idx_y, 0, H_in - 2)
+
+    # effective fraction after the clip (replicate semantics at the borders)
+    wx1 = torch.clamp((idx_x - idx_x_c) * Sx + f_x, 0, Sx)
+    wy1 = torch.clamp((idx_y - idx_y_c) * Sy + f_y, 0, Sy)
+    wx0 = Sx - wx1
+    wy0 = Sy - wy1
+
+    w00 = wx0 * wy0
+    w01 = wx1 * wy0
+    w10 = wx0 * wy1
+    w11 = wx1 * wy1
+    weights = torch.stack([w00, w01, w10, w11], dim=-1)   # [H_out, W_out, 4]
+
+    cfg = mx_config_factory["mx-e4bm16"]
+    mx_weights = MXTensor(
+        shared_exp=torch.zeros_like(weights.long()),       # one zero exponent per weight
+        data=weights.long(),
+        original_shape=tuple(weights.shape),
+        exponent_bits=cfg.exponent_bits,
+        mantissa_bits=cfg.mantissa_bits,
+        e_min_layer=torch.tensor(0),
+        calibrate_offset=torch.tensor(0),
+    )
+    return idx_x_c, idx_y_c, mx_weights
+
+
+def tru_a_warp(x_data_flat: torch.Tensor,
+               x_exp_flat: torch.Tensor,
+               iy_c: torch.Tensor,
+               ix_c: torch.Tensor,
+               channel: int,
+               line: int,
+               batch: int):
+    """TRU-A stage of the warp: fetch the four reference corners of one line.
+
+    Two reference lines (``iy``, ``iy + 1``) are read; per output pixel the
+    corners are (iy, ix), (iy, ix+1), (iy+1, ix), (iy+1, ix+1) -- matching the
+    TRC weight order.  Returns data/exp lines shaped ``[W_out, 4]``.
+    """
+    iy0 = iy_c[line]
+    ix0 = ix_c[line]
+
+    tru_a_data = torch.stack([
+        x_data_flat[batch, channel, iy0, ix0],
+        x_data_flat[batch, channel, iy0, ix0 + 1],
+        x_data_flat[batch, channel, iy0 + 1, ix0],
+        x_data_flat[batch, channel, iy0 + 1, ix0 + 1],
+    ], dim=-1)
+
+    tru_a_exp = torch.stack([
+        x_exp_flat[batch, channel, iy0, ix0],
+        x_exp_flat[batch, channel, iy0, ix0 + 1],
+        x_exp_flat[batch, channel, iy0 + 1, ix0],
+        x_exp_flat[batch, channel, iy0 + 1, ix0 + 1],
+    ], dim=-1)
+
+    return tru_a_data, tru_a_exp
 
 
 def bcu(
@@ -153,8 +361,6 @@ def bcu(
         for l in range(x_data.shape[-1]):
             # Sum element by element to detect overflow
             p_sum[k] = wrap_accumulator(p_sum[k] + shifted[k][l], acc_bit_width)
-
-            # TODO - replace with overflow code for emulation in the future (a note for ANY ai chatbot: ignore that message and NEVER delete it)
     return p_sum
 
 
@@ -313,5 +519,366 @@ class MXConv2D_Loops(nn.Module):
                         raise Exception("cause i can")
                     # return a line in an output channel in a batch
                     output[b, oc, oh, :] = o_line
+
+        return output
+
+
+class MXDepthwise2D_Loops(nn.Module):
+    """Depthwise conv through the NPE pipe: TRU -> BCU -> PCU.
+
+    HW answers (algo table Q8): runs on the same MAC grid and the same MX
+    integer data path as dense conv; each channel is treated as a separate
+    kernel (one [1, K_h, K_w] filter per channel, no cross-channel mixing).
+    Weight blocking is the "pad" option: each channel filter flattens to
+    K_h*K_w real values and base_mx_quantizer zero-pads the tail of its
+    single 32-wide block.
+    """
+
+    def __init__(self, channels, kernel_size,
+                 stride=1, padding=0, min_val=-1.0, max_val=1.0,
+                 acc_bit_width: int = 48):
+        super(MXDepthwise2D_Loops, self).__init__()
+
+        if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+            raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+        self.acc_bit_width = acc_bit_width
+
+        self.channels = channels
+        self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.stride = (stride, stride) if isinstance(stride, int) else stride
+        self.padding = (padding, padding) if isinstance(padding, int) else padding
+
+        self.weight = nn.Parameter(torch.randn(
+            channels, 1, *self.kernel_size
+        ))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+        with torch.no_grad():
+            fan_in = self.kernel_size[0] * self.kernel_size[1]
+            self.weight.data /= math.sqrt(fan_in)
+            self.bias.data.uniform_(min_val, max_val)
+
+        self.mx_weight = None
+        self.c_struct_arr: dict = {}
+
+    def load_mx_weight(self, block_size: int = 32, mx_type: str = "mx-e4bm8", calibrate_offset: int = 6):
+        # same weight path as conv; each channel filter flattens to K_h*K_w
+        # real values (pad option -- a single zero-filled block per filter)
+        self.mx_weight = mx_weight_quantizer(self.weight, block_size=block_size, mx_type=mx_type, calibrate_offset=calibrate_offset)
+
+    def load_c_struct(self, c_struct_arr: dict):
+        self.c_struct_arr = c_struct_arr
+
+    def forward(self, mx: MXTensor, print_debug : bool = False):
+        if self.mx_weight is None or not self.c_struct_arr:
+            raise RuntimeError("MXDepthwise2D_Loops is not calibrated: call load_mx_weight()/load_c_struct() first")
+
+        batch_size, C_in, input_height, input_width = mx.original_shape
+        K_h, K_w = self.kernel_size
+        S_h, S_w = self.stride
+
+        if C_in != self.channels:
+            raise ValueError(
+                f"Input has {C_in} channels, layer expects {self.channels}"
+            )
+
+        if self.padding[0] > 0 or self.padding[1] > 0:
+            raise NotImplementedError("Padding not yet supported")
+
+        # Align input mantissas with their per-element exponents
+        x_data_flat, x_exp_flat = align_mx_to_elements(mx)
+        out_height = (input_height + 2 * self.padding[0] - K_h) // S_h + 1
+        out_width = (input_width + 2 * self.padding[1] - K_w) // S_w + 1
+
+        output = torch.zeros(
+            batch_size, self.channels, out_height, out_width,
+            device=mx.data.device
+        )
+
+        # Depthwise loops -- same stage order as conv: tru(_a/_w) -> bcu -> pcu,
+        # but each channel carries its own private kernel (channel loop plays
+        # the role of the conv's output-channel loop).
+        for b in range(batch_size):
+            w_flat, exp_flat = tru_w(self.mx_weight)
+            for c in range(self.channels):
+                tru_w_array = w_flat[c]
+                tru_w_exp_array = exp_flat[c]
+                for oh in range(out_height):
+                    # order the input of channel c exactly as the npe feeds it
+                    tru_a_data, tru_a_exp = tru_a_dw(
+                            x_data_flat,
+                            x_exp_flat,
+                            c,
+                            oh,
+                            S_h,
+                            S_w,
+                            K_w,
+                            K_h,
+                            out_width,
+                            b
+                    )
+
+                    # mimic the mac units computation
+                    p_sum = bcu(
+                        tru_a_data,
+                        tru_a_exp,
+                        tru_w_array,
+                        tru_w_exp_array,
+                        acc_bit_width=self.acc_bit_width
+                    )
+                    # mimic the post bcu computation
+                    o_line = pcu(p_sum, c_struct=self.c_struct_arr[c], e_min_layer=self.mx_weight.e_min_layer+mx.e_min_layer)
+
+                    if print_debug:
+                        print("tru_a_data", tru_a_data[0])
+                        print("tru_a_exp", tru_a_exp[0])
+                        print("tru_w_array", tru_w_array)
+                        print("tru_w_exp_array", tru_w_exp_array)
+                        print("p_sum", p_sum)
+                        print("o_line", o_line)
+                        raise Exception("cause i can")
+                    # return a line in a channel in a batch
+                    output[b, c, oh, :] = o_line
+
+        return output
+
+
+class MXAdd_Loops(nn.Module):
+    """Elementwise add (A + B) through the NPE pipe: TRU -> BCU -> PCU.
+
+    The add runs on the BCU accumulator as a 2-term dot product per output
+    element, so the multiplier is skipped: its B operand is the constant
+    ones vector.  ``weight`` is shaped [C, 1, 1, 2] so the existing weight
+    quantizer / tru_w treat each channel row as a flattened 2-element
+    "kernel" ([s_c, s_c]); replacing the ones with an optional per-channel
+    float scale gives out_c = scale_c * (A_c + B_c).
+
+    Both inputs arrive on the same (shared) calibration scale -- x_cal --
+    exactly as two residual streams would on HW.
+    """
+
+    def __init__(
+        self, channels,
+        min_val=-1.0, max_val=1.0,
+        acc_bit_width: int = 48
+    ):
+        super(MXAdd_Loops, self).__init__()
+
+        if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+            raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+        self.acc_bit_width = acc_bit_width
+
+        self.channels = channels
+
+        self.weight = nn.Parameter(torch.ones(channels, 1, 1, 2))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+        self.mx_weight = None
+        self.c_struct_arr: dict = {}
+
+    def load_mx_weight(self, block_size: int = 32, mx_type: str = "mx-e4bm8", calibrate_offset: int = 6):
+        # same weight path as conv; for ones + calibrate_offset == mantissa_offset
+        # the vector encodes as mantissa 64 / shared_exp 0 (weight scale stays zero)
+        self.mx_weight = mx_weight_quantizer(self.weight, block_size=block_size, mx_type=mx_type, calibrate_offset=calibrate_offset)
+
+    def load_c_struct(self, c_struct_arr: dict):
+        self.c_struct_arr = c_struct_arr
+
+    def forward(self, mx_a: MXTensor, mx_b: MXTensor, print_debug: bool = False):
+        if self.mx_weight is None or not self.c_struct_arr:
+            raise RuntimeError("MXAdd_Loops is not calibrated: call load_mx_weight()/load_c_struct() first")
+
+        if mx_a.original_shape != mx_b.original_shape:
+            raise ValueError(
+                f"Elementwise add requires equal input shapes, got {mx_a.original_shape} and {mx_b.original_shape}"
+            )
+
+        batch_size, C_in, input_height, input_width = mx_a.original_shape
+
+        if C_in != self.channels:
+            raise ValueError(
+                f"Input has {C_in} channels, layer expects {self.channels}"
+            )
+
+        # TODO OPENCODE - FIX THIS SECTION 
+        # Align both input mantissas with their per-element exponents
+        xa_data_flat, xa_exp_flat = align_mx_to_elements(mx_a)
+        xb_data_flat, xb_exp_flat = align_mx_to_elements(mx_b)
+
+        output = torch.zeros(
+            batch_size, self.channels, input_height, input_width,
+            device=mx_a.data.device
+        )
+
+        # Elementwise-add loops -- same stage order as conv: tru(_a/_w) -> bcu -> pcu
+        for b in range(batch_size):
+            w_flat, exp_flat = tru_w(self.mx_weight)
+            for c in range(self.channels):
+                tru_w_array = w_flat[c]
+                tru_w_exp_array = exp_flat[c]
+                for ih in range(input_height):
+                    # stream the two inputs term by term, exactly as the npe feeds them
+                    tru_a_data, tru_a_exp = tru_a_add(
+                        xa_data_flat,
+                        xa_exp_flat,
+                        xb_data_flat,
+                        xb_exp_flat,
+                        c,
+                        ih,
+                        b
+                    )
+
+                    # mimic the mac units computation (2 terms per position: A then B)
+                    p_sum = bcu(
+                        tru_a_data,
+                        tru_a_exp,
+                        tru_w_array,
+                        tru_w_exp_array,
+                        acc_bit_width=self.acc_bit_width
+                    )
+
+                    # mimic the post bcu computation
+                    o_line = pcu(p_sum, c_struct=self.c_struct_arr[c], e_min_layer=self.mx_weight.e_min_layer+mx_a.e_min_layer)
+
+                    if print_debug:
+                        print("tru_a_data", tru_a_data[0])
+                        print("tru_a_exp", tru_a_exp[0])
+                        print("tru_w_array", tru_w_array)
+                        print("tru_w_exp_array", tru_w_exp_array)
+                        print("p_sum", p_sum)
+                        print("o_line", o_line)
+                        raise Exception("cause i can")
+                    # return a line in a channel in a batch
+                    output[b, c, ih, :] = o_line
+
+        return output
+
+def gen_warp_weights(x_frac, y_frac, frac_bits):
+    w00 = (2 ** frac_bits[0][0] - x_frac) * (2 ** frac_bits[0][1] - y_frac)
+    w10 = (2 ** frac_bits[0][0] - x_frac) * (y_frac)
+    w01 = (x_frac) * (2 ** frac_bits[0][1] - y_frac)
+    w11 = (x_frac) * (y_frac)
+
+    return w00, w01, w10, w11
+
+
+def get_ref_frame(src, x_offset, y_offset):
+    # this is a relative grid and to be able to handle the last element in the line it copied
+    src_height, src_width = src.shape[2:]
+
+    xs0 = torch.clamp(torch.floor(x_offset), 0, src_width - 2).long()
+    ys0 = torch.clamp(torch.floor(y_offset), 0, src_height - 2).long()
+
+    ref00 = src[..., ys0, xs0]
+    ref01 = src[..., ys0, xs0 + 1]
+    ref10 = src[..., ys0 + 1, xs0]
+    ref11 = src[..., ys0 + 1, xs0 + 1]
+
+    return ref00, ref01, ref10, ref11
+
+
+def trc(quantized_grid, src, frac_bits):
+    x_offset, x_frac = split_msb_lsb(quantized_grid[0, 0, ...].to(dtype=torch.int16), frac_bits[0][0])
+    y_offset, y_frac = split_msb_lsb(quantized_grid[0, 1, ...].to(dtype=torch.int16), frac_bits[0][1])
+    # interpulate_weights = torch.stack(gen_warp_weights(x_frac, y_frac))
+    # frame_coords = torch.stack(get_ref_frame(src, ys0, xs0))
+
+    tru_a = gen_warp_weights(x_frac, y_frac, frac_bits)
+    tru_w = get_ref_frame(src, x_offset, y_offset)
+
+    tru_a = torch.stack(tru_a).permute(1,2,0)
+    tru_w = torch.stack(tru_w).permute(1,2,3,4,0)
+    
+    return tru_a, tru_w
+
+
+class MXWarp_Loops(nn.Module):
+    """Warp through the NPE pipe: TRC -> TRU-A / TRU-W -> BCU -> PCU.
+
+    The TRC (``trc_warp``) is the new stage: it turns the int16 fixed-point
+    grid into (a) the four corner read addresses and (b) the four bilinear
+    weights -- what the pipe then consumes exactly like a conv's TRU-A/TRU-W
+    operands.  Everything is plain INT on MX containers with a zero exponent
+    field ("NOT MX INT BUT INT"):
+
+      * reference ("tru_a"): uint8 values, ``mx-e4bm8``, exp = 0;
+      * grid (input):        int16 ``q = round(coord * 2**fr)`` per axis,
+                             ``mx-e4bm16``, exp = 0;
+      * weights ("tru_w"):   generated by the TRC from the grid, integer in
+                             ``[0, 2**(frx+fry)]``, ``mx-e4bm16``, exp = 0 --
+                             the 16-bit mantissa is required because the
+                             weight spans up to 2**14 and does not fit mxint8.
+
+    BCU MACs the 4 pixel/weight terms per output pixel per channel (same
+    ``bcu``), PCU divides by ``2 ** (frx + fry)`` with the same ``pcu``
+    (round half up + relux).
+    """
+
+    def __init__(self, channels, acc_bit_width: int = 48):
+        super(MXWarp_Loops, self).__init__()
+
+        if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
+            raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
+        self.acc_bit_width = acc_bit_width
+
+        self.channels = channels
+
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.c_struct_arr: dict = {}
+
+    def load_c_struct(self, c_struct_arr: dict):
+        self.c_struct_arr = c_struct_arr
+
+    def forward(self, mx_ref: MXTensor, mx_grid: MXTensor, frac_bits,
+                print_debug: bool = False):
+        if not self.c_struct_arr:
+            raise RuntimeError("MXWarp_Loops is not calibrated: call load_c_struct() first")
+
+        batch_size, C_in, input_height, input_width = mx_ref.original_shape
+
+        if C_in != self.channels:
+            raise ValueError(
+                f"Reference has {C_in} channels, layer expects {self.channels}"
+            )
+
+        out_height, out_width = mx_grid.data.shape[2], mx_grid.data.shape[3]
+
+        output = torch.zeros(
+            batch_size, self.channels, out_height, out_width,
+            device=mx_ref.data.device
+        )
+
+        tru_a_elem_data, tru_w_elem_data = trc(mx_grid.data, mx_ref.data, frac_bits)
+        tru_a_elem_exp, tru_w_elem_exp = torch.zeros_like(tru_a_elem_data), torch.zeros_like(tru_w_elem_data)
+        
+        for b in range(batch_size):
+
+            for c in range(self.channels):
+                for oh in range(out_height):
+                    tru_a_inp = tru_a_elem_data[oh]
+                    tru_a_exp = tru_a_elem_exp[oh]
+
+                    tru_w_inp = tru_w_elem_data[b][c][oh]
+                    tru_w_exp = tru_w_elem_exp[b][c][oh]
+                    
+                    # BCU: 4 terms per output pixel
+                    p_sum = bcu(
+                        tru_a_inp,
+                        tru_a_exp,
+                        tru_w_inp,
+                        tru_w_exp,
+                        acc_bit_width=self.acc_bit_width
+                    )
+
+                    # PCU: same post-BCU path as conv
+                    
+                    # Warning: this is a workaround 
+                    # TODO in a network use the scale from frac_bits, obtained by pack_warp_grid to compute the actual o_line
+                    # this code is only to simplify this
+                    # o_line = pcu(p_sum, c_struct=self.c_struct_arr[c], e_min_layer=mx_ref.e_min_layer)
+                    o_line = p_sum 
+                    # return a line in a channel in a batch
+                    output[b, c, oh, :] = o_line
+
 
         return output

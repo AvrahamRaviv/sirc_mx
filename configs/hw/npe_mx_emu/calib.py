@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import torch
 
-from npe_mx_emu.hw_pipe import Cstruct
+from npe_mx_emu.hw_pipe import Cstruct, frac_bits_pair
 from npe_mx_emu.mx_format import mantissa_offset
 
 
@@ -79,6 +79,60 @@ def build_c_struct(
         min_val=-2.0 ** (relux_bits - 1),
         max_val=2.0 ** (relux_bits - 1) - 1,
     )
+
+
+def build_warp_c_struct_arr(
+    qparams: LayerMXQParams,
+    bias: torch.Tensor,
+    out_channels: int,
+    frac_bits=(7, 7),
+    relux_bits: int = 24,
+) -> dict:
+    """Derive the PCU c_structs for a warp layer.
+
+    All warp operands are plain INTs with zero exponents ("NOT MX INT BUT
+    INT"): the reference is uint8 (x scale **1) and the TRC weights are exact
+    integers over ``2 ** (frx + fry)`` (per-axis fraction bits from the grid
+    quantizer), so the accumulator units are ``2 ** (frx + fry)`` and the
+    bias is placed on those units.  The PCU shift removes the weight fraction
+    scale; the runtime ``e_min_layer`` of the reference (``mantissa_offset``,
+    calibrate_offset 0) covers the ``mantissa_offset`` part, hence::
+
+        c_struct.shift      = out_cal - mantissa_offset - (frx + fry)
+        effective pcu shift = shift + e_min_layer = out_cal - (frx + fry)
+
+    With ``out_cal = 0`` the output is the warped value rounded to integer,
+    then reluxed to the int range (default the 24-bit relux, like
+    ``build_c_struct`` -- the warp demo data spans 0..255, so an int8 clamp
+    is available only by passing ``relux_bits=8`` explicitly).
+
+    Args:
+        frac_bits: scalar or (frx, fry) pair used to quantize the grid.
+    """
+    if bias.shape[0] != out_channels:
+        raise ValueError(f"bias has {bias.shape[0]} channels, layer expects {out_channels}")
+    frx, fry = frac_bits_pair(frac_bits)
+    fp = frx + fry
+    if fp > 14:
+        raise ValueError(
+            f"weight scale 2**{fp} overflows the 16-bit weight mantissa (max 2**14); "
+            f"frac_bits={(frx, fry)}"
+        )
+    mo = mantissa_offset(qparams.mx_type)
+    shift = qparams.out_cal - mo - fp
+    relux_max = 2.0 ** (relux_bits - 1) - 1
+    relux_min = -2.0 ** (relux_bits - 1)
+    return {
+        oc: Cstruct(
+            bias=(bias[oc].float() * 2.0 ** fp + 0.5).floor().long(),
+            scale=1,
+            shift=shift,
+            round_type="round",
+            min_val=relux_min,
+            max_val=relux_max,
+        )
+        for oc in range(out_channels)
+    }
 
 
 def build_c_struct_arr(
