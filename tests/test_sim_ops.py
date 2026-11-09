@@ -517,7 +517,7 @@ def test_hw_warp_per_site_list_of_wrong_length_refused():
 # --- ALG warp on every shape of warp entry the configs hold -----------------
 
 DOF_RUN = SC.load_config("mx_config_dof_run.json")         # ref fxp: per-site list
-HW_EXACT = SC.load_config("mx_config_npe_hw_exact.json")   # warp entry: no output
+# HWX (mx_config_npe_hw_exact.json): its warp entry has no output
 
 
 def test_alg_warp_reads_a_per_site_ref_list_by_the_lib_rule():
@@ -536,7 +536,7 @@ def test_alg_warp_reads_a_per_site_ref_list_by_the_lib_rule():
         ALG.run(case, bad)
 
 
-@pytest.mark.parametrize("cfg", [DOF_RUN, HW_EXACT], ids=["dof_run", "hw_exact"])
+@pytest.mark.parametrize("cfg", [DOF_RUN, HWX], ids=["dof_run", "hw_exact"])
 def test_alg_warp_without_output_fxp_is_unrounded_as_the_lib(cfg):
     """A warp entry with no output: the lib passes the bilinear result
     through (MXActQuant.quant_output), so ALG out is out_pre, off the
@@ -565,7 +565,7 @@ def test_alg_warp_non_fxp_output_has_no_out_code():
 
 def test_t12_output_requant_q7_without_output_fxp():
     """D7 on a config with no output fxp: ALG gives the acc unrounded."""
-    (v,) = [x for x in WV.vectors(HW_EXACT) if x["label"] == "D7 | HW Q7"]
+    (v,) = [x for x in WV.vectors(HWX) if x["label"] == "D7 | HW Q7"]
     assert (v["acc"], v["alg"], v["hw"], v["pcu"]) == (37.5, 37.5, 37.5, 38)
     assert "no output fxp" in v["text"]
 
