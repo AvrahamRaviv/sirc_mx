@@ -26,6 +26,7 @@ import cases as C
 import main as M
 import main_ALG as ALG
 import main_HW as HW
+import sim_config as SC
 from npe_mx_emu import pack_warp_reference, pcu_div
 
 # frame sizes of the fraction-bit vectors (D2 / D3), zero flow
@@ -73,9 +74,9 @@ class _Sim:
 
 
 # What a side raises on a config the warp cannot run on: main_ALG a missing
-# fxp entry (KeyError) or a bad one (ValueError), main_HW a refusal or a
-# missing grid format. Any other error is a bug and propagates.
-CANNOT_RUN = (KeyError, ValueError, NotImplementedError, SystemExit)
+# fxp entry (KeyError) or a bad one (ValueError), either side a documented
+# refusal (sim_config.REFUSED). Any other error is a bug and propagates.
+CANNOT_RUN = (KeyError, ValueError) + SC.REFUSED
 
 
 def probe(cfg):
