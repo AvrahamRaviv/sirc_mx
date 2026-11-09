@@ -327,10 +327,6 @@ def _u8_cases():
     return U8
 
 
-def _flow(B, H, W, fx, fy):
-    return C._flow((B, 2, H, W), ("const", fx, fy), None)
-
-
 @pytest.mark.parametrize("name", _u8_cases())
 def test_hw_warp_runs_their_code(name):
     """Every code-lattice warp case runs on their code: their packed
@@ -415,7 +411,7 @@ def test_hw_warp_refuses_what_their_code_would_get_wrong():
     packer would clamp (signed, or above 255), H < 2, an axis whose fraction
     bits come out infinite. Same flows over a batch run."""
     ok = torch.randint(0, 128, (2, 1, 3, 8), generator=torch.Generator().manual_seed(1))
-    f = _flow(2, 3, 8, 0.5, 0.0)
+    f = C.const_flow(2, 3, 8, 0.5, 0.0)
     t = HW.run(C.warp_case("b", ok, f, C.P2, C.P2), E4)
     one = HW.run(C.warp_case("b1", ok[1:], f[1:], C.P2, C.P2), E4)
     assert torch.equal(t["hw_acc"][1:], one["hw_acc"])
@@ -427,10 +423,10 @@ def test_hw_warp_refuses_what_their_code_would_get_wrong():
         ref = ok[:1].clone()
         ref[0, 0, 0, 0] = bad
         with pytest.raises(NotImplementedError, match="clamps to uint8"):
-            HW.run(C.warp_case("r", ref, _flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
+            HW.run(C.warp_case("r", ref, C.const_flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
     with pytest.raises(NotImplementedError, match="H = 1"):
-        HW.run(C.warp_case("h", ok[:1, :, :1], _flow(1, 1, 8, 0, 0), C.P2, C.P2), E4)
-    fy = _flow(1, 3, 8, 0.0, 0.0)
+        HW.run(C.warp_case("h", ok[:1, :, :1], C.const_flow(1, 1, 8, 0, 0), C.P2, C.P2), E4)
+    fy = C.const_flow(1, 3, 8, 0.0, 0.0)
     fy[0, 1] = -torch.arange(3.0).view(3, 1)        # every y position 0
     with pytest.raises(NotImplementedError, match="fraction bits"):
         HW.run(C.warp_case("y", ok[:1], fy, C.P2, C.P2), E4)
@@ -446,7 +442,7 @@ def test_hw_warp_grid_format_from_config_and_reported():
         cfg = copy.deepcopy(E4)
         cfg["entries"]["model.warp"]["inputs"][1]["fxp"].update(grid)
         return cfg
-    z = lambda H, W: C.warp_case("z", torch.zeros(1, 1, H, W), _flow(1, H, W, 0, 0),
+    z = lambda H, W: C.warp_case("z", torch.zeros(1, 1, H, W), C.const_flow(1, H, W, 0, 0),
                                  C.P2, C.P2)
     t = HW.run(z(4, 40), cfg_with(frac_bits=7))
     assert t["frac_cfg"].tolist() == [7, 7] and int(t["frac_match"]) == 0

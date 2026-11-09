@@ -36,10 +36,6 @@ def _ramp(H, W, f):
     return f(xx, yy).view(1, 1, H, W)
 
 
-def _const_flow(B, H, W, fx, fy):
-    return C._flow((B, 2, H, W), ("const", fx, fy), None)
-
-
 def _vec(label, text, alg, hw, **more):
     return {"label": label, "text": text, "alg": alg, "hw": hw, **more}
 
@@ -85,7 +81,7 @@ def probe(cfg):
     """None when both sides run a plain warp case on `cfg`, else why not
     ("<side> <error>"): every vector would fail the same way."""
     case = C.warp_case("probe", _ramp(2, 4, lambda x, y: x + y),
-                       _const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2)
+                       C.const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2)
     for side, run in (("main_ALG", ALG.run), ("main_HW", HW.run)):
         try:
             run(case, cfg)
@@ -108,7 +104,7 @@ def _border(sim):
     out = []
     for (fx, fy), (yy, xx), where in (((-0.25, 0.0), (1, 0), "x = -0.25, y = 1"),
                                       ((0.0, 0.25), (3, 2), "x = 2, y = H-1+0.25")):
-        _, _, _, acc_a, acc_h = sim.warp(ref, _const_flow(1, 4, 6, fx, fy))
+        _, _, _, acc_a, acc_h = sim.warp(ref, C.const_flow(1, 4, 6, fx, fy))
         a, h = float(acc_a[0, 0, yy, xx]), float(acc_h[0, 0, yy, xx])
         out.append(_vec("D1 | HW Q1", f"border, sample at {where}: ALG (zero outside) "
                         f"{a:.2f}, HW {h:.2f}", a, h, ref=ref, at=(yy, xx)))
@@ -118,12 +114,12 @@ def _border(sim):
 def _identity(sim):
     """D1, Q2: zero flow, last row (3x4) and last column (W = 32)."""
     ref = _ramp(3, 4, lambda x, y: 12 * y + 3 * x)
-    _, _, _, acc_a, acc_h = sim.warp(ref, _const_flow(1, 3, 4, 0.0, 0.0))
+    _, _, _, acc_a, acc_h = sim.warp(ref, C.const_flow(1, 3, 4, 0.0, 0.0))
     a, h = acc_a[0, 0, -1].tolist(), acc_h[0, 0, -1].tolist()
     row = _vec("D1 | HW Q2", f"zero flow, 3x4, last row: ref {ref[0, 0, -1].tolist()}, "
                f"ALG {a}, HW {h}", a, h, ref=ref)
     ref = _ramp(2, 32, lambda x, y: 3 * x)
-    _, _, _, acc_a, acc_h = sim.warp(ref, _const_flow(1, 2, 32, 0.0, 0.0))
+    _, _, _, acc_a, acc_h = sim.warp(ref, C.const_flow(1, 2, 32, 0.0, 0.0))
     a, h = float(acc_a[0, 0, 0, -1]), float(acc_h[0, 0, 0, -1])
     col = _vec("D1 | HW Q2", f"zero flow, 2x32, last column: ref {int(ref[0, 0, 0, -1])}, "
                f"ALG {a:g}, HW {h:g}", a, h, ref=ref)
@@ -136,7 +132,7 @@ def _frac(sim):
     sums = []
     for Hh, Ww in FRAC_SIZES:
         h = sim.hw(C.warp_case("t12", torch.zeros(1, 1, Hh, Ww),
-                               _const_flow(1, Hh, Ww, 0.0, 0.0), C.P2, C.P2))
+                               C.const_flow(1, Hh, Ww, 0.0, 0.0), C.P2, C.P2))
         sums.append((Hh, Ww, h["frac_cfg"].tolist(), h["hw_frac_bits"].tolist(),
                      int(h["frac_sum"])))
     size = {(Hh, Ww): (fc, fh) for Hh, Ww, fc, fh, _ in sums}
@@ -166,14 +162,14 @@ def _ties(sim):
     out = []
     ref = torch.full((1, 1, 2, 100), 50)
     for t in (0.5, -0.5):
-        _, a, h, _, _ = sim.warp(ref, _const_flow(1, 2, 100, t / 256, 0.0))
+        _, a, h, _, _ = sim.warp(ref, C.const_flow(1, 2, 100, t / 256, 0.0))
         fr = int(h["hw_frac_bits"][0])
         dx_a = int(a["grid_code"][0, 0, 0, 10])
         dx_h = (float(h["hw_grid_code"][0, 0, 0, 10]) / 2 ** fr - 10) * 256
         out.append(_vec("D4 | HW Q5", f"grid tie, flow x {t:+}/256 (their frac x {fr}): "
                         f"ALG {dx_a:+d}/256 px, HW {dx_h:+g}/256 px", dx_a, dx_h, tie=t))
     ref = torch.tensor([[[[2.5, 3.5, 4.0]] * 2]])
-    _, a, h, _, _ = sim.warp(ref, _const_flow(1, 2, 3, 0.0, 0.0))
+    _, a, h, _, _ = sim.warp(ref, C.const_flow(1, 2, 3, 0.0, 0.0))
     ca, ch = a["ref_code"][0, 0, 0].tolist(), h["hw_ref_code"][0, 0, 0, :3].tolist()
     out.append(_vec("D6 | HW Q5", f"reference ties {ref[0, 0, 0].tolist()}: ALG codes "
                     f"{ca}, HW {ch}", ca, ch, ref=ref[0, 0, 0]))
@@ -183,7 +179,7 @@ def _ties(sim):
 def _ref_format(sim):
     """D5 reference format, Q6: signed and above-int8 codes."""
     ref = torch.tensor([[[[-50, 0, 127, 200]] * 2]])
-    case = C.warp_case("t12", ref, _const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2)
+    case = C.warp_case("t12", ref, C.const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2)
     refusal = sim.hw_refusal(case, 60)
     a = sim.alg(case)["ref_code"][0, 0, 0].tolist()
     h = pack_warp_reference(ref.double()).data[0, 0, 0, :4].tolist()
@@ -194,7 +190,7 @@ def _ref_format(sim):
 def _out_requant(sim):
     """D7 output requant, Q7: acc 37.5, out step = ref step."""
     ref = _ramp(2, 40, lambda x, y: 37 + x % 2)
-    _, a, h, _, acc_h = sim.warp(ref, _const_flow(1, 2, 40, 0.5, 0.0))
+    _, a, h, _, acc_h = sim.warp(ref, C.const_flow(1, 2, 40, 0.5, 0.0))
     pcu = int(pcu_div(h["hw_acc"][0, 0, 0, :1], -int(h["frac_sum"]), "round"))
     acc = float(acc_h[0, 0, 0, 0])
     ca, ch = int(a["out_code"][0, 0, 0, 0]), float(h["out_raw"][0, 0, 0, 0])
@@ -238,7 +234,7 @@ def _padding(sim):
     out = []
     for Ww in (40, 32):
         _, _, h, acc_a, acc_h = sim.warp(torch.full((1, 1, 2, Ww), 100),
-                                         _const_flow(1, 2, Ww, 0.5, 0.0))
+                                         C.const_flow(1, 2, Ww, 0.5, 0.0))
         a, hv = float(acc_a[0, 0, 0, -1]), float(acc_h[0, 0, 0, -1])
         out.append(_vec("D1 | HW Q10", f"W {Ww} (padded to {h['hw_ref_code'].shape[-1]}), "
                         f"x = W-1+0.5 on 100: ALG {a:g}, HW {hv:g}", a, hv, W=Ww))

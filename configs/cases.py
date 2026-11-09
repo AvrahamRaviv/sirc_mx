@@ -191,6 +191,12 @@ def warp_case(name, codes, flow, ref_scale, out_scale):
             "act": None, "input_layer": False, "params": {}}
 
 
+def const_flow(B, H, W, fx, fy):
+    """A flow [B,2,H,W] moving every pixel by (fx, fy) px, as a table entry's
+    ("const", fx, fy), for hand-built warp cases."""
+    return _flow((B, 2, H, W), ("const", fx, fy), None)
+
+
 def select(arg):
     """'-m' value -> case names: a case name, an op tag, or 'all'."""
     if arg == "all":
