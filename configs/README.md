@@ -160,7 +160,12 @@ The generic compare covers `out`. ALG's int8 `out_code` has no HW counterpart.
 (built in `warp_vectors.py`, which keeps each vector's ALG and HW values for
 the tests). On a config the warp cannot run on (no `act_quant` entry, a
 per-site list of the wrong length, a refusal) T12 prints
-`T12 skipped on <config>: <why>` and the run ends normally.
+`T12 skipped on <config>: <why>`. The same holds for every section: T1-T10
+run on fixed conv cases (`conv3x3_p0`, `conv1x1`, `conv3x3_p0_bias`), so a
+config that holds grids only for its own cases (`npe_e4_pla`,
+`npe_hw_exact_in`) skips them with the reason, and the rest runs. The last
+line names the skipped sections; exit 0 when every section ran, 2 when one
+was skipped.
 
 ## Static grids and PLA
 

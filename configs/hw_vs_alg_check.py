@@ -21,7 +21,10 @@ difference moved. Sections:
   T12 warp (main_ALG.warp vs main_HW.warp on their CalibratedMXWarp): one
       vector per ALG-vs-HW difference of the warp deep run, each labelled
       [D<n> | HW Q<m>] with its question in the list sent to the HW team
-      (warp_vectors.py); skipped, with why, on a config the warp cannot run on
+      (warp_vectors.py)
+A section whose cases a config cannot run (no grids for them, a format a side
+refuses) prints "<T> skipped on <config>: <why>" and the run goes on; the last
+line names every skipped section. Exit 0: every section ran; 2: one skipped.
 --config: default mx_config_npe_e4.json; mx_config_npe_hw_exact.json = lib HW-exact switches.
 --only warp: T12 alone.
 """
@@ -55,6 +58,34 @@ torch.set_printoptions(precision=6)
 def hdr(s): print(f"\n### {s}")
 
 
+# Sections skipped on this config, with why. A section runs the sim on fixed
+# cases (conv3x3_p0, conv1x1, ...); a config that holds no grids for them, or
+# whose format a side refuses, cannot run it. That is said, never hidden.
+SKIPPED = []
+
+
+def skip(label, why):
+    print(f"  {label} skipped on {os.path.basename(CFG['file'])}: {why}")
+    SKIPPED.append(label)
+
+
+def section(label, fn):
+    """Run one section; on a documented refusal (sim_config.REFUSED) say so
+    and why, and go on: the sections do not depend on each other."""
+    try:
+        fn()
+    except SC.REFUSED as e:
+        skip(label, e)
+
+
+def finish():
+    """Exit 0 when every section ran, 2 (as main.py: a refusal) when one was
+    skipped, named on the last line."""
+    if SKIPPED:
+        print(f"\nskipped on {os.path.basename(CFG['file'])}: {', '.join(SKIPPED)}")
+    sys.exit(2 if SKIPPED else 0)
+
+
 # ---------------------------------------------------------------- T12 warp
 # The vectors live in warp_vectors.py (one per difference D1-D10, labelled
 # with its HW question), so tests read the same values this prints.
@@ -67,7 +98,7 @@ def warp_section():
     hdr("T12 warp: ALG (main_ALG) vs HW (their CalibratedMXWarp via main_HW)")
     why = _WV.probe(CFG)
     if why is not None:
-        print(f"  T12 skipped on {os.path.basename(CFG['file'])}: {why}")
+        skip("T12", why)
         return
     sp = _H.warp_spec(CFG)
     print(f"  config grid: int{sp['grid_bits']}, frac {sp['frac_cfg']}, relative flow "
@@ -80,92 +111,100 @@ def warp_section():
 
 if ARGS.only == "warp":
     warp_section()
-    sys.exit(0)
+    finish()
 
 # ---------------------------------------------------------------- T1 quantizer
-hdr("T1 activation quantizer, conv3x3_p0 x")
-c = C.build("conv3x3_p0"); x = c["x"]
-a = A.run(c); h = H.run(c)
-cal = int(h["x_cal"])
-# ALG value
-ebias = (1 << (int(CFG["mx_specs"]["scale_bits"]) - 1)) - 1      # code = E + ebias
-qa = a["a_int"].double() * 2.0 ** (a["a_exp"].double().repeat_interleave(32, -1)[..., :40] - ebias - 6)
-# HW value: x = data * 2^(shared - cal)
-hd = h["hw_a_mant"].double().reshape(1, 4, 6, -1)[..., :40]
-he = h["hw_a_exp"].double().repeat_interleave(32, -1)[..., :40]
-qh = hd * 2.0 ** (he - cal)
-# my reading of their rule (not an input layer: no pre-round):
-# trunc(x 2^c / 2^(floor(log2 amax)-6))
-xi = x.double() * 2 ** cal
-am = F.pad(xi, (0, 24)).reshape(1, 4, 6, 2, 32).abs().amax(-1)
-E = torch.where(am > 0, torch.log2(am.clamp(min=1e-30)).floor(), torch.zeros_like(am))
-mine = torch.trunc(F.pad(xi, (0, 24)).reshape(1, 4, 6, 2, 32) / 2 ** (E - 6).unsqueeze(-1)).reshape(1, 4, 6, 64)[..., :40]
-print("my model of HW rule == their data:", bool((mine == hd).all()))
-print(f"max|mant|  ALG {int(a['a_int'].abs().max())}   HW {int(hd.abs().max())}")
-print(f"quant err rms  ALG {float(((qa - x) ** 2).mean().sqrt()):.5f}   HW {float(((qh - x) ** 2).mean().sqrt()):.5f}")
-print(f"same value: {float((qa == qh).double().mean()) * 100:.1f}% of elements")
-print(f"HW bias (mean err, trunc->toward 0 of |x|): {float(((qh.abs() - x.abs())).mean()):.5f}  ALG {float(((qa.abs() - x.abs())).mean()):.5f}")
+def _t1_t7():
+    hdr("T1 activation quantizer, conv3x3_p0 x")
+    c = C.build("conv3x3_p0"); x = c["x"]
+    a = A.run(c); h = H.run(c)
+    cal = int(h["x_cal"])
+    # ALG value
+    ebias = (1 << (int(CFG["mx_specs"]["scale_bits"]) - 1)) - 1      # code = E + ebias
+    qa = a["a_int"].double() * 2.0 ** (a["a_exp"].double().repeat_interleave(32, -1)[..., :40] - ebias - 6)
+    # HW value: x = data * 2^(shared - cal)
+    hd = h["hw_a_mant"].double().reshape(1, 4, 6, -1)[..., :40]
+    he = h["hw_a_exp"].double().repeat_interleave(32, -1)[..., :40]
+    qh = hd * 2.0 ** (he - cal)
+    # my reading of their rule (not an input layer: no pre-round):
+    # trunc(x 2^c / 2^(floor(log2 amax)-6))
+    xi = x.double() * 2 ** cal
+    am = F.pad(xi, (0, 24)).reshape(1, 4, 6, 2, 32).abs().amax(-1)
+    E = torch.where(am > 0, torch.log2(am.clamp(min=1e-30)).floor(), torch.zeros_like(am))
+    mine = torch.trunc(F.pad(xi, (0, 24)).reshape(1, 4, 6, 2, 32) / 2 ** (E - 6).unsqueeze(-1)).reshape(1, 4, 6, 64)[..., :40]
+    print("my model of HW rule == their data:", bool((mine == hd).all()))
+    print(f"max|mant|  ALG {int(a['a_int'].abs().max())}   HW {int(hd.abs().max())}")
+    print(f"quant err rms  ALG {float(((qa - x) ** 2).mean().sqrt()):.5f}   HW {float(((qh - x) ** 2).mean().sqrt()):.5f}")
+    print(f"same value: {float((qa == qh).double().mean()) * 100:.1f}% of elements")
+    print(f"HW bias (mean err, trunc->toward 0 of |x|): {float(((qh.abs() - x.abs())).mean()):.5f}  ALG {float(((qa.abs() - x.abs())).mean()):.5f}")
 
-# ---------------------------------------------------------------- T7 dequantizer
-hdr("T7 their mx_dequantizer vs the value their pipe uses")
-mx = base_mx_quantizer(x * 2 ** cal, calibrate_offset=cal)
-dq = mx_dequantizer(mx)
-print(f"mx_dequantizer / true value ratio: {float((dq[x.abs() > 0.1] / qh.float()[x.abs() > 0.1]).median()):.6f}  (1.0 = consistent; 2^-6 = {2**-6:.6f})")
+    # ---------------------------------------------------------------- T7 dequantizer
+    hdr("T7 their mx_dequantizer vs the value their pipe uses")
+    mx = base_mx_quantizer(x * 2 ** cal, calibrate_offset=cal)
+    dq = mx_dequantizer(mx)
+    print(f"mx_dequantizer / true value ratio: {float((dq[x.abs() > 0.1] / qh.float()[x.abs() > 0.1]).median()):.6f}  (1.0 = consistent; 2^-6 = {2**-6:.6f})")
+section("T1 T7", _t1_t7)
 
 # ---------------------------------------------------------------- T3 acc exactness
-def exact_acc(h, w_shape, x_shape):
-    B, Cin, Hh, W = x_shape; O, _, kh, kw = w_shape
-    ad = h["hw_a_mant"].long().reshape(B, Cin, Hh, -1)[..., :W]
-    ae = h["hw_a_exp"].long().repeat_interleave(32, -1)[..., :W]
-    wd = h["hw_w_mant"].long().reshape(O, -1)[:, :Cin * kh * kw]
-    we = h["hw_w_exp"].long().repeat_interleave(32, -1)[:, :Cin * kh * kw]
-    A_ = F.unfold((ad.double()), (kh, kw)).long(); AE = F.unfold(ae.double(), (kh, kw)).long()
-    acc = torch.zeros(B, O, A_.shape[-1], dtype=torch.int64)
-    for o in range(O):
-        acc[:, o] = ((A_ * wd[o].view(1, -1, 1)) << (AE + we[o].view(1, -1, 1))).sum(1)
-    return acc
+def _t3():
+    def exact_acc(h, w_shape, x_shape):
+        B, Cin, Hh, W = x_shape; O, _, kh, kw = w_shape
+        ad = h["hw_a_mant"].long().reshape(B, Cin, Hh, -1)[..., :W]
+        ae = h["hw_a_exp"].long().repeat_interleave(32, -1)[..., :W]
+        wd = h["hw_w_mant"].long().reshape(O, -1)[:, :Cin * kh * kw]
+        we = h["hw_w_exp"].long().repeat_interleave(32, -1)[:, :Cin * kh * kw]
+        A_ = F.unfold((ad.double()), (kh, kw)).long(); AE = F.unfold(ae.double(), (kh, kw)).long()
+        acc = torch.zeros(B, O, A_.shape[-1], dtype=torch.int64)
+        for o in range(O):
+            acc[:, o] = ((A_ * wd[o].view(1, -1, 1)) << (AE + we[o].view(1, -1, 1))).sum(1)
+        return acc
 
-hdr("T3 HW accumulator exactness (int64 p_sum)")
-for name in ["conv1x1", "conv3x3_p0"]:
-    cc = C.build(name); hh = H.run(cc)
-    ex = exact_acc(hh, cc["w"].shape, cc["x"].shape).reshape(hh["hw_acc"].shape)
-    print(f"{name}: max|acc| {int(ex.abs().max())} (2^{math.log2(ex.abs().max()):.1f})  hw_acc==exact int: {bool((hh['hw_acc'].double() == ex.double()).all())}")
-# worst case on their bcu directly: a big and a tiny product in one dot
-# product (exps legal 0..15, sum fits 48 bits) - float32 dropped the low bits
-xd = torch.tensor([[63.0, 1.0]]); xe = torch.tensor([[10.0, 0.0]])
-wd = torch.tensor([63.0, 1.0]); we = torch.tensor([10.0, 0.0])
-exact = 63 * 63 * 2 ** 20 + 1
-got = int(bcu(xd, xe, wd, we).item())
-print(f"bcu 63*63*2^20 + 1: exact {exact}  HW {got}  diff {exact - got}")
+    hdr("T3 HW accumulator exactness (int64 p_sum)")
+    for name in ["conv1x1", "conv3x3_p0"]:
+        cc = C.build(name); hh = H.run(cc)
+        ex = exact_acc(hh, cc["w"].shape, cc["x"].shape).reshape(hh["hw_acc"].shape)
+        print(f"{name}: max|acc| {int(ex.abs().max())} (2^{math.log2(ex.abs().max()):.1f})  hw_acc==exact int: {bool((hh['hw_acc'].double() == ex.double()).all())}")
+    # worst case on their bcu directly: a big and a tiny product in one dot
+    # product (exps legal 0..15, sum fits 48 bits) - float32 dropped the low bits
+    xd = torch.tensor([[63.0, 1.0]]); xe = torch.tensor([[10.0, 0.0]])
+    wd = torch.tensor([63.0, 1.0]); we = torch.tensor([10.0, 0.0])
+    exact = 63 * 63 * 2 ** 20 + 1
+    got = int(bcu(xd, xe, wd, we).item())
+    print(f"bcu 63*63*2^20 + 1: exact {exact}  HW {got}  diff {exact - got}")
+section("T3", _t3)
 
 # ---------------------------------------------------------------- T4 PCU rounding
-hdr("T4 PCU rounding: HW round half up (ties to +inf) vs ALG window")
-v = torch.tensor([10, 11, 13, -6, -10, -11])   # /4 -> 2.5 2.75 3.25 -1.5 -2.5 -2.75
-print("in            ", v.tolist(), "shift -2 (x/4)")
-print("pcu_div round ", pcu_div(v, -2, "round").tolist())
-print("half up       ", (v / 4 + 0.5).floor().long().tolist())
-print("ALG floor     ", (v >> 2).tolist(), "  ALG nearest", ((v + 2) >> 2).tolist(),
-      "(xblock_accum.out_round)")
-cc = C.build("conv3x3_p0"); hh = H.run(cc)
-e = int(hh["out_scale_log2"]) - int(hh["x_cal"]) - int(hh["w_cal"])   # incl. static shift
-print(f"conv3x3_p0: out_raw == floor(acc*2^{e} + 1/2): "
-      f"{bool((hh['out_raw'] == (hh['hw_acc'].double() * 2.0 ** e + 0.5).floor()).all())}")
+def _t4():
+    hdr("T4 PCU rounding: HW round half up (ties to +inf) vs ALG window")
+    v = torch.tensor([10, 11, 13, -6, -10, -11])   # /4 -> 2.5 2.75 3.25 -1.5 -2.5 -2.75
+    print("in            ", v.tolist(), "shift -2 (x/4)")
+    print("pcu_div round ", pcu_div(v, -2, "round").tolist())
+    print("half up       ", (v / 4 + 0.5).floor().long().tolist())
+    print("ALG floor     ", (v >> 2).tolist(), "  ALG nearest", ((v + 2) >> 2).tolist(),
+          "(xblock_accum.out_round)")
+    cc = C.build("conv3x3_p0"); hh = H.run(cc)
+    e = int(hh["out_scale_log2"]) - int(hh["x_cal"]) - int(hh["w_cal"])   # incl. static shift
+    print(f"conv3x3_p0: out_raw == floor(acc*2^{e} + 1/2): "
+          f"{bool((hh['out_raw'] == (hh['hw_acc'].double() * 2.0 ** e + 0.5).floor()).all())}")
+section("T4", _t4)
 
 # ---------------------------------------------------------------- T5 bias
-hdr("T5 bias projection")
-cc = C.build("conv3x3_p0_bias")
-hh = H.run(cc); aa = A.run(cc)
-bc = int(hh["x_cal"]) + int(hh["w_cal"])
-b = cc["b"].double()
-print(f"HW bias = floor(b*2^{bc} + 1/2) (acc LSB 2^-{bc}), err max {float((b - (b * 2 ** bc + 0.5).floor() / 2 ** bc).abs().max()):.2e}")
-ea = -int(aa.get("e_layer_min", -20))
-half_up = CFG["mx_specs"].get("xblock_accum", {}).get("bias_round", "even") == "half_up"
-rb = (lambda v: (v + 0.5).floor()) if half_up else (lambda v: v.round())
-print(f"ALG bias = {'floor(v+1/2)' if half_up else 'round half to even'} of b*2^{ea},  "
-      f"err max {float((b - rb(b * 2 ** ea) / 2 ** ea).abs().max()):.2e}")
-t = torch.tensor([0.5, 1.5, 2.5, -0.5, -2.5], dtype=torch.float64)
-print(f"ties b*2^k {t.tolist()}: HW {(t + 0.5).floor().long().tolist()}  ALG {rb(t).long().tolist()}")
-print(f"with bias end-to-end: max|ALG-fp32| {float((aa['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}  max|HW-fp32| {float((hh['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}")
+def _t5():
+    hdr("T5 bias projection")
+    cc = C.build("conv3x3_p0_bias")
+    hh = H.run(cc); aa = A.run(cc)
+    bc = int(hh["x_cal"]) + int(hh["w_cal"])
+    b = cc["b"].double()
+    print(f"HW bias = floor(b*2^{bc} + 1/2) (acc LSB 2^-{bc}), err max {float((b - (b * 2 ** bc + 0.5).floor() / 2 ** bc).abs().max()):.2e}")
+    ea = -int(aa.get("e_layer_min", -20))
+    half_up = CFG["mx_specs"].get("xblock_accum", {}).get("bias_round", "even") == "half_up"
+    rb = (lambda v: (v + 0.5).floor()) if half_up else (lambda v: v.round())
+    print(f"ALG bias = {'floor(v+1/2)' if half_up else 'round half to even'} of b*2^{ea},  "
+          f"err max {float((b - rb(b * 2 ** ea) / 2 ** ea).abs().max()):.2e}")
+    t = torch.tensor([0.5, 1.5, 2.5, -0.5, -2.5], dtype=torch.float64)
+    print(f"ties b*2^k {t.tolist()}: HW {(t + 0.5).floor().long().tolist()}  ALG {rb(t).long().tolist()}")
+    print(f"with bias end-to-end: max|ALG-fp32| {float((aa['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}  max|HW-fp32| {float((hh['out'] - F.conv2d(cc['x'], cc['w'], cc['b'])).abs().max()):.4f}")
+section("T5", _t5)
 
 # ---------------------------------------------------------------- T6 saturation
 hdr("T6 accumulator overflow (bcu, acc_bit_width=48 -> range [-2^47, 2^47-1])")
@@ -181,13 +220,15 @@ for signs in ([1, 1, -1], [1, 1, 1]):
           + ("  (ALG overflow 'raise': eval raises here)" if CFG["mx_specs"].get("xblock_accum", {}).get("overflow") == "raise" else ""))
 
 # ---------------------------------------------------------------- T8 observer blocking
-hdr("T8 weight observer blocks vs weight quantizer blocks")
-w = C.build("conv3x3_p0")["w"]
-o_theirs = MXObserver(mode="mx"); o_theirs.update(w)
-o_flat = MXObserver(mode="mx"); o_flat.update(w, per_row_flatten=True)
-print(f"observer default (blocks along kW=3): w_cal {o_theirs.calibrate_offset()}   per_row_flatten=True (= quantizer blocks, main_HW uses it): {o_flat.calibrate_offset()}")
-mxw = H.run(C.build("conv3x3_p0"))["hw_w_exp"]
-print(f"resulting weight block exps used: {mxw.unique().tolist()}  (min 0 = anchored; >0 = headroom spent)")
+def _t8():
+    hdr("T8 weight observer blocks vs weight quantizer blocks")
+    w = C.build("conv3x3_p0")["w"]
+    o_theirs = MXObserver(mode="mx"); o_theirs.update(w)
+    o_flat = MXObserver(mode="mx"); o_flat.update(w, per_row_flatten=True)
+    print(f"observer default (blocks along kW=3): w_cal {o_theirs.calibrate_offset()}   per_row_flatten=True (= quantizer blocks, main_HW uses it): {o_flat.calibrate_offset()}")
+    mxw = H.run(C.build("conv3x3_p0"))["hw_w_exp"]
+    print(f"resulting weight block exps used: {mxw.unique().tolist()}  (min 0 = anchored; >0 = headroom spent)")
+section("T8", _t8)
 
 # ---------------------------------------------------------------- T9 exponent wrap
 hdr("T9 4-bit exponent wrap (block below the anchor)")
@@ -196,20 +237,22 @@ m = base_mx_quantizer(t, calibrate_offset=0)
 print("block shared exps:", m.shared_exp.tolist(), " block2 data:", m.data[0, 1, :4].tolist(), "(true 3.0 -> wiped)")
 
 # ---------------------------------------------------------------- T10 exponent window
-hdr("T10 4-bit exponent window: ALG fixed [-7,7] vs HW per-tensor offset (weights x0.01)")
-c = C.build("conv3x3_p0"); c["w"] = c["w"] * 0.01
-r = F.conv2d(c["x"], c["w"])
-try:
-    a = A.run(c)
-except RuntimeError as e:      # HW-exact: weights x0.01 leave the config's register
-    print(f"ALG raises (grids in the config are for the unscaled weights): {str(e)[:150]}")
-    a = None
-h = H.run(c)
-if a is not None:
-  print(f"ALG: w_exp codes [{int(a['w_exp'].min())}..{int(a['w_exp'].max())}] (0 = clamped at E=-7)  "
-        f"w_int max {int(a['w_int'].abs().max())}  max err {float((a['out'] - r).abs().max()):.2e}")
-print(f"HW : w_cal {int(h['w_cal'])} slides the window  "
-      f"w_mant max {int(h['hw_w_mant'].abs().max())}  max err {float((h['out'] - r).abs().max()):.2e}")
+def _t10():
+    hdr("T10 4-bit exponent window: ALG fixed [-7,7] vs HW per-tensor offset (weights x0.01)")
+    c = C.build("conv3x3_p0"); c["w"] = c["w"] * 0.01
+    r = F.conv2d(c["x"], c["w"])
+    try:
+        a = A.run(c)
+    except RuntimeError as e:      # HW-exact: weights x0.01 leave the config's register
+        print(f"ALG raises (grids in the config are for the unscaled weights): {str(e)[:150]}")
+        a = None
+    h = H.run(c)
+    if a is not None:
+      print(f"ALG: w_exp codes [{int(a['w_exp'].min())}..{int(a['w_exp'].max())}] (0 = clamped at E=-7)  "
+            f"w_int max {int(a['w_int'].abs().max())}  max err {float((a['out'] - r).abs().max()):.2e}")
+    print(f"HW : w_cal {int(h['w_cal'])} slides the window  "
+          f"w_mant max {int(h['hw_w_mant'].abs().max())}  max err {float((h['out'] - r).abs().max()):.2e}")
+section("T10", _t10)
 
 # ---------------------------------------------------------------- T11 PLA
 # HW PLA = per-channel bins on the accumulator word (their answer to Q10):
@@ -300,3 +343,4 @@ print(f"  their relux  {hw_bins(Nb, pla)[0].tolist()}  ([-2^23, 2^23-1]; HW: >= 
       f"unreachable by PTQ, no clamp needed)")
 
 warp_section()
+finish()

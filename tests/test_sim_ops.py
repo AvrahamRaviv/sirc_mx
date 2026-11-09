@@ -789,3 +789,30 @@ def test_main_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys):
     assert "  ALG FAILED: RuntimeError: boom" in out
     assert "=== conv3x3_p0 ===" in out
     assert ", FAILED: conv1x1" in out[-1]
+
+
+@pytest.mark.parametrize("cfg_name", ["mx_config_npe_e4_pla.json",
+                                      "mx_config_npe_hw_exact_in.json"])
+def test_hw_vs_alg_check_skips_sections_without_grids_and_goes_on(cfg_name):
+    """These configs hold grids for their own cases only (PLA / first layer),
+    not for the conv cases T1-T10 run on; the sim never calibrates. Each such
+    section says it is skipped and why, the rest (T6, T9, T11, T12) runs, the
+    last line names the skipped ones, and the exit code is 2, not a pass."""
+    p = _cli("hw_vs_alg_check.py", "--config", cfg_name)
+    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
+    out = p.stdout.splitlines()
+    assert any(ln.startswith(f"  T1 T7 skipped on {cfg_name}: {cfg_name}: no hw_grids "
+                             f"entry 'conv3x3_p0'") for ln in out)
+    for t in ("### T6", "### T9", "### T11", "### T12"):
+        assert any(ln.startswith(t) for ln in out), t
+    assert any(ln.startswith("  [D7 | HW Q7]") for ln in out)
+    assert out[-1] == f"skipped on {cfg_name}: T1 T7, T3, T4, T5, T8, T10"
+
+
+def test_hw_vs_alg_check_exit_0_only_when_every_section_ran():
+    p = _cli("hw_vs_alg_check.py", "--config", "mx_config_npe_e4.json")
+    assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
+    assert "skipped" not in p.stdout
+    p = _cli("hw_vs_alg_check.py", "--config", "mx_config_npe_cpu.json")
+    assert p.returncode == 2
+    assert p.stdout.splitlines()[-1] == "skipped on mx_config_npe_cpu.json: T12"
