@@ -559,6 +559,21 @@ Set to `false` to disable.
 
 ---
 
+## Single-op simulator (`configs/`)
+
+Each NPE op (conv, convT, warp) runs alone through the MX lib (ALG) and the
+HW team's emulator (`configs/hw/npe_mx_emu`, verbatim), and every stage is
+compared. Conv and warp run on their code; their emulator has no convT yet.
+How it works, the warp included: `configs/README.md`.
+
+```bash
+cd configs
+python main.py -m warp --config mx_config_npe_e4.json   # warp, ALG vs HW, per stage
+python hw_vs_alg_check.py --only warp                    # one vector per HW question
+```
+
+---
+
 ## Notes
 
 - `scale_bits` is shared between weights and activations (library constraint).

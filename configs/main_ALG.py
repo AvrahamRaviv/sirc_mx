@@ -58,17 +58,13 @@ from taps import tap, show
 # =============================================================================
 
 from sim_config import DEFAULT_CONFIG, load_config, hw_grid   # noqa: E402  (re-exported)
+from sim_config import entry_name                             # noqa: E402
 
 
 def _entry(cfg, op, as_name="op"):
     """The `layers` entry for the layer under test, renamed `as_name` ("op",
     or "op.0" for the conv inside a conv + activation Sequential)."""
-    name = cfg["layer"]
-    if name is None and op == "warp":
-        name = next((n for n, e in cfg["entries"].items()
-                     if e.get("kind") == "act_quant"), None)
-        if name is None:
-            raise SystemExit(f"{cfg['file']}: no act_quant entry for warp")
+    name = entry_name(cfg, op)
     if name is None:
         return as_name
     e = json.loads(json.dumps(cfg["entries"][name]))   # deep copy

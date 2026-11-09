@@ -4,9 +4,8 @@ main_HW.py - run one case through the HW implementation (the HW side).
 HW code lives in hw/npe_mx_emu/, copied verbatim from the HW team - never
 edited here. This file only wires it in: it builds their layer, calls their
 calibration and forward, and taps what their code produced (via a forward
-pre-hook and a pass-through wrapper on their bcu - no logic of theirs is
-reimplemented). Status: conv wired in; their warp exists but is not wired in
-yet; they have no convT.
+pre-hook and pass-through wrappers on their module functions - no logic of
+theirs is reimplemented). Status: conv and warp wired in; they have no convT.
 
 Same interface as main_ALG:
 
@@ -47,9 +46,11 @@ from taps import tap, show
 
 # --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
 from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
+from npe_mx_emu import CalibratedMXWarp
 from npe_mx_emu import mx_config_factory, SUPPORTED_ACC_WIDTHS
 from npe_mx_emu import Cstruct, pcu, mantissa_offset
 from npe_mx_emu import hw_pipe as _hw_pipe
+from npe_mx_emu import layers as _hw_layers
 
 # Widths fixed inside npe_mx_emu - their API has no parameter for them, so the
 # config can't reach them (listed so a config that disagrees is visible):
@@ -71,9 +72,9 @@ def hw_format(cfg):
     shared-exponent register: xblock_accum.in_exp_bits when the lib models
     that register (in_exp_mode on), else mx_specs.scale_bits. Conv runs on
     their 8-bit mantissa lane only (CONV_MANTISSA_BITS): their factory also has
-    mx-e4bm16, but that lane is for the warp weights, and their conv on it gives
-    wrong numbers instead of an error. Refused when their code can't run it as
-    configured, rather than silently running something else.
+    mx-e4bm16, but that lane is the warp's (grid and weights), and their conv
+    on it gives wrong numbers instead of an error. Refused when their code
+    can't run it as configured, rather than silently running something else.
     """
     sp = cfg["mx_specs"]
     a, w = sp["a_elem_format"], sp["w_elem_format"]
@@ -82,11 +83,13 @@ def hw_format(cfg):
     xa = sp.get("xblock_accum") if isinstance(sp.get("xblock_accum"), dict) else {}
     reg = xa.get("in_exp_bits") if xa.get("in_exp_mode", "off") != "off" else None
     ebits, mbits = int(reg if reg is not None else sp["scale_bits"]), int(a[3:])
+    mx_type = f"mx-e{ebits}bm{mbits}"
     if mbits != CONV_MANTISSA_BITS:
+        why = (f"their {mx_type} is the warp's 16-bit lane: wrong numbers on conv"
+               if mx_type in mx_config_factory else f"npe_mx_emu has no {mx_type}")
         raise NotImplementedError(
             f"HW conv: {a} needs a {mbits}-bit mantissa lane; npe_mx_emu conv "
-            f"runs int{CONV_MANTISSA_BITS} only (their e4bm16 is the warp lane)")
-    mx_type = f"mx-e{ebits}bm{mbits}"
+            f"runs int{CONV_MANTISSA_BITS} only ({why})")
     if mx_type not in mx_config_factory:
         raise NotImplementedError(
             f"HW: {mx_type} (scale_bits={ebits}, {a}) not in npe_mx_emu "
@@ -108,22 +111,30 @@ def hw_acc_bits(cfg):
 
 
 @contextlib.contextmanager
-def _capture_bcu():
-    """Record every bcu() result (one output line: p_sum[out_width]) in call
-    order. Pass-through: their bcu runs unchanged, we only keep its output."""
+def _pass_through(module, name, keep=lambda r: r):
+    """Record every result of their function `module.name`, in call order.
+    Pass-through: their function runs unchanged, we only keep `keep(result)`.
+    Their callers look the name up in their module at call time, so they call
+    the wrapper."""
     seen = []
-    orig = _hw_pipe.bcu
+    orig = getattr(module, name)
 
     def rec(*a, **k):
-        p = orig(*a, **k)
-        seen.append(p.detach().clone())
-        return p
+        r = orig(*a, **k)
+        seen.append(keep(r))
+        return r
 
-    _hw_pipe.bcu = rec
+    setattr(module, name, rec)
     try:
         yield seen
     finally:
-        _hw_pipe.bcu = orig
+        setattr(module, name, orig)
+
+
+def _capture_bcu():
+    """Every bcu() result (one output line: p_sum[out_width], their int64
+    accumulator) in call order."""
+    return _pass_through(_hw_pipe, "bcu", keep=lambda p: p.detach().clone())
 
 
 # --- PLA (activation folded into the PCU) -----------------------------------
@@ -345,22 +356,183 @@ def convt(case, cfg, taps):
     raise NotImplementedError("HW convt")
 
 
+# Warp. Their reference lane: uint8 codes with zero exponents, no scale
+# (pack_warp_reference's default type). The sim runs one forward of a fresh
+# module on each side, so both use the config's call site 0.
+WARP_REF_MX_TYPE = "mx-e4bm8"
+WARP_REF_RANGE = (0, 255)       # pack_warp_reference clamps to this, silently
+WARP_GRID_WORD_BITS = 16        # trc casts the grid word to int16
+WARP_CALL_SITE = 0
+# frx + fry above this overflows their 16-bit weight lane: their trc_warp and
+# build_warp_c_struct_arr raise, the path that runs (trc) does not check (HW Q4)
+WARP_FRAC_SUM_LIMIT = 14
+
+
+def warp_spec(cfg):
+    """The config's warp entry, as their code takes it: grid word width
+    (their grid_bit_width), the grid fraction bits per axis (frx, fry) at the
+    sim's call site, and how many call sites the config declares.
+    Refused when their lanes can't hold what the config describes."""
+    name = SC.entry_name(cfg, "warp")
+    e = cfg["entries"][name]
+    ref = SC.site_fxp(e["inputs"][0]["fxp"], WARP_CALL_SITE)
+    grid = SC.site_fxp(e["inputs"][1]["fxp"], WARP_CALL_SITE)
+    if int(ref["total_bits"]) != 8:
+        raise NotImplementedError(
+            f"HW warp: {name} ref is {ref['total_bits']}-bit; their reference "
+            f"lane is 8-bit ({WARP_REF_MX_TYPE}, uint8)")
+    if int(grid["total_bits"]) > WARP_GRID_WORD_BITS:
+        raise NotImplementedError(
+            f"HW warp: {name} grid is {grid['total_bits']}-bit; their trc casts "
+            f"the grid word to int{WARP_GRID_WORD_BITS}")
+    if grid.get("frac_bits") is None:
+        raise SystemExit(f"{os.path.basename(cfg['file'])}: {name} grid has no "
+                         f"frac_bits; the sim reads the grid format from the config")
+    f = int(grid["frac_bits"])
+    return {"call_sites": int(e.get("call_sites", 1)), "call_site": WARP_CALL_SITE,
+            "grid_bits": int(grid["total_bits"]), "frac_cfg": (f, f)}
+
+
+def abs_coords(flow):
+    """Relative flow [B,2,H,W] in px (channel 0 = x) -> what their
+    CalibratedMXWarp takes: ABSOLUTE sample positions [B,H,W,2] (x, y), in
+    float64 as their notebooks build them (their weights and bcu product take
+    the coordinates' float dtype; float64 keeps them exact)."""
+    B, _, H, W = flow.shape
+    yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float64),
+                            torch.arange(W, dtype=torch.float64), indexing="ij")
+    f = flow.double()
+    return torch.stack([xx + f[:, 0], yy + f[:, 1]], dim=-1)
+
+
+def _refuse_warp(ref, coords, flow, grid_bits):
+    """Refuse what their warp would compute wrongly without raising."""
+    B, _, H, _ = ref.shape
+    if B > 1 and not all(torch.equal(flow[b], flow[0]) for b in range(1, B)):
+        raise NotImplementedError(
+            "HW warp: batch > 1 with different flows; their pack_warp_grid and "
+            "trc read batch 0's grid only (HW Q8)")
+    if H < 2:
+        raise NotImplementedError(
+            f"HW warp: H = {H}; their get_ref_frame reads rows up to index H-2")
+    lo, hi = WARP_REF_RANGE
+    r = torch.round(ref)                  # the rounding their packer applies
+    if not bool(torch.isfinite(ref).all()) or float(r.min()) < lo or float(r.max()) > hi:
+        raise NotImplementedError(
+            f"HW warp: reference codes in [{float(r.min()):g}, {float(r.max()):g}]; "
+            f"their pack_warp_reference clamps to uint8 [{lo}, {hi}] without "
+            f"a word (HW Q6)")
+    _, _, fr = _hw_layers.grid_quantization(coords[0], grid_bits)
+    if not bool(torch.isfinite(fr).all()) or float(fr.min()) < 0:
+        raise NotImplementedError(
+            f"HW warp: their grid_quantization gives fraction bits "
+            f"{fr.flatten().tolist()} (an axis with max |position| 0 gives "
+            f"inf); their trc would split the grid word wrongly")
+
+
+def _warp_layer(channels, grid_bits, acc_bits):
+    """Their warp layer, with the minimal setup their example notebook uses:
+    LayerMXQParams(x_cal=0, w_cal=0, out_cal=0) (output in reference code
+    units, reference lane WARP_REF_MX_TYPE), then calibrate() with its default
+    fraction bits (7, 7). calibrate() only fills the PCU c_structs, which
+    forward() requires to be non-empty and never reads (their PCU is bypassed,
+    HW Q7); nothing in it comes from data."""
+    qp = LayerMXQParams(x_cal=0, w_cal=0, out_cal=0, mx_type=WARP_REF_MX_TYPE)
+    layer = CalibratedMXWarp(channels=channels, grid_bit_width=grid_bits,
+                             acc_bit_width=acc_bits, qparams=qp)
+    layer.calibrate()
+    return layer
+
+
+def run_their_warp(ref, coords, grid_bits, acc_bits):
+    """Their CalibratedMXWarp.forward(ref, coords) as is, no refusals, with
+    every intermediate kept by pass-through wrappers: the packed reference
+    and grid (+ their fraction bits), trc's weights and corners, and bcu's
+    int64 p_sum per line. ref: [B,C,H,W] in code units; coords from
+    abs_coords."""
+    layer = _warp_layer(ref.shape[1], grid_bits, acc_bits)
+    with torch.no_grad(), \
+            _pass_through(_hw_layers, "pack_warp_reference") as refs, \
+            _pass_through(_hw_layers, "pack_warp_grid") as grids, \
+            _pass_through(_hw_pipe, "trc") as trcs, \
+            _capture_bcu() as lines:
+        out = layer(ref, coords)
+    (mx_grid, fr), = grids
+    (weights, corners), = trcs
+    B, C, H, W = out.shape
+    return {"mx_ref": refs[0], "mx_grid": mx_grid,
+            "frac": fr.flatten().long(), "weights": weights, "corners": corners,
+            # bcu is called per (b, c, oh) in that loop order -> [B, C, H, W]
+            "acc": torch.stack(lines).reshape(B, C, H, W), "out": out}
+
+
 def warp(case, cfg, taps):
-    """Bilinear backward warp, integer.
+    """Backward warp on the HW team's emulator (CalibratedMXWarp ->
+    MXWarp_Loops), as their notebook calls it, nothing reimplemented.
 
-    Steps:
-      1. ref_code  = clamp(round_half_away(x / ref_scale), -128, 127)    int8
-      2. grid_code = clamp(round_half_away(flow * 256), -32768, 32767)    int16,
-                     Q8.8 displacement in px, channel 0 = x
-      3. X = (x << 8) + grid_code[:,0];  x0 = X >> 8;  fx = X & 255  (same for y)
-      4. acc = sum of 4 neighbours ref_code * wx * wy,
-               wx in {256 - fx, fx}, wy in {256 - fy, fy}; outside image -> 0
-      5. out_code = clamp(round_half_away(acc * ref_scale / out_scale / 65536),
-                          -128, 127)                                     int8
+    Inputs from the case, conventions converted: reference = x / ref_scale,
+    in code units (their packer rounds half to even and clamps to uint8, no
+    scale); coords = absolute positions (abs_coords). Config: grid word width
+    and fraction bits (the warp entry's grid fxp, call site 0), accumulator
+    width (hw_acc_bits). Their fraction bits come from the data (per frame,
+    from max |position|): taps `frac_cfg` (config) and `hw_frac_bits` (theirs)
+    and `frac_match` show whether they agree; their code runs on its own.
 
-    Taps: ref_code grid_code (acc) out_code out (= out_code * out_scale).
+    Refused (_refuse_warp): batch > 1 with different flows, a reference their
+    packer would clamp, H < 2, fraction bits their trc can't use.
+
+    Taps: x flow | call_sites call_site frac_cfg | hw_ref_code [B,C,H,W pad 32]
+          hw_grid_code [1,2,H,W] hw_frac_bits frac_match frac_sum
+          frac_over | hw_weights [H,W,4] hw_corners [B,C,H,W,4] |
+          hw_acc int64 (bcu's p_sum, taken inside their loop) | out_raw
+          (their float32 output as is: acc / 2^(frx+fry), in code units; float32
+          rounds acc above 2^24) | out (= out_raw * ref_scale)
     """
-    raise NotImplementedError("HW warp")
+    x, flow, s = case["x"], case["flow"], case["warp"]
+    spec = warp_spec(cfg)
+    acc_bits = hw_acc_bits(cfg)
+    ref = x.double() / s["ref_scale"]
+    coords = abs_coords(flow)
+    _refuse_warp(ref, coords, flow, spec["grid_bits"])
+    r = run_their_warp(ref, coords, spec["grid_bits"], acc_bits)
+
+    frac_cfg = torch.tensor(spec["frac_cfg"])
+    k = int(r["frac"].sum())
+    tap(taps, "x", x)
+    tap(taps, "flow", flow)
+    tap(taps, "call_sites", spec["call_sites"])
+    tap(taps, "call_site", spec["call_site"])
+    tap(taps, "frac_cfg", frac_cfg)
+    tap(taps, "hw_ref_code", r["mx_ref"].data)
+    tap(taps, "hw_grid_code", r["mx_grid"].data)
+    tap(taps, "hw_frac_bits", r["frac"])
+    tap(taps, "frac_match", int(torch.equal(frac_cfg, r["frac"])))
+    tap(taps, "frac_sum", k)
+    tap(taps, "frac_over", int(k > WARP_FRAC_SUM_LIMIT))
+    tap(taps, "acc_bits", acc_bits)
+    tap(taps, "hw_weights", r["weights"])
+    tap(taps, "hw_corners", r["corners"])
+    tap(taps, "hw_acc", r["acc"])
+    tap(taps, "out_raw", r["out"])
+    tap(taps, "out", r["out"] * s["ref_scale"])
+    return taps["out"]
+
+
+def warp_notes(taps):
+    """What a reader of an HW warp run must not miss, one line each."""
+    notes = []
+    fc, fh = taps["frac_cfg"].tolist(), taps["hw_frac_bits"].tolist()
+    if not int(taps["frac_match"]):
+        notes.append(f"!! grid fraction bits: config {fc}, their pack_warp_grid "
+                     f"derived {fh} from the data; their code ran on its own (HW Q3)")
+    if int(taps["frac_over"]):
+        notes.append(f"!! frx + fry = {int(taps['frac_sum'])} > "
+                     f"{WARP_FRAC_SUM_LIMIT}: their weight lane limit; the path "
+                     f"runs anyway (HW Q4)")
+    if int(taps["call_sites"]) > 1:
+        notes.append(f"config call_sites {int(taps['call_sites'])}: the sim "
+                     f"runs call site {int(taps['call_site'])}")
+    return notes
 
 
 OPS = {"conv": conv, "convt": convt, "warp": warp}
@@ -384,7 +556,11 @@ def main():
     args = ap.parse_args()
     cfg = SC.load_config(args.config)
     for name in C.select(args.m):
-        show(run(C.build(name), cfg), f"{name}  HW")
+        taps = run(C.build(name), cfg)
+        show(taps, f"{name}  HW")
+        if C.CASES[name]["op"] == "warp":
+            for line in warp_notes(taps):
+                print(f"  {line}")
 
 
 if __name__ == "__main__":

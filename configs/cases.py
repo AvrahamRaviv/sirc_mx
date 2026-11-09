@@ -102,6 +102,20 @@ CASES = {
                             ref_scale=P2, out_scale=P2),
     "warp_subpix":     dict(op="warp", x=(1, 8, 6, 12), flow=("subpix", 3.0),
                             ref_scale=0.0331, out_scale=0.0137),
+    # reference on the code lattice, codes 0..127: the range both ALG (int8)
+    # and the HW emulator (uint8, no scale) hold the same, so these also run
+    # on HW. W 40 / 56: not a multiple of 32 (the emulator's padding), 32 / 64:
+    # a multiple. out step = ref step, as HW plans (QA Q9).
+    "warp_u8_zero":    dict(op="warp", x=(1, 2, 5, 32), flow=("const", 0.0, 0.0),
+                            ref=(0, 127), ref_scale=P2, out_scale=P2),
+    "warp_u8_half":    dict(op="warp", x=(1, 2, 4, 40), flow=("const", 0.5, 0.0),
+                            ref=(0, 127), ref_scale=P2, out_scale=P2),
+    "warp_u8_oob":     dict(op="warp", x=(1, 2, 6, 40), flow=("const", -0.5, 0.5),
+                            ref=(0, 127), ref_scale=P2, out_scale=P2),
+    "warp_u8_subpix":  dict(op="warp", x=(1, 2, 6, 56), flow=("subpix", 3.0),
+                            ref=(0, 127), ref_scale=0.0331, out_scale=0.0331),
+    "warp_u8_subpix_w64": dict(op="warp", x=(1, 2, 6, 64), flow=("subpix", 3.0),
+                               ref=(0, 127), ref_scale=0.0331, out_scale=0.0331),
 }
 
 TAGS = ("conv", "convt", "warp")
@@ -136,7 +150,12 @@ def build(name, seed=0, x_frac=None):
     """
     spec = dict(CASES[name])
     gen = torch.Generator().manual_seed(seed)
-    x = torch.randn(spec.pop("x"), generator=gen) * spec.pop("x_scale", 1.0)
+    if "ref" in spec:             # warp reference on the code lattice: codes lo..hi
+        lo, hi = spec.pop("ref")
+        codes = torch.randint(lo, hi + 1, spec.pop("x"), generator=gen)
+        x = codes.float() * spec["ref_scale"]
+    else:
+        x = torch.randn(spec.pop("x"), generator=gen) * spec.pop("x_scale", 1.0)
     case = {"name": name, "op": spec.pop("op"),
             "x": x if x_frac is None else to_grid(x, x_frac), "x_frac": x_frac,
             "w": None, "b": None, "flow": None, "warp": None, "act": None}
@@ -160,6 +179,16 @@ def build(name, seed=0, x_frac=None):
                         "out_scale": spec.pop("out_scale")}
         case["params"] = spec
     return case
+
+
+def warp_case(name, codes, flow, ref_scale, out_scale):
+    """A warp case built by hand: reference codes [B,C,H,W] (any integer or
+    float values, on the code grid of `ref_scale`) and flow [B,2,H,W] in px.
+    Same dict as build() gives, for test vectors a table entry cannot hold."""
+    return {"name": name, "op": "warp", "x": codes.double().float() * ref_scale,
+            "x_frac": None, "w": None, "b": None, "flow": flow.float(),
+            "warp": {"ref_scale": ref_scale, "out_scale": out_scale},
+            "act": None, "input_layer": False, "params": {}}
 
 
 def select(arg):

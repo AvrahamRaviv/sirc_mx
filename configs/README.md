@@ -14,8 +14,8 @@ conv), and **warp**.
 | `cases.py` | the case table: one op per case, tiny shapes, fixed seed. Also `Warp`, the float spec of the warp |
 | `taps.py` | `tap(taps, name, t)` logs a value at any point; `show(taps)` prints them in order |
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
-| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv runs on their code (incl. PLA via a labelled bins stand-in). convT and warp are still placeholders: their emulator has no convT, and its warp (`CalibratedMXWarp`, `MXWarp_Loops`) is not wired in yet |
-| `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop |
+| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv (incl. PLA via a labelled bins stand-in) and warp (`CalibratedMXWarp`) run on their code. convT is a placeholder: their emulator has no convT |
+| `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop. `--only warp`: the warp vectors (T12) alone |
 | `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
@@ -30,7 +30,7 @@ conv), and **warp**.
 |---|---|
 | conv | `x w a_int a_exp w_int w_exp acc sat out` |
 | convt | `x w a_int a_exp w_int w_exp out` (HW adds `x_dil`) |
-| warp | `x flow ref_code grid_code out_pre out_code out` |
+| warp | `x flow ref_code grid_code out_pre out_code out` (HW: see HW warp) |
 
 - **conv**:
   - Integer form: `value = mant * 2^(E-6)` and `code = E + 127`.
@@ -57,6 +57,8 @@ python main_ALG.py -m convt --layer model.block2.conv1   # use that entry's grou
 python main_ALG.py -m conv3x3 --backend python           # step into the python ref
 python main_ALG.py -m warp           # every warp case
 python main.py -m all                # both sides compared
+python main.py -m warp --config mx_config_npe_e4.json   # warp: ALG vs their emulator, per stage
+python hw_vs_alg_check.py --only warp                    # warp vectors, one per HW question
 python main.py -m conv3x3_p0 --config mx_config_npe_e4.json   # HW conv runs at 4-bit exp
 python main.py -m conv3x3_p0 --config mx_config_npe_e4.json --input both   # float vs integer input
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
@@ -88,8 +90,9 @@ Exponent width: `mx_specs.scale_bits` drives both sides. ALG decodes the
 exponent code as `E + 2^(n-1)-1`. HW maps the config to their `mx_type`
 `mx-e{scale_bits}bm{N}` (e4bm8, e6bm8, e8bm8; the wrap mask comes with the
 type) and `block_size`, and refuses a type they don't have. Conv runs int8
-mantissas only: their `mx-e4bm16` is the warp weight lane, and their conv on
-it gives wrong numbers without an error, so `hw_format` refuses it. The NPE
+mantissas only: their `mx-e4bm16` is the warp's 16-bit lane (grid and
+weights), and their conv on it gives wrong numbers without an error, so
+`hw_format` refuses it; another width is refused as a type they lack. The NPE
 width is 4 bits: `--config mx_config_npe_e4.json`.
 Accumulator width: `xblock_accum.bits`, one of their `SUPPORTED_ACC_WIDTHS`
 (46, 48, 54, 56), else refused. Fixed inside their code (their API has no
@@ -97,6 +100,48 @@ parameter): PCU clamp 24 bits (`main_HW.HW_FIXED`).
 
 Their code does not support padding (it raises) or dilation (it has no such
 parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.
+
+## HW warp (npe_mx_emu)
+
+`main_HW.warp` runs their `CalibratedMXWarp` as their example notebook
+calls it; nothing of theirs is reimplemented or edited:
+1. Inputs from the case: `reference = x / ref_scale` (code units; their
+   packer rounds half to even and clamps to uint8 0..255, no scale) and
+   `coords` = absolute positions, mesh + flow, `[B, H, W, 2]`, float64 as in
+   their notebooks (their weights and bcu product take the coordinates' dtype).
+2. Config: grid word width (their `grid_bit_width`) and fraction bits from the
+   warp entry's grid fxp at call site 0 (a per-site list is indexed; the sim
+   runs one forward, so both sides use site 0; `call_sites` is tapped);
+   accumulator width from `xblock_accum.bits` (the BCU conv uses). Refused
+   unless the reference is 8-bit and the grid word at most 16 bits.
+3. Setup: `LayerMXQParams(x_cal=0, w_cal=0, out_cal=0)` (output in code
+   units), then `calibrate()` with its default fraction bits (7, 7). It only
+   fills the PCU c_structs, which `forward()` requires and never reads (their
+   PCU is bypassed). Nothing comes from data.
+4. Taps, by pass-through wrappers on `pack_warp_reference`, `pack_warp_grid`,
+   `trc` and `bcu`: `hw_ref_code` (W padded to 32), `hw_grid_code`,
+   `hw_frac_bits`, `hw_weights`, `hw_corners`, `hw_acc` (bcu's int64 p_sum,
+   taken inside their loop), `out_raw` (their float32 output as is: acc /
+   2^(frx+fry), rounded by float32 once |acc| > 2^24) and
+   `out = out_raw * ref_scale`.
+
+Their fraction bits come from the data (per frame, from max |position|); the
+config's are fixed. `frac_cfg`, `hw_frac_bits` and `frac_match` show both, and
+a `!!` line is printed when they differ; their code runs on its own.
+`frac_over`: frx + fry above 14, their weight lane (their `trc_warp` and
+`build_warp_c_struct_arr` refuse it, the path that runs does not).
+
+Refused, because their code would give wrong numbers without an error:
+batch > 1 with different flows (they read batch 0's grid), a reference their
+packer would clamp (negative or above 255, so the randn warp cases), H < 2, and an
+axis whose fraction bits come out infinite. The `warp_u8_*` cases (codes
+0..127, the range both sides hold the same) run on both sides.
+
+main.py adds, per stage and labelled with the numbers of the questions sent
+to the HW team: ref code, grid position (px), acc inside the frame and on the
+border (code units), and their float32 output against their own int64 acc.
+The generic compare covers `out`. ALG's int8 `out_code` has no HW counterpart.
+`hw_vs_alg_check.py` T12 has one vector per difference, labelled the same way.
 
 ## Static grids and PLA
 

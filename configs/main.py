@@ -32,6 +32,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import torch
+
 import cases as C
 import main_ALG as ALG
 import main_HW as HW
@@ -90,6 +92,75 @@ def report(name, rows, alg, hw):
     return "bit-exact"
 
 
+# ALG's out_pre is float32: its acc in code units carries <= ~2e-5 of float
+# error (measured, phase A), so the acc stage counts differences above this.
+WARP_ACC_TOL = 1e-3
+
+
+def _row(stage, q, a, h, tol=0.0, mask=None):
+    """One stage of warp_stages: compare a and h (same shape) where mask."""
+    a, h = a.double(), h.double()
+    if mask is not None:
+        a, h = a[mask], h[mask]
+    n = a.numel()
+    d = (a - h).abs()
+    return {"stage": stage, "q": q, "n": n, "n_diff": int((d > tol).sum()),
+            "max_d": float(d.max()) if n else 0.0}
+
+
+def warp_stages(case, alg, hw):
+    """The warp, ALG vs HW, per stage where both sides have one, in units both
+    share. Rows {stage, q (the HW question it bears on), n, n_diff, max_d}:
+      ref code     ALG int8 ref_code vs their uint8 code (padding dropped)
+      grid px      sample position each grid word stands for: ALG mesh +
+                   grid_code / 2^frac_cfg vs theirs hw_grid_code / 2^hw_frac_bits
+      acc interior the bilinear sum in ref code units, ALG out_pre / ref_scale
+      acc border   vs their hw_acc / 2^(frx+fry); interior = all 4 corners of
+                   ALG's position inside the frame, border = the rest
+    `out` is in the generic tap compare. ALG's int8 out_code has no HW
+    counterpart: their PCU is bypassed (HW Q7)."""
+    B, _, H, W = case["x"].shape
+    yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float64),
+                            torch.arange(W, dtype=torch.float64), indexing="ij")
+    mesh = torch.stack([xx, yy])                               # [2, H, W]
+    fa = hw["frac_cfg"].double().view(1, 2, 1, 1)
+    fh = hw["hw_frac_bits"].double().view(1, 2, 1, 1)
+    a_pos = mesh + alg["grid_code"].double() / 2.0 ** fa       # [B, 2, H, W]
+    h_pos = (hw["hw_grid_code"].double() / 2.0 ** fh).expand_as(a_pos)
+    k = int(hw["frac_sum"])
+    a_acc = alg["out_pre"].double() / case["warp"]["ref_scale"]
+    h_acc = hw["hw_acc"].double() / 2.0 ** k
+    x0, y0 = torch.floor(a_pos[:, 0]), torch.floor(a_pos[:, 1])
+    inside = (x0 >= 0) & (x0 + 1 < W) & (y0 >= 0) & (y0 + 1 < H)   # [B, H, W]
+    inside = inside.unsqueeze(1).expand_as(a_acc)
+    return [_row("ref code", "Q5 Q6", alg["ref_code"], hw["hw_ref_code"][..., :W]),
+            _row("grid px", "Q3 Q5", a_pos, h_pos),
+            _row("acc interior", "Q3", a_acc, h_acc, WARP_ACC_TOL, inside),
+            _row("acc border", "Q1 Q2 Q10", a_acc, h_acc, WARP_ACC_TOL, ~inside)]
+
+
+def warp_float32_store(hw):
+    """(n, n above 2^24, n rounded): their float32 output vs their own int64
+    acc. out_raw * 2^(frx+fry) is exact where |acc| <= 2^24 (HW Q9)."""
+    acc = hw["hw_acc"]
+    back = hw["out_raw"].double() * 2.0 ** int(hw["frac_sum"])
+    return (acc.numel(), int((acc.abs() > 2 ** 24).sum()),
+            int((back != acc.double()).sum()))
+
+
+def report_warp(case, alg, hw):
+    print("  warp per stage (HW question):")
+    for r in warp_stages(case, alg, hw):
+        print(f"    {r['stage']:<13} {r['q']:<10} {r['n_diff']:>6}/{r['n']:<6} "
+              f"differ, max {r['max_d']:.6g}")
+    n, big, rounded = warp_float32_store(hw)
+    print(f"    their float32 output vs their int64 acc (Q9): {big}/{n} acc above "
+          f"2^24, {rounded} rounded")
+    print("    ALG out_code: no HW counterpart, their PCU is bypassed (Q7)")
+    for line in HW.warp_notes(hw):
+        print(f"  {line}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
@@ -123,6 +194,8 @@ def main():
                 results[key] = None
                 continue
             results[key] = report(key, compare(alg, hw), alg, hw)
+            if case["op"] == "warp":
+                report_warp(case, alg, hw)
             if "pre_round_moved" in hw:
                 print(f"  HW input off its integer grid (x*2^x_cal): "
                       f"{int(hw['pre_round_moved'])}/{case['x'].numel()} elements"

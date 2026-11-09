@@ -39,6 +39,25 @@ def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
             "layer": layer, "backend": backend}
 
 
+def entry_name(cfg, op):
+    """Name of the `layers` entry of the layer under test: --layer if given,
+    else for warp the file's first act_quant entry, else None (conv / convT
+    run on the plain global mx_specs)."""
+    name = cfg["layer"]
+    if name is None and op == "warp":
+        name = next((n for n, e in cfg["entries"].items()
+                     if e.get("kind") == "act_quant"), None)
+        if name is None:
+            raise SystemExit(f"{cfg['file']}: no act_quant entry for warp")
+    return name
+
+
+def site_fxp(fxp, site):
+    """One operand's fxp spec at call site `site`: a per-site list is indexed,
+    a single spec is shared by every site (as the lib's MXActQuant reads it)."""
+    return fxp[site] if isinstance(fxp, (list, tuple)) else fxp
+
+
 def grid_key(cfg, case):
     """Name of the case's hw_grids entry: --layer if given, else the case name."""
     return cfg["layer"] or case["name"]

@@ -77,10 +77,9 @@ def test_hw_conv_unsupported_raises(name):
         HW.run(C.build(name), E4)
 
 
-@pytest.mark.parametrize("name", ["convt_k3_s2", "warp_int_shift"])
-def test_hw_placeholder(name):
-    with pytest.raises(NotImplementedError):
-        HW.run(C.build(name), E4)
+def test_hw_placeholder():
+    with pytest.raises(NotImplementedError, match="HW convt"):
+        HW.run(C.build("convt_k3_s2"), E4)
 
 
 def test_int_input_is_on_grid_and_hw_preround_is_noop():
@@ -122,10 +121,22 @@ def test_hw_conv_refuses_non_int8_mantissa():
     by_register = dict(i16, scale_bits=8, xblock_accum=dict(
         i16["xblock_accum"], in_exp_mode="infer", in_exp_bits=4))
     for sp in (by_scale_bits, by_register):
-        with pytest.raises(NotImplementedError, match="int16.*warp lane"):
+        with pytest.raises(NotImplementedError, match="int16.*mx-e4bm16 is the warp's"):
             HW.hw_format({"mx_specs": sp})
-    with pytest.raises(NotImplementedError, match="warp lane"):
+    with pytest.raises(NotImplementedError, match="warp's 16-bit lane"):
         HW.run(C.build("conv1x1"), {**E4, "mx_specs": by_scale_bits})
+
+
+@pytest.mark.parametrize("fmt, scale_bits", [("int6", 4), ("int4", 4), ("int16", 8)])
+def test_hw_conv_refusal_names_only_what_is_true(fmt, scale_bits):
+    """A width with no lane in their factory is refused as that, never as
+    "the warp lane" (only mx-e4bm16 is)."""
+    sp = dict(E4["mx_specs"], a_elem_format=fmt, w_elem_format=fmt, scale_bits=scale_bits)
+    with pytest.raises(NotImplementedError) as e:
+        HW.hw_format({"mx_specs": sp})
+    msg = str(e.value)
+    assert f"npe_mx_emu has no mx-e{scale_bits}bm{fmt[3:]}" in msg
+    assert "warp" not in msg
 
 
 def test_hw_acc_width_comes_from_config():
@@ -300,3 +311,191 @@ def test_hw_exact_first_layer():
     d = (a["out"].double() - h["out"].double())[0]
     assert float(d.abs().max()) <= 2.0 ** -16
     assert all(d[o].unique().numel() == 1 for o in range(d.shape[0]))
+
+
+# --- HW warp: their CalibratedMXWarp, wired in (main_HW.warp) -----------------
+
+import subprocess                     # noqa: E402
+
+import main as M                      # noqa: E402
+
+U8 = [n for n, c in C.CASES.items() if c["op"] == "warp" and "ref" in c]
+
+
+def _u8_cases():
+    assert U8, "no warp case with a code-lattice reference in cases.CASES"
+    return U8
+
+
+def _flow(B, H, W, fx, fy):
+    return C._flow((B, 2, H, W), ("const", fx, fy), None)
+
+
+@pytest.mark.parametrize("name", _u8_cases())
+def test_hw_warp_runs_their_code(name):
+    """Every code-lattice warp case runs on their code: their packed
+    reference holds the case's codes, out is their output times the ref
+    step, the grid format comes from the config."""
+    case = C.build(name)
+    t = HW.run(case, E4)
+    B, Cc, H, W = case["x"].shape
+    codes = (case["x"].double() / case["warp"]["ref_scale"]).round().long()
+    assert torch.equal(t["hw_ref_code"][..., :W], codes)
+    assert t["hw_acc"].dtype == torch.int64 and t["hw_acc"].shape == (B, Cc, H, W)
+    assert t["hw_weights"].shape == (H, W, 4)
+    assert torch.equal(t["out"], t["out_raw"] * case["warp"]["ref_scale"])
+    assert t["frac_cfg"].tolist() == [8, 8]          # mx_config_npe_e4.json grid fxp
+    assert int(t["frac_sum"]) == int(t["hw_frac_bits"].sum())
+
+
+def test_hw_warp_acc_is_their_int64_psum():
+    """hw_acc is bcu's p_sum taken in their loop, not read back from their
+    float32 output: with a constant reference c and a continuous flow every
+    interior sample's acc is c * 2^(frx+fry) exactly (their weights sum to
+    2^(frx+fry)), while their float32 output equals it only where |acc| <=
+    2^24; on a random reference it rounds some."""
+    g = torch.Generator().manual_seed(3)
+    flow = (torch.rand(1, 2, 8, 8, generator=g) * 2 - 1) * 1.5
+    t = HW.run(C.warp_case("c", torch.full((1, 1, 8, 8), 7), flow, C.P2, C.P2), E4)
+    k = int(t["frac_sum"])
+    pos = HW.abs_coords(flow)[0]
+    inner = ((pos[..., 0] >= 0) & (pos[..., 0] < 7) & (pos[..., 1] >= 0)
+             & (pos[..., 1] < 7)).expand(1, 1, 8, 8)
+    assert int(inner.sum()) > 0
+    assert bool((t["hw_acc"][inner] == 7 * 2 ** k).all())
+    t = HW.run(C.warp_case("r", torch.randint(0, 128, (1, 1, 8, 8), generator=g),
+                           flow, C.P2, C.P2), E4)
+    acc, back = t["hw_acc"], t["out_raw"].double() * 2.0 ** int(t["frac_sum"])
+    small = acc.abs() <= 2 ** 24
+    assert bool(small.any()) and bool((back[small] == acc[small].double()).all())
+    n, big, rounded = M.warp_float32_store(t)
+    assert big > 0 and rounded > 0                  # float32 dropped acc bits
+    assert bool((back != acc.double()).any())
+
+
+@pytest.mark.parametrize("name", ["warp_u8_subpix", "warp_u8_subpix_w64"])
+def test_hw_warp_interior_equals_alg_exact(name):
+    """Codes 0..127, flow on 1/256, their fraction bits >= 8 per axis: inside
+    the frame their acc / 2^(frx+fry) is the exact bilinear sum of ALG's own
+    codes (cases.Warp in float64, exact on the 1/256 grid)."""
+    case = C.build(name)
+    a, h = ALG.run(case, E4), HW.run(case, E4)
+    assert int(h["hw_frac_bits"].min()) >= 8
+    want = C.Warp()(a["ref_code"].double(), a["grid_code"].double() / 256)
+    got = h["hw_acc"].double() / 2.0 ** int(h["frac_sum"])
+    st = {r["stage"]: r for r in M.warp_stages(case, a, h)}
+    _, _, H, W = case["x"].shape
+    pos = HW.abs_coords(case["flow"])[0]
+    x0, y0 = pos[..., 0].floor(), pos[..., 1].floor()
+    inside = ((x0 >= 0) & (x0 + 1 < W) & (y0 >= 0) & (y0 + 1 < H)).expand_as(got)
+    assert int(inside.sum()) == st["acc interior"]["n"] > 0
+    assert torch.equal(got[inside], want[inside])
+
+
+def test_hw_warp_stages_name_the_border_rule():
+    """main.warp_stages on the identity flow: ref, grid and interior equal,
+    the border differs: their last row reads the row above and, W being a
+    multiple of 32, their last column the column before (HW Q2)."""
+    case = C.build("warp_u8_zero")
+    a, h = ALG.run(case, E4), HW.run(case, E4)
+    st = {r["stage"]: r for r in M.warp_stages(case, a, h)}
+    assert all(r["n"] > 0 for r in st.values())
+    assert st["ref code"]["n_diff"] == st["grid px"]["n_diff"] == 0
+    assert st["acc interior"]["n_diff"] == 0
+    assert st["acc border"]["n_diff"] > 0
+    got = h["hw_acc"][0, 0].double() / 2.0 ** int(h["frac_sum"])
+    ref = a["ref_code"][0, 0].double()
+    assert torch.equal(got[-1, :-1], ref[-2, :-1])
+    assert torch.equal(got[:-1, -1], ref[:-1, -2])
+    assert torch.equal(got[:-1, :-1], ref[:-1, :-1])
+
+
+def test_hw_warp_refuses_what_their_code_would_get_wrong():
+    """Batch > 1 with different flows (their batch-0 grid), a reference their
+    packer would clamp (signed, or above 255), H < 2, an axis whose fraction
+    bits come out infinite. Same flows over a batch run."""
+    ok = torch.randint(0, 128, (2, 1, 3, 8), generator=torch.Generator().manual_seed(1))
+    f = _flow(2, 3, 8, 0.5, 0.0)
+    t = HW.run(C.warp_case("b", ok, f, C.P2, C.P2), E4)
+    one = HW.run(C.warp_case("b1", ok[1:], f[1:], C.P2, C.P2), E4)
+    assert torch.equal(t["hw_acc"][1:], one["hw_acc"])
+    f2 = f.clone()
+    f2[1, 0] += 1.0
+    with pytest.raises(NotImplementedError, match="batch > 1 with different flows"):
+        HW.run(C.warp_case("b", ok, f2, C.P2, C.P2), E4)
+    for bad in (-1, 256):
+        ref = ok[:1].clone()
+        ref[0, 0, 0, 0] = bad
+        with pytest.raises(NotImplementedError, match="clamps to uint8"):
+            HW.run(C.warp_case("r", ref, _flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
+    with pytest.raises(NotImplementedError, match="H = 1"):
+        HW.run(C.warp_case("h", ok[:1, :, :1], _flow(1, 1, 8, 0, 0), C.P2, C.P2), E4)
+    fy = _flow(1, 3, 8, 0.0, 0.0)
+    fy[0, 1] = -torch.arange(3.0).view(3, 1)        # every y position 0
+    with pytest.raises(NotImplementedError, match="fraction bits"):
+        HW.run(C.warp_case("y", ok[:1], fy, C.P2, C.P2), E4)
+    with pytest.raises(NotImplementedError, match="uint8"):
+        HW.run(C.build("warp_int_shift"), E4)       # randn reference: signed
+
+
+def test_hw_warp_grid_format_from_config_and_reported():
+    """frac_cfg is the config's grid fxp at call site 0; their own fraction
+    bits are tapped beside it, a mismatch and frx + fry > 14 are named, the
+    call sites are reported; lanes their code lacks are refused."""
+    def cfg_with(**grid):
+        cfg = copy.deepcopy(E4)
+        cfg["entries"]["model.warp"]["inputs"][1]["fxp"].update(grid)
+        return cfg
+    z = lambda H, W: C.warp_case("z", torch.zeros(1, 1, H, W), _flow(1, H, W, 0, 0),
+                                 C.P2, C.P2)
+    t = HW.run(z(4, 40), cfg_with(frac_bits=7))
+    assert t["frac_cfg"].tolist() == [7, 7] and int(t["frac_match"]) == 0
+    notes = " ".join(HW.warp_notes(t))
+    assert "HW Q3" in notes and "HW Q4" in notes and int(t["frac_over"]) == 1
+    assert "call_sites 3" in notes
+    t = HW.run(z(65, 65), E4)                       # their rule gives 8, 8 here
+    assert t["hw_frac_bits"].tolist() == [8, 8] and int(t["frac_match"]) == 1
+    assert "HW Q3" not in " ".join(HW.warp_notes(t))
+    assert int(HW.run(z(4, 40), HWX)["call_sites"]) == 2
+    cfg = copy.deepcopy(E4)                          # per-site list: site 0 is used
+    g = cfg["entries"]["model.warp"]["inputs"][1]["fxp"]
+    cfg["entries"]["model.warp"]["inputs"][1]["fxp"] = [dict(g, frac_bits=f) for f in (6, 7, 5)]
+    t = HW.run(z(4, 40), cfg)
+    assert t["frac_cfg"].tolist() == [6, 6] and int(t["call_site"]) == 0
+    with pytest.raises(NotImplementedError, match="int16"):
+        HW.run(z(4, 40), cfg_with(total_bits=32))
+    cfg = copy.deepcopy(E4)
+    cfg["entries"]["model.warp"]["inputs"][0]["fxp"]["total_bits"] = 16
+    with pytest.raises(NotImplementedError, match="8-bit"):
+        HW.run(z(4, 40), cfg)
+
+
+def test_hw_warp_setup_c_struct_is_not_read():
+    """main_HW's minimal setup calibrates with their default fraction bits;
+    the result does not depend on them, their forward never reads the PCU
+    c_structs (PCU bypassed)."""
+    case = C.build("warp_u8_half")
+    ref = case["x"].double() / case["warp"]["ref_scale"]
+    coords = HW.abs_coords(case["flow"])
+    outs = []
+    for fb in ((7, 7), (1, 2)):
+        layer = HW._warp_layer(ref.shape[1], 16, 48)
+        layer.calibrate(fb)
+        with torch.no_grad():
+            outs.append(layer(ref, coords))
+    assert torch.equal(outs[0], outs[1])
+    assert torch.equal(outs[0], HW.run(case, E4)["out_raw"])
+
+
+def test_hw_vs_alg_check_warp_vectors():
+    """T12 prints one labelled vector per difference, covering HW questions
+    Q1-Q10 of the list sent to the HW team."""
+    import re
+    p = subprocess.run([sys.executable, "hw_vs_alg_check.py", "--only", "warp"],
+                       cwd=os.path.join(_ROOT, "configs"), capture_output=True,
+                       text=True, timeout=300)
+    assert p.returncode == 0, p.stderr[-2000:]
+    labels = re.findall(r"^\s+\[(D\d+) \| HW (Q\d+)\]", p.stdout, re.M)
+    assert labels, p.stdout[-2000:]
+    assert {q for _, q in labels} == {f"Q{i}" for i in range(1, 11)}
+    assert {d for d, _ in labels} == {f"D{i}" for i in range(1, 10)}
