@@ -24,6 +24,15 @@ from fixed_point.fxp_sites import entry_call_sites, expand_sites   # noqa: E402
 DEFAULT_CONFIG = os.path.join(_HERE, "mx_config_dof.json")
 
 
+# What a side raises when it cannot run a case as configured - a documented
+# refusal, with a message naming what and why: NotImplementedError (the HW
+# code cannot run it, or would give wrong numbers without an error) and
+# SystemExit (the config lacks what the sim reads, e.g. static grids: the sim
+# never calibrates). A CLI over many cases reports each and goes on; any other
+# error is a failure.
+REFUSED = (NotImplementedError, SystemExit)
+
+
 def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
     """Framework mx_config.json -> sim config dict.
 

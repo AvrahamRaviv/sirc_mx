@@ -703,3 +703,89 @@ def test_hw_vs_alg_check_runs_on_hw_exact():
     assert p.returncode == 0, p.stderr[-2000:]
     assert "### T11" in p.stdout and "T12 skipped" not in p.stdout
     assert "(config has no output fxp)" in p.stdout, p.stdout[-2000:]
+
+
+# --- CLIs over many cases: a refusal is reported, the run goes on -----------
+
+def _cli(script, *args):
+    return subprocess.run([sys.executable, script, *args],
+                          cwd=os.path.join(_ROOT, "configs"), capture_output=True,
+                          text=True, timeout=600)
+
+
+def _refused_names(summary):
+    """Case names after 'refused: ' in a CLI summary line."""
+    part = summary.split("refused: ", 1)[1].split(", FAILED")[0]
+    return part.split(", HW missing")[0].split(", ")
+
+
+def test_main_hw_cli_reports_each_refusal_and_goes_on():
+    """-m all on npe_e4: conv3x3 (padding) is refused by their code, and the
+    run goes on to the end; every refusal is named with its reason and in
+    the summary, never counted as ran; only refusals: exit 0."""
+    names = C.select("all")
+    p = _cli("main_HW.py", "-m", "all", "--config", "mx_config_npe_e4.json")
+    assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
+    out = p.stdout.splitlines()
+    assert "  refused: Padding not yet supported" in out
+    assert "=== warp_u8_subpix_w64  HW ===" in out          # the last case ran
+    refused = _refused_names(out[-1])
+    assert "conv3x3" in refused and "conv1x1" not in refused
+    assert out[-1].startswith(f"{len(names) - len(refused)}/{len(names)} ran")
+    assert sum(ln.startswith("  refused: ") for ln in out) == len(refused)
+
+
+def test_main_hw_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys):
+    """An error other than a documented refusal is reported, the run goes
+    on, and the exit code is 1."""
+    real = HW.run
+
+    def run(case, cfg=None):
+        if case["name"] == "conv1x1":
+            raise RuntimeError("boom")
+        return real(case, cfg)
+
+    monkeypatch.setattr(HW, "run", run)
+    monkeypatch.setattr(sys, "argv", ["main_HW.py", "-m", "conv", "--config",
+                                      "mx_config_npe_e4.json"])
+    with pytest.raises(SystemExit) as ex:
+        HW.main()
+    out = capsys.readouterr().out.splitlines()
+    assert ex.value.code == 1
+    assert "  FAILED: RuntimeError: boom" in out
+    assert "=== conv3x3_p0  HW ===" in out                    # went on
+    assert ", FAILED: conv1x1" in out[-1]
+
+
+def test_main_cli_reports_each_refusal_and_goes_on():
+    """main.py -m all on npe_e4: the input-layer and PLA cases are refused
+    (no grids in that config), the run goes on to the warp, the refusals are
+    named, and the exit code says a case did not run (2), never a pass."""
+    p = _cli("main.py", "-m", "all", "--config", "mx_config_npe_e4.json")
+    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
+    out = p.stdout.splitlines()
+    assert any(ln.startswith("  HW refused: mx_config_npe_e4.json: input layer needs")
+               for ln in out)
+    assert "=== warp_u8_subpix_w64 ===" in out
+    refused = _refused_names(out[-1])
+    assert {"conv1x1_in", "conv3x3_in", "conv_prelu"} <= set(refused)
+
+
+def test_main_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys):
+    real = ALG.run
+
+    def run(case, cfg=None):
+        if case["name"] == "conv1x1":
+            raise RuntimeError("boom")
+        return real(case, cfg)
+
+    monkeypatch.setattr(M.ALG, "run", run)
+    monkeypatch.setattr(sys, "argv", ["main.py", "-m", "conv", "--config",
+                                      "mx_config_npe_e4.json"])
+    with pytest.raises(SystemExit) as ex:
+        M.main()
+    out = capsys.readouterr().out.splitlines()
+    assert ex.value.code == 1
+    assert "  ALG FAILED: RuntimeError: boom" in out
+    assert "=== conv3x3_p0 ===" in out
+    assert ", FAILED: conv1x1" in out[-1]

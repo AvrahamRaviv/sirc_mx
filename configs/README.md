@@ -67,6 +67,15 @@ python main.py -m conv3x3_p0 --config mx_config_npe_e4.json --input both   # flo
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
 
+Over many cases (`-m all`, an op), `main.py` and `main_HW.py` run every case.
+A case a side refuses (`sim_config.REFUSED`: their code cannot run it, or the
+config lacks what the sim reads, such as static grids) prints `refused: <why>`
+and the run goes on; any other error prints `FAILED` with its traceback and
+the run goes on. The last line names the refused and failed cases. Exit:
+`main_HW.py` 1 if a case failed, else 0; `main.py` 1 on a mismatch or a
+failure, 2 if a case was refused or not implemented on HW, 3 float
+differences only, 0 all bit-exact.
+
 ## HW side (npe_mx_emu)
 
 `main_HW.conv` runs their flow as in their notebook:

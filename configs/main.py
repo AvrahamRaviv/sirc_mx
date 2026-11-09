@@ -20,13 +20,18 @@ Verdict per case: bit-exact (every shared tap equal), float-diff (integer taps
 equal, a float tap differs - reported, not failed), MISMATCH (an integer tap or
 a shape differs).
 
-Exit code: 0 all bit-exact, 1 a mismatch, 2 HW side not implemented, 3 only
-float differences.
+Every case is run: a side that refuses a case (sim_config.REFUSED: the HW
+code cannot run it, or the config lacks what the sim reads) or fails is
+reported and the run goes on.
+
+Exit code: 0 all bit-exact, 1 a mismatch or a failure, 2 a refusal (HW side
+not implemented, or refused), 3 only float differences.
 """
 
 import argparse
 import os
 import sys
+import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -163,6 +168,18 @@ def report_warp(case, alg, hw, cfg):
         print(f"  {line}")
 
 
+def _not_run(key, side, e):
+    """A side that raised on a case: a documented refusal (SC.REFUSED, its
+    message names what and why) -> "refused"; anything else -> "failed",
+    with its traceback. Printed either way; the run goes on."""
+    if isinstance(e, SC.REFUSED):
+        print(f"\n=== {key} ===\n  {side} refused: {e}")
+        return "refused"
+    print(f"\n=== {key} ===\n  {side} FAILED: {type(e).__name__}: {e}")
+    traceback.print_exception(e)
+    return "failed"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
@@ -187,13 +204,20 @@ def main():
         for xf in modes:
             key = name if xf is None else f"{name} [int 2^-{xf}]"
             case = C.build(name, x_frac=xf)
-            alg = ALG.run(case, cfg)
+            try:
+                alg = ALG.run(case, cfg)
+            except (Exception, SystemExit) as e:
+                results[key] = _not_run(key, "ALG", e)
+                continue
             try:
                 hw = HW.run(case, cfg)
             except NotImplementedError as e:
                 print(f"\n=== {key} ===\n  HW not implemented: {e}  "
                       f"(ALG: {len(alg)} taps)")
                 results[key] = None
+                continue
+            except (Exception, SystemExit) as e:
+                results[key] = _not_run(key, "HW", e)
                 continue
             results[key] = report(key, compare(alg, hw), alg, hw)
             if case["op"] == "warp":
@@ -238,11 +262,15 @@ def main():
     fd = [k for k, v in results.items() if v == "float-diff"]
     bad = [k for k, v in results.items() if v == "mismatch"]
     skip = [k for k, v in results.items() if v is None]
+    refused = [k for k, v in results.items() if v == "refused"]
+    failed = [k for k, v in results.items() if v == "failed"]
     print(f"\n{len(ok)}/{len(results)} bit-exact"
           + (f", float-diff: {', '.join(fd)}" if fd else "")
           + (f", mismatched: {', '.join(bad)}" if bad else "")
-          + (f", HW missing: {len(skip)}" if skip else ""))
-    sys.exit(1 if bad else 2 if skip else 3 if fd else 0)
+          + (f", HW missing: {len(skip)}" if skip else "")
+          + (f", refused: {', '.join(refused)}" if refused else "")
+          + (f", FAILED: {', '.join(failed)}" if failed else ""))
+    sys.exit(1 if bad or failed else 2 if skip or refused else 3 if fd else 0)
 
 
 if __name__ == "__main__":
