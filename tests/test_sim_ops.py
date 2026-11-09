@@ -582,6 +582,43 @@ def test_alg_warp_output_fxp_off_is_unrounded_as_the_lib(fxp):
     assert "output fxp is off" in ALG.warp_out_note(cfg)
 
 
+@pytest.mark.parametrize("bad", [[], "two"], ids=["empty", "two_of_three"])
+def test_alg_warp_output_site_list_of_wrong_length_refused_by_the_lib_rule(bad):
+    """warp_out_note reads the output's call site by the lib's rule
+    (sim_config.site_fxp): a list that is not one spec per call site is the
+    lib's ValueError, not a crash of its own."""
+    cfg = copy.deepcopy(E4)                    # warp call_sites 3
+    out = cfg["entries"]["model.warp"]["output"]
+    out["fxp"] = [] if bad == [] else [out["fxp"]] * 2
+    n = len(out["fxp"])
+    with pytest.raises(ValueError, match=f"{n} per-call-site fxp configs for call_sites=3"):
+        ALG.warp_out_note(cfg)
+
+
+@pytest.mark.parametrize("operand, shape", [
+    ("output", "on_none_none"), ("output", "on_false_false"), ("input0", "on_none_none"),
+    ("output", "true"), ("input0", "true")])
+def test_alg_warp_off_sites_and_true_run_as_the_lib(operand, shape):
+    """Shapes the lib accepts: a per-site list whose other sites are off
+    (null / false) runs call site 0 as the single spec does, and `true` (the
+    lib's defaults) runs with the case's scale; no crash in _fix_scale."""
+    cfg = copy.deepcopy(E4)                    # warp call_sites 3
+    e = cfg["entries"]["model.warp"]
+    op = e["output"] if operand == "output" else e["inputs"][0]
+    on = op["fxp"]
+    op["fxp"] = {"on_none_none": [on, None, None], "on_false_false": [on, False, False],
+                 "true": True}[shape]
+    case = C.build("warp_u8_half")
+    t = ALG.run(case, cfg)
+    assert "out_code" in t and ALG.warp_out_note(cfg) is None
+    if shape == "true":
+        codes = (case["x"].double() / case["warp"]["ref_scale"]).round()
+        assert operand == "output" or torch.equal(t["ref_code"].double(), codes)
+        return
+    ref = ALG.run(case, E4)
+    assert all(torch.equal(t[k], ref[k]) for k in ref)
+
+
 def test_t12_output_requant_q7_without_output_fxp():
     """D7 on a config with no output fxp: ALG gives the acc unrounded."""
     (v,) = [x for x in WV.vectors(HWX) if x["label"] == "D7 | HW Q7"]
@@ -792,6 +829,9 @@ def test_main_alg_cli_reports_each_refusal_and_goes_on(tmp_path):
            "The sim does not calibrate: write the grids into the config " \
            "(gen_hw_grids.py)." in out
     assert "=== warp_u8_subpix_w64  ALG ===" in out          # the last case ran
+    note = ("  ALG out: warp entry 'model.warp' has no output fxp; the lib leaves the "
+            "warp output unrounded (float), so there is no out_code")
+    assert out.count(note) == sum(C.CASES[n]["op"] == "warp" for n in names) > 0
     summary = out[-3]                          # then the --dump line
     refused = _refused_names(summary)
     assert {"conv3x3", "convt_k3_s2"} <= set(refused) and "conv1x1" not in refused
@@ -870,6 +910,40 @@ def test_main_cli_reports_each_refusal_and_goes_on():
     p = _cli("main.py", "-m", "conv1x1_in", "--config", "mx_config_npe_e4.json")
     assert p.returncode == 2, p.stdout[-2000:]                # refused alone: 2
     assert p.stdout.splitlines()[-1] == "0/1 bit-exact, refused: conv1x1_in"
+
+
+def test_main_cli_prints_the_warp_out_note():
+    """main.py on a warp case of a config with no output fxp says why ALG
+    has no out_code (warp_out_note), in its per-stage warp report."""
+    p = _cli("main.py", "-m", "warp_u8_half", "--config", "mx_config_npe_hw_exact.json")
+    assert p.returncode == 3, p.stdout[-2000:] + p.stderr[-2000:]  # out: float diff
+    assert ("    ALG out: warp entry 'model.warp' has no output fxp; the lib leaves the "
+            "warp output unrounded (float), so there is no out_code") in p.stdout.splitlines()
+
+
+def test_main_cli_exit_3_on_float_differences_only():
+    """Every integer tap equal, a float tap differs: exit 3, not 0 and not 1."""
+    p = _cli("main.py", "-m", "conv1x1", "--config", "mx_config_npe_e4.json")
+    assert p.returncode == 3, p.stdout[-2000:] + p.stderr[-2000:]
+    assert p.stdout.splitlines()[-1] == "0/1 bit-exact, float-diff: conv1x1"
+
+
+def test_hw_vs_alg_check_fails_on_an_error_that_is_not_a_refusal(monkeypatch):
+    """A section's error that is not a documented refusal is not a skip: it
+    propagates (exit 1), so a bug never reads as "skipped"."""
+    import runpy
+    real = HW.run
+
+    def run(case, cfg=None):
+        if case["name"] == "conv3x3_p0":
+            raise RuntimeError("boom")
+        return real(case, cfg)
+
+    monkeypatch.setattr(HW, "run", run)
+    monkeypatch.chdir(os.path.join(_ROOT, "configs"))
+    monkeypatch.setattr(sys, "argv", ["hw_vs_alg_check.py", "--config", "mx_config_npe_e4.json"])
+    with pytest.raises(RuntimeError, match="boom"):
+        runpy.run_path(os.path.join(_ROOT, "configs", "hw_vs_alg_check.py"), run_name="__main__")
 
 
 def test_main_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys):

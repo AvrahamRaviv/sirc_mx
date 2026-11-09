@@ -7,6 +7,7 @@ hw_vs_alg_check.py:
     0  every case (section) ran clean
     1  a failure (an error that is not a refusal) or a mismatch
     2  something was refused or skipped, and nothing failed
+       (an argparse usage error also exits 2)
 A refusal is never a pass: it must not read as 0 to a caller of the code.
 (main.py adds 3: everything ran, only float taps differ.)
 """
@@ -39,10 +40,23 @@ def load_config(path, layer=None, backend=None):
         sys.exit(EXIT_REFUSED)
 
 
+def not_run(header, e, side=""):
+    """A case that raised: a documented refusal (sim_config.REFUSED, its
+    message names what and why) prints `[side ]refused: <why>` and gives
+    "refused"; anything else prints `[side ]FAILED: <type>: <msg>` with its
+    traceback and gives "failed". The one rule every CLI reports cases by."""
+    who = f"{side} " if side else ""
+    if isinstance(e, SC.REFUSED):
+        print(f"\n=== {header} ===\n  {who}refused: {e}")
+        return "refused"
+    print(f"\n=== {header} ===\n  {who}FAILED: {type(e).__name__}: {e}")
+    traceback.print_exception(e)
+    return "failed"
+
+
 def run_each(names, side, run_one):
     """run_one(name) for every case name, in order. A documented refusal
-    (sim_config.REFUSED) prints `refused: <why>`, any other error `FAILED`
-    with its traceback; either way the run goes on. Prints the summary line
+    or any other error is reported by not_run; either way the run goes on. Prints the summary line
     `<n>/<total> ran[, refused: ...][, FAILED: ...]` and returns the exit
     code."""
     if not names:
@@ -51,13 +65,9 @@ def run_each(names, side, run_one):
     for name in names:
         try:
             run_one(name)
-        except SC.REFUSED as e:
-            print(f"\n=== {name}  {side} ===\n  refused: {e}")
-            refused.append(name)
-        except Exception as e:
-            print(f"\n=== {name}  {side} ===\n  FAILED: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            failed.append(name)
+        except (Exception, SystemExit) as e:
+            kind = not_run(f"{name}  {side}", e)
+            (refused if kind == "refused" else failed).append(name)
     ran = len(names) - len(refused) - len(failed)
     print(f"\n{ran}/{len(names)} ran"
           + (f", refused: {', '.join(refused)}" if refused else "")

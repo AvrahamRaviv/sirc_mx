@@ -32,7 +32,6 @@ differences.
 import argparse
 import os
 import sys
-import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -170,18 +169,6 @@ def report_warp(case, alg, hw, cfg):
         print(f"  {line}")
 
 
-def _not_run(key, side, e):
-    """A side that raised on a case: a documented refusal (SC.REFUSED, its
-    message names what and why) -> "refused"; anything else -> "failed",
-    with its traceback. Printed either way; the run goes on."""
-    if isinstance(e, SC.REFUSED):
-        print(f"\n=== {key} ===\n  {side} refused: {e}")
-        return "refused"
-    print(f"\n=== {key} ===\n  {side} FAILED: {type(e).__name__}: {e}")
-    traceback.print_exception(e)
-    return "failed"
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
@@ -209,7 +196,7 @@ def main():
             try:
                 alg = ALG.run(case, cfg)
             except (Exception, SystemExit) as e:
-                results[key] = _not_run(key, "ALG", e)
+                results[key] = CLI.not_run(key, e, "ALG")
                 continue
             try:
                 hw = HW.run(case, cfg)
@@ -219,7 +206,7 @@ def main():
                 results[key] = None
                 continue
             except (Exception, SystemExit) as e:
-                results[key] = _not_run(key, "HW", e)
+                results[key] = CLI.not_run(key, e, "HW")
                 continue
             results[key] = report(key, compare(alg, hw), alg, hw)
             if case["op"] == "warp":

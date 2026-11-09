@@ -360,12 +360,10 @@ def convt(case, cfg, taps):
 
 
 # Warp. Their reference lane: uint8 codes with zero exponents, no scale
-# (pack_warp_reference's default type). The sim runs one forward of a fresh
-# module on each side, so both use the config's call site 0.
+# (pack_warp_reference's default type). Call site: SC.WARP_CALL_SITE.
 WARP_REF_MX_TYPE = "mx-e4bm8"
 WARP_REF_RANGE = (0, 255)       # pack_warp_reference clamps to this, silently
 WARP_GRID_WORD_BITS = 16        # trc casts the grid word to int16
-WARP_CALL_SITE = 0
 # frx + fry above this overflows their 16-bit weight lane: their trc_warp and
 # build_warp_c_struct_arr raise, the path that runs (trc) does not check (HW Q4)
 WARP_FRAC_SUM_LIMIT = 14
@@ -378,8 +376,8 @@ def warp_spec(cfg):
     Refused when their lanes can't hold what the config describes."""
     name = SC.entry_name(cfg, "warp")
     e = cfg["entries"][name]
-    ref = SC.site_fxp(e, e["inputs"][0]["fxp"], WARP_CALL_SITE, f"{name} input 0")
-    grid = SC.site_fxp(e, e["inputs"][1]["fxp"], WARP_CALL_SITE, f"{name} input 1")
+    ref = SC.site_fxp(e, e["inputs"][0]["fxp"], SC.WARP_CALL_SITE, f"{name} input 0")
+    grid = SC.site_fxp(e, e["inputs"][1]["fxp"], SC.WARP_CALL_SITE, f"{name} input 1")
     if int(ref["total_bits"]) != 8:
         raise NotImplementedError(
             f"HW warp: {name} ref is {ref['total_bits']}-bit; their reference "
@@ -392,7 +390,7 @@ def warp_spec(cfg):
         raise SystemExit(f"{os.path.basename(cfg['file'])}: {name} grid has no "
                          f"frac_bits; the sim reads the grid format from the config")
     f = int(grid["frac_bits"])
-    return {"call_sites": SC.entry_call_sites(e, name), "call_site": WARP_CALL_SITE,
+    return {"call_sites": SC.entry_call_sites(e, name), "call_site": SC.WARP_CALL_SITE,
             "grid_bits": int(grid["total_bits"]), "frac_cfg": (f, f)}
 
 

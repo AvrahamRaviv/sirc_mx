@@ -49,7 +49,6 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
 from mx_quantizer import MXQuantizer
 from mx_layers_blocked import MXConv2dHW
 from fixed_point.fxp_quant import fxp_step, normalize_out_quant
-from fixed_point.fxp_sites import entry_call_sites, expand_sites
 
 import cases as C
 import sim_cli as CLI
@@ -60,7 +59,7 @@ from taps import tap, show
 # =============================================================================
 
 from sim_config import DEFAULT_CONFIG, load_config, hw_grid   # noqa: E402  (re-exported)
-from sim_config import entry_name                             # noqa: E402
+from sim_config import entry_name, site_fxp, sites_fxp, WARP_CALL_SITE   # noqa: E402
 
 
 def _entry(cfg, op, as_name="op"):
@@ -363,17 +362,20 @@ def convt(case, cfg, taps):
 
 def _fix_scale(entry, operand, scale, where):
     """The case's static scale in place of the file's (calibrate or a
-    frozen scale), at every call site. Per-site fxp lists are read by the
-    lib's rule (fxp_sites.expand_sites), so a list and a single spec are
-    accepted and refused exactly as the lib does."""
-    sites = expand_sites(operand["fxp"], entry_call_sites(entry, where), where)
-    operand["fxp"] = [dict(d, scale=scale, calibrate=False) for d in sites]
+    frozen scale), at every call site the lib quantizes. Per-site fxp lists
+    are read by the lib's rule (sim_config.sites_fxp), so a list and a
+    single spec are accepted and refused exactly as the lib does; a site the
+    lib reads as off (normalize_out_quant) stays off, and `true` is the
+    lib's defaults."""
+    sites = sites_fxp(entry, operand["fxp"], where)
+    operand["fxp"] = [dict({} if d is True else d, scale=scale, calibrate=False)
+                      if normalize_out_quant(d)["enabled"] else d for d in sites]
 
 
 def warp_out_note(cfg):
     """None when the config's warp entry rounds the output to an fxp word at
-    call site 0 (the one ALG runs), else the line saying what the lib does
-    instead: with no `output` entry, or an output fxp the lib reads as off
+    the call site ALG runs (sim_config.WARP_CALL_SITE), else the line saying
+    what the lib does instead: with no `output` entry, or an output fxp the lib reads as off
     (false, null, {"enabled": false}: normalize_out_quant), it leaves the
     warp result unrounded (MXActQuant.quant_output passes it through); with a
     non-fxp `output` it holds no fixed-point word either. No format is
@@ -386,9 +388,8 @@ def warp_out_note(cfg):
     if "fxp" not in out:
         return (f"ALG out: warp entry {e['name']!r} output is not fxp; the lib "
                 f"gives no fixed-point output word, so there is no out_code")
-    fxp = out["fxp"]
-    site0 = fxp[0] if isinstance(fxp, (list, tuple)) and fxp else fxp
-    if not normalize_out_quant(site0)["enabled"]:
+    site = site_fxp(e, out["fxp"], WARP_CALL_SITE, f"{e['name']} output")
+    if not normalize_out_quant(site)["enabled"]:
         return (f"ALG out: warp entry {e['name']!r} output fxp is off; the lib "
                 f"leaves the warp output unrounded (float), so there is no out_code")
     return None
@@ -400,7 +401,8 @@ def warp(case, cfg, taps):
 
     ref: int8, static scale.  grid: Q8.8 (int16, step 1/256 px).
     out: int8, static scale.  All round half away from zero and saturate.
-    One real forward of a fresh module: call site 0 of a per-site config.
+    One real forward of a fresh module: call site WARP_CALL_SITE (0) of a
+    per-site config.
     `_tap` makes it keep its quantized inputs, the raw bilinear result and
     the quantized output. An entry with no output fxp: out as the lib gives
     it and no out_code (warp_out_note says why).

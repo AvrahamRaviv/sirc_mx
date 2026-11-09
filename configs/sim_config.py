@@ -86,11 +86,25 @@ def entry_name(cfg, op):
     return name
 
 
+# The sim runs one forward of a fresh module on each side, so both read the
+# config's call site 0 of a per-site (call_sites) entry.
+WARP_CALL_SITE = 0
+
+
+def sites_fxp(entry, fxp, where):
+    """One operand's fxp spec per call site of `entry`, by the lib's rule: a
+    per-site list must hold one spec per call site (ValueError otherwise), a
+    single spec is shared by every site, and so is a bare null / true /
+    false (the lib reads them as off / defaults / off)."""
+    n = entry_call_sites(entry, where)
+    if fxp is None or isinstance(fxp, bool):
+        return [fxp] * n
+    return expand_sites(fxp, n, where)
+
+
 def site_fxp(entry, fxp, site, where):
-    """One operand's fxp spec at call site `site` of `entry`, by the lib's
-    rule: a per-site list must hold one spec per call site (ValueError
-    otherwise), a single spec is shared by every site."""
-    return expand_sites(fxp, entry_call_sites(entry, where), where)[site]
+    """One operand's fxp spec at call site `site` of `entry` (sites_fxp)."""
+    return sites_fxp(entry, fxp, where)[site]
 
 
 def grid_key(cfg, case):

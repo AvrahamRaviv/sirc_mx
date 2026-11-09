@@ -70,8 +70,9 @@ pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
 
 Over many cases (`-m all`, an op), `main.py`, `main_HW.py` and `main_ALG.py`
-run every case (one loop, `sim_cli.run_each`; `main.py` runs both sides). A
-case a side refuses (`sim_config.REFUSED`: their code cannot run it, or the
+run every case (`main_HW` and `main_ALG` through one loop, `sim_cli.run_each`;
+`main.py` loops over both sides itself and reports each case by the same
+`sim_cli` rule, `not_run`). A case a side refuses (`sim_config.REFUSED`: their code cannot run it, or the
 config lacks what the sim reads, such as static grids) prints `refused: <why>`
 and the run goes on; any other error prints `FAILED` with its traceback and
 the run goes on. The last line names the refused and failed cases. A config
@@ -84,7 +85,7 @@ Exit codes, one meaning in `main.py`, `main_HW.py`, `main_ALG.py` and
 |---|---|
 | 0 | every case (section) ran clean |
 | 1 | a failure (an error that is not a refusal) or a mismatch |
-| 2 | something was refused or skipped (a case, a section, the config), nothing failed |
+| 2 | something was refused or skipped (a case, a section, the config), nothing failed (an argparse usage error also exits 2) |
 | 3 | `main.py` only: everything ran, only float taps differ |
 
 A refusal is never a pass: it never exits 0.
