@@ -60,7 +60,6 @@ scales that differ per level.
 `fixed_point/mx_fixed_point_hw.py`) has run; quantizing before that raises.
 """
 
-import copy
 import math
 
 import torch
@@ -76,6 +75,7 @@ from fixed_point.fxp_quant import (  # STE-wrapped fake_quant_fxp
     fxp_scale_for_max_abs,
     fxp_stats_value,
 )
+from fixed_point.fxp_sites import expand_sites
 
 class MXActQuant(nn.Module):
     """MX-quantize the tensor inputs of a parameter-free module.
@@ -116,13 +116,13 @@ class MXActQuant(nn.Module):
         assert len(fxp_per_input) == len(self.specs_per_input), \
             "fxp_per_input and specs_per_input must have the same length"
         self.fxp_per_input = [
-            self._expand_sites(f, f"input {i}")
+            expand_sites(f, self.call_sites, f"input {i}")
             for i, f in enumerate(fxp_per_input)
         ]
 
         self.out_spec = out_spec
         self.out_axes = list(out_axes) if out_axes is not None else [1]
-        self.out_fxp = self._expand_sites(out_fxp, "output")
+        self.out_fxp = expand_sites(out_fxp, self.call_sites, "output")
         self.n_calls = 0
         self.calibrating = False
         self._obs = {}
@@ -140,26 +140,6 @@ class MXActQuant(nn.Module):
         self._call_sites_warned = False
 
     # -- construction ------------------------------------------------------
-
-    def _expand_sites(self, fxp, where):
-        """Normalize one operand's fxp config into a per-call-site list.
-
-        A list is taken as given. A single config is shared across call sites
-        when its scale is already known, and deep-copied per site when the
-        scale is to be calibrated - a learned scale is a property of the tensor
-        a given call sees, not of the module.
-        """
-        if fxp is None:
-            return None
-        if isinstance(fxp, (list, tuple)):
-            if len(fxp) != self.call_sites:
-                raise ValueError(
-                    f"{where}: {len(fxp)} per-call-site fxp configs for "
-                    f"call_sites={self.call_sites}")
-            return [copy.deepcopy(c) for c in fxp]
-        if fxp.get("calibrate") and self.call_sites > 1:
-            return [copy.deepcopy(fxp) for _ in range(self.call_sites)]
-        return [fxp] * self.call_sites
 
     @property
     def mx_specs(self):

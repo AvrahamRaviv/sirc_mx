@@ -375,8 +375,8 @@ def warp_spec(cfg):
     Refused when their lanes can't hold what the config describes."""
     name = SC.entry_name(cfg, "warp")
     e = cfg["entries"][name]
-    ref = SC.site_fxp(e["inputs"][0]["fxp"], WARP_CALL_SITE)
-    grid = SC.site_fxp(e["inputs"][1]["fxp"], WARP_CALL_SITE)
+    ref = SC.site_fxp(e, e["inputs"][0]["fxp"], WARP_CALL_SITE, f"{name} input 0")
+    grid = SC.site_fxp(e, e["inputs"][1]["fxp"], WARP_CALL_SITE, f"{name} input 1")
     if int(ref["total_bits"]) != 8:
         raise NotImplementedError(
             f"HW warp: {name} ref is {ref['total_bits']}-bit; their reference "
@@ -389,7 +389,7 @@ def warp_spec(cfg):
         raise SystemExit(f"{os.path.basename(cfg['file'])}: {name} grid has no "
                          f"frac_bits; the sim reads the grid format from the config")
     f = int(grid["frac_bits"])
-    return {"call_sites": int(e.get("call_sites", 1)), "call_site": WARP_CALL_SITE,
+    return {"call_sites": SC.entry_call_sites(e, name), "call_site": WARP_CALL_SITE,
             "grid_bits": int(grid["total_bits"]), "frac_cfg": (f, f)}
 
 

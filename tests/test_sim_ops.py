@@ -487,15 +487,155 @@ def test_hw_warp_setup_c_struct_is_not_read():
     assert torch.equal(outs[0], HW.run(case, E4)["out_raw"])
 
 
-def test_hw_vs_alg_check_warp_vectors():
-    """T12 prints one labelled vector per difference, covering HW questions
-    Q1-Q10 of the list sent to the HW team."""
-    import re
+from mx_layers_act import MXActQuant   # noqa: E402
+
+
+def test_hw_warp_per_site_list_of_wrong_length_refused():
+    """A per-site fxp list must hold one spec per call site: the HW side
+    refuses a short one, as the lib does, instead of indexing it."""
+    cfg = copy.deepcopy(E4)
+    e = cfg["entries"]["model.warp"]
+    g = e["inputs"][1]["fxp"]
+    e["inputs"][1]["fxp"] = [dict(g, frac_bits=f) for f in (6, 7)]   # call_sites 3
+    with pytest.raises(ValueError, match="2 per-call-site fxp configs for call_sites=3"):
+        HW.warp_spec(cfg)
+    with pytest.raises(ValueError, match="2 per-call-site fxp configs for call_sites=3"):
+        MXActQuant(torch.nn.Identity(), [None, None],
+                       fxp_per_input=[None, e["inputs"][1]["fxp"]], call_sites=3)
+    e["call_sites"] = 0
+    with pytest.raises(ValueError, match="call_sites must be an int >= 1"):
+        HW.warp_spec(cfg)
+
+
+# --- hw_vs_alg_check T12: the warp vectors sent with the HW questions --------
+
+import warp_vectors as WV             # noqa: E402
+
+T12 = WV.vectors(E4)
+
+
+def _t12(label):
+    v = [x for x in T12 if x["label"] == label]
+    assert v, f"no T12 vector {label}"
+    return v
+
+
+def test_t12_covers_every_hw_question():
+    labels = [v["label"].split(" | ") for v in T12]
+    assert labels
+    assert {q for _, q in labels} == {f"HW Q{i}" for i in range(1, 11)}
+    assert {d for d, _ in labels} == {f"D{i}" for i in range(1, 10)}
+
+
+def test_t12_border_q1():
+    """ALG reads zero outside the frame; HW reads a frame pixel there."""
+    left, bottom = _t12("D1 | HW Q1")
+    ref = left["ref"][0, 0].double()
+    # x = -0.25 at (y 1, x 0): ALG 0.25 * 0 + 0.75 * ref[1, 0]
+    assert left["alg"] == pytest.approx(0.75 * float(ref[1, 0])) == pytest.approx(8.25)
+    # their integer part truncates toward zero and keeps the low bits as the
+    # fraction: x0 = 0, fraction 0.75 -> 0.25 * ref[1, 0] + 0.75 * ref[1, 1]
+    assert left["hw"] == pytest.approx(0.25 * float(ref[1, 0]) + 0.75 * float(ref[1, 1]))
+    assert left["hw"] == pytest.approx(18.5)
+    # y = H-1+0.25 at (y 3, x 2): ALG 0.75 * ref[3, 2], HW reads a nonzero row there
+    assert bottom["alg"] == pytest.approx(0.75 * float(ref[3, 2]))
+    assert bottom["hw"] > bottom["alg"]
+
+
+def test_t12_identity_q2():
+    """Zero flow: ALG returns the frame; HW the last row (column) from the
+    row (column) before it."""
+    row, col = _t12("D1 | HW Q2")
+    ref = row["ref"][0, 0].double()
+    assert row["alg"] == ref[-1].tolist()
+    assert row["hw"] == ref[-2].tolist()
+    ref = col["ref"][0, 0].double()
+    assert col["alg"] == float(ref[0, -1]) and col["hw"] == float(ref[0, -2])
+
+
+def test_t12_fraction_bits_q3_q4():
+    """Their fraction bits come from the frame: 15 minus the bits of the
+    largest position on that axis (16-bit signed word); the config's are
+    fixed. Equal only where the frame gives the config's format (65x65)."""
+    q3, moved = _t12("D2 | HW Q3")
+    (q4,) = _t12("D3 | HW Q4")
+    fcfg = list(HW.warp_spec(E4)["frac_cfg"])
+    assert set(q3["hw"]) == set(WV.FRAC_SIZES)
+    for (Hh, Ww), fh in q3["hw"].items():
+        assert q3["alg"][(Hh, Ww)] == fcfg
+        assert fh == [15 - (Ww - 1).bit_length(), 15 - (Hh - 1).bit_length()]
+        assert (fh == fcfg) == ((Hh, Ww) == (65, 65))
+        assert q4["hw"][(Hh, Ww)] == sum(fh) > HW.WARP_FRAC_SUM_LIMIT
+    assert moved["grid"]["n_diff"] > 0 and moved["acc"]["n_diff"] > 0
+
+
+def test_t12_ties_q5():
+    """Grid ties: ALG rounds half away from zero, HW the tie to 0 px; the
+    reference: ALG half up, HW half to even."""
+    g_pos, g_neg, ref = _t12("D4 | HW Q5") + _t12("D6 | HW Q5")
+    assert (g_pos["tie"], g_pos["alg"], g_pos["hw"]) == (0.5, 1, 0)
+    assert (g_neg["tie"], g_neg["alg"], g_neg["hw"]) == (-0.5, -1, 0)
+    r = ref["ref"].double()
+    assert ref["alg"] == torch.floor(r + 0.5).tolist() == [3, 4, 4]
+    assert ref["hw"] == torch.round(r).tolist() == [2, 4, 4]
+
+
+def test_t12_reference_format_q6():
+    """ALG saturates to int8, their packer clamps to uint8; main_HW refuses."""
+    (v,) = _t12("D5 | HW Q6")
+    r = v["ref"].double()
+    assert v["alg"] == r.clamp(-128, 127).tolist()
+    assert v["hw"] == r.clamp(0, 255).tolist()
+    assert v["refusal"].startswith("refused")
+
+
+def test_t12_output_requant_q7():
+    """acc 37.5: ALG requantizes (half away -> 38), HW stores the acc as is."""
+    (v,) = _t12("D7 | HW Q7")
+    assert (v["acc"], v["alg"], v["hw"], v["pcu"]) == (37.5, 38, 37.5, 38)
+
+
+def test_t12_batch_q8():
+    """Batch 1 moved +1 px: ALG moves it, their code samples batch 1 on
+    batch 0's (zero) grid; main_HW refuses."""
+    (v,) = _t12("D8 | HW Q8")
+    ref1 = v["ref"][1, 0, 0].double()
+    assert v["alg"] == ref1[1:5].tolist()
+    assert v["hw"] == ref1[:4].tolist()
+    assert v["refusal"].startswith("refused")
+
+
+def test_t12_float32_store_q9():
+    (v,) = _t12("D9 | HW Q9")
+    assert 0 < v["rounded"] <= v["big"] <= v["n"] and v["lsb"] > 0
+
+
+def test_t12_padding_q10():
+    """x = W-1+0.5 on 100: ALG 0.5 * 100 at both widths; HW reads its zero
+    padding at W = 40 (padded to 64), the frame's own pixel at W = 32."""
+    w40, w32 = _t12("D1 | HW Q10")
+    assert (w40["W"], w40["alg"], w40["hw"]) == (40, 50, 50)
+    assert (w32["W"], w32["alg"], w32["hw"]) == (32, 50, 100)
+
+
+def test_hw_vs_alg_check_prints_the_t12_vectors():
+    """--only warp prints every vector's own text (built from its values)."""
     p = subprocess.run([sys.executable, "hw_vs_alg_check.py", "--only", "warp"],
                        cwd=os.path.join(_ROOT, "configs"), capture_output=True,
                        text=True, timeout=300)
     assert p.returncode == 0, p.stderr[-2000:]
-    labels = re.findall(r"^\s+\[(D\d+) \| HW (Q\d+)\]", p.stdout, re.M)
-    assert labels, p.stdout[-2000:]
-    assert {q for _, q in labels} == {f"Q{i}" for i in range(1, 11)}
-    assert {d for d, _ in labels} == {f"D{i}" for i in range(1, 10)}
+    lines = [f"  [{v['label']}] {v['text']}" for v in T12]
+    assert lines and all(ln in p.stdout.splitlines() for ln in lines), p.stdout[-2000:]
+
+
+def test_hw_vs_alg_check_runs_on_hw_exact():
+    """The script's HW-exact mode runs T1-T11 to the end and says why T12
+    is skipped (main_ALG.warp has no output fxp in that config)."""
+    p = subprocess.run([sys.executable, "hw_vs_alg_check.py", "--config",
+                        "mx_config_npe_hw_exact.json"],
+                       cwd=os.path.join(_ROOT, "configs"), capture_output=True,
+                       text=True, timeout=600)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "### T11" in p.stdout
+    assert ("T12 skipped on mx_config_npe_hw_exact.json: main_ALG KeyError: 'output'"
+            in p.stdout), p.stdout[-2000:]

@@ -25,6 +25,7 @@ from fixed_point.mx_fixed_point_hw import (calibrate_act_scales,
                                            export_hw_grids, resolve_out_window_bits,
                                            static_shift_of)
 from fixed_point.hw_grids import check_hw_grid, load_hw_grids
+from fixed_point.fxp_sites import check_site_list, entry_call_sites
 from fixed_point.fxp_quant import (
     fake_quant_fxp, fxp_clip_stats, fxp_format_str, fxp_stats_value,
     normalize_out_quant,
@@ -1915,12 +1916,7 @@ class MXQuantizer:
                 raise ValueError(
                     f"act_quant layer '{name}' must define a non-empty 'inputs' list")
 
-            call_sites = layer.get("call_sites", 1)
-            if not isinstance(call_sites, int) or isinstance(call_sites, bool) \
-                    or call_sites < 1:
-                raise ValueError(
-                    f"act_quant layer '{name}': call_sites must be an int >= 1, "
-                    f"got {call_sites!r}")
+            call_sites = entry_call_sites(layer, f"act_quant layer '{name}'")
 
             specs_per_input, axes_per_input, fxp_per_input = [], [], []
             for i, ent in enumerate(inputs):
@@ -1973,11 +1969,8 @@ class MXQuantizer:
                         f"{where}: 'fxp' and '{k}' are alternative quantizers; "
                         f"set only one")
             fxp = ent["fxp"]
+            check_site_list(fxp, call_sites, where)
             if isinstance(fxp, (list, tuple)):
-                if len(fxp) != call_sites:
-                    raise ValueError(
-                        f"{where}: {len(fxp)} per-call-site fxp configs but "
-                        f"call_sites={call_sites}")
                 return None, axes, [normalize_out_quant(c) for c in fxp]
             return None, axes, normalize_out_quant(fxp)
 

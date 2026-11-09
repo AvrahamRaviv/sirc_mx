@@ -21,6 +21,7 @@ difference moved. Sections:
   T12 warp (main_ALG.warp vs main_HW.warp on their CalibratedMXWarp): one
       vector per ALG-vs-HW difference of the warp deep run, each labelled
       [D<n> | HW Q<m>] with its question in the list sent to the HW team
+      (warp_vectors.py); skipped, with why, on a config the warp cannot run on
 --config: default mx_config_npe_e4.json; mx_config_npe_hw_exact.json = lib HW-exact switches.
 --only warp: T12 alone.
 """
@@ -49,153 +50,32 @@ class H:
     run = staticmethod(lambda case: _H.run(case, CFG))
 
 from npe_mx_emu import base_mx_quantizer, mx_dequantizer, MXObserver, bcu, pcu_div
-from npe_mx_emu import pack_warp_reference
 torch.set_printoptions(precision=6)
 
 def hdr(s): print(f"\n### {s}")
 
 
 # ---------------------------------------------------------------- T12 warp
-# One vector per difference D1-D10 of the warp deep run, labelled with the
-# number of its question in the list sent to the HW team. Both sides through
-# the sim (main_ALG.warp, main_HW.warp); where main_HW refuses (batch, signed
-# reference), the refusal is shown and their code is called directly.
-# Reference values are codes; acc = the bilinear sum in code units.
-import main as _M
-
-
-def _ramp(H, W, f):
-    yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
-    return f(xx, yy).view(1, 1, H, W)
-
-
-def _const_flow(B, H, W, fx, fy):
-    return C._flow((B, 2, H, W), ("const", fx, fy), None)
-
-
-def _warp(codes, flow, rs=C.P2, os_=C.P2):
-    case = C.warp_case("t12", codes, flow, rs, os_)
-    a, h = A.run(case), H.run(case)
-    acc_a = a["out_pre"].double() / rs
-    acc_h = h["hw_acc"].double() / 2.0 ** int(h["frac_sum"])
-    return case, a, h, acc_a, acc_h
-
-
-def _v(label, text):
-    print(f"  [{label}] {text}")
+# The vectors live in warp_vectors.py (one per difference D1-D10, labelled
+# with its HW question), so tests read the same values this prints.
+import warp_vectors as _WV
 
 
 def warp_section():
+    """T12; on a config the warp cannot run on, says so and why, and the
+    run goes on (T1-T11 do not depend on the warp)."""
     hdr("T12 warp: ALG (main_ALG) vs HW (their CalibratedMXWarp via main_HW)")
+    why = _WV.probe(CFG)
+    if why is not None:
+        print(f"  T12 skipped on {os.path.basename(CFG['file'])}: {why}")
+        return
     sp = _H.warp_spec(CFG)
     print(f"  config grid: int{sp['grid_bits']}, frac {sp['frac_cfg']}, relative flow "
           f"(call site {sp['call_site']}); theirs: absolute position, frac from the "
           f"data. acc in reference code units.")
-    # D1 border, Q1: ref[y,x] = 10(x+1)+y on 4x6, sample just outside the frame
-    ref = _ramp(4, 6, lambda x, y: 10 * (x + 1) + y)
-    for (fx, fy), (yy, xx), where in (((-0.25, 0.0), (1, 0), "x = -0.25, y = 1"),
-                                      ((0.0, 0.25), (3, 2), "x = 2, y = H-1+0.25")):
-        _, a, h, acc_a, acc_h = _warp(ref, _const_flow(1, 4, 6, fx, fy))
-        _v("D1 | HW Q1", f"border, sample at {where}: ALG (zero outside) "
-           f"{float(acc_a[0, 0, yy, xx]):.2f}, HW {float(acc_h[0, 0, yy, xx]):.2f}")
-    # D1 identity, Q2: zero flow, last row (3x4) and last column (W = 32)
-    ref = _ramp(3, 4, lambda x, y: 12 * y + 3 * x)
-    _, a, h, acc_a, acc_h = _warp(ref, _const_flow(1, 3, 4, 0.0, 0.0))
-    _v("D1 | HW Q2", f"zero flow, 3x4, last row: ref {ref[0, 0, -1].tolist()}, "
-       f"ALG {acc_a[0, 0, -1].tolist()}, HW {acc_h[0, 0, -1].tolist()}")
-    ref = _ramp(2, 32, lambda x, y: 3 * x)
-    _, a, h, acc_a, acc_h = _warp(ref, _const_flow(1, 2, 32, 0.0, 0.0))
-    _v("D1 | HW Q2", f"zero flow, 2x32, last column: ref {int(ref[0, 0, 0, -1])}, "
-       f"ALG {float(acc_a[0, 0, 0, -1]):g}, HW {float(acc_h[0, 0, 0, -1]):g}")
-    # D2 fraction bits, Q3; D3 their sum, Q4: zero flow per frame size
-    sums = []
-    for Hh, Ww in ((4, 6), (8, 8), (6, 40), (6, 56), (6, 64), (2, 160), (65, 65)):
-        h = H.run(C.warp_case("t12", torch.zeros(1, 1, Hh, Ww),
-                              _const_flow(1, Hh, Ww, 0.0, 0.0), C.P2, C.P2))
-        sums.append((Hh, Ww, h["frac_cfg"].tolist(), h["hw_frac_bits"].tolist(),
-                     int(h["frac_sum"])))
-    _v("D2 | HW Q3", "fraction bits (x, y), config vs theirs: " + ", ".join(
-        f"{Hh}x{Ww} {fc} vs {fh}" for Hh, Ww, fc, fh, _ in sums))
-    g = torch.Generator().manual_seed(12)
-    ref = torch.randint(0, 128, (1, 1, 2, 160), generator=g)
-    flow = torch.round((torch.rand(1, 2, 2, 160, generator=g) * 2 - 1) * 3 * 256) / 256
-    case, a, h, acc_a, acc_h = _warp(ref, flow)
-    st = {r["stage"]: r for r in _M.warp_stages(case, a, h)}
-    _v("D2 | HW Q3", f"2x160, flow on 1/256: their frac {h['hw_frac_bits'].tolist()}, "
-       f"grid position differs on {st['grid px']['n_diff']}/{st['grid px']['n']} "
-       f"(max {st['grid px']['max_d'] * 256:g}/256 px), interior acc on "
-       f"{st['acc interior']['n_diff']}/{st['acc interior']['n']} "
-       f"(max {st['acc interior']['max_d']:.3f})")
-    _v("D3 | HW Q4", f"frx + fry (limit {_H.WARP_FRAC_SUM_LIMIT}): " + ", ".join(
-        f"{Hh}x{Ww} {k}{' OVER' if k > _H.WARP_FRAC_SUM_LIMIT else ''}"
-        for Hh, Ww, _, _, k in sums))
-    # D4 grid ties, D6 reference ties, Q5
-    ref = torch.full((1, 1, 2, 100), 50)
-    for t in (0.5, -0.5):
-        case, a, h, _, _ = _warp(ref, _const_flow(1, 2, 100, t / 256, 0.0))
-        fr = int(h["hw_frac_bits"][0])
-        dx_a = int(a["grid_code"][0, 0, 0, 10])
-        dx_h = float(h["hw_grid_code"][0, 0, 0, 10]) / 2 ** fr - 10
-        _v("D4 | HW Q5", f"grid tie, flow x {t:+}/256 (their frac x {fr}): ALG "
-           f"{dx_a:+d}/256 px, HW {dx_h * 256:+g}/256 px")
-    ref = torch.tensor([[[[2.5, 3.5, 4.0]] * 2]])
-    _, a, h, _, _ = _warp(ref, _const_flow(1, 2, 3, 0.0, 0.0))
-    _v("D6 | HW Q5", f"reference ties {ref[0, 0, 0].tolist()}: ALG codes "
-       f"{a['ref_code'][0, 0, 0].tolist()}, HW {h['hw_ref_code'][0, 0, 0, :3].tolist()}")
-    # D5 reference format, Q6
-    ref = torch.tensor([[[[-50, 0, 127, 200]] * 2]])
-    try:
-        H.run(C.warp_case("t12", ref, _const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2))
-        refusal = "ran"
-    except NotImplementedError as e:
-        refusal = f"refused ({str(e)[:60]}...)"
-    case = C.warp_case("t12", ref, _const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2)
-    their = pack_warp_reference(ref.double())
-    _v("D5 | HW Q6", f"codes {ref[0, 0, 0].tolist()}: ALG int8 "
-       f"{A.run(case)['ref_code'][0, 0, 0].tolist()}, their packer "
-       f"{their.data[0, 0, 0, :4].tolist()}; main_HW {refusal}")
-    # D7 output requant, Q7: acc 37.5, out step = ref step
-    ref = _ramp(2, 40, lambda x, y: 37 + x % 2)
-    _, a, h, acc_a, acc_h = _warp(ref, _const_flow(1, 2, 40, 0.5, 0.0))
-    k = int(h["frac_sum"])
-    pcu = pcu_div(h["hw_acc"][0, 0, 0, :1], -k, "round")
-    _v("D7 | HW Q7", f"acc {float(acc_h[0, 0, 0, 0]):g}: ALG int8 code "
-       f"{int(a['out_code'][0, 0, 0, 0])}, HW out {float(h['out_raw'][0, 0, 0, 0]):g} "
-       f"(no PCU), their pcu_div half up {int(pcu)}; negative ties need a signed ref")
-    # D8 batch, Q8: batch 1 moved +1 px
-    ref = _ramp(2, 8, lambda x, y: 10 * (x + 1)).expand(2, 1, 2, 8).clone()
-    flow = torch.zeros(2, 2, 2, 8)
-    flow[1, 0] = 1.0
-    try:
-        H.run(C.warp_case("t12", ref, flow, C.P2, C.P2))
-        refusal = "ran"
-    except NotImplementedError as e:
-        refusal = f"refused ({str(e)[:50]}...)"
-    a = A.run(C.warp_case("t12", ref, flow, C.P2, C.P2))
-    r = _H.run_their_warp(ref.double(), _H.abs_coords(flow), sp["grid_bits"],
-                          _H.hw_acc_bits(CFG))
-    _v("D8 | HW Q8", f"batch 1 moved +1 px, row 0 x 0..3: ALG "
-       f"{(a['out_pre'][1, 0, 0, :4] / C.P2).tolist()}, their code "
-       f"{r['out'][1, 0, 0, :4].tolist()}; main_HW {refusal}")
-    # D9 float32 store of the acc, Q9: continuous flow, small frame
-    g = torch.Generator().manual_seed(9)
-    ref = torch.randint(0, 128, (1, 1, 8, 8), generator=g)
-    flow = (torch.rand(1, 2, 8, 8, generator=g) * 2 - 1) * 1.5
-    h = H.run(C.warp_case("t12", ref, flow, C.P2, C.P2))
-    n, big, rounded = _M.warp_float32_store(h)
-    back = h["out_raw"].double() * 2.0 ** int(h["frac_sum"])
-    _v("D9 | HW Q9", f"8x8 continuous flow, frx+fry {int(h['frac_sum'])}: {big}/{n} acc "
-       f"above 2^24, float32 output rounds {rounded} of them, by up to "
-       f"{int((back - h['hw_acc'].double()).abs().max())} acc LSB (hw_acc is exact)")
-    # D1 padding, Q10: x = W-1+0.5 on a constant 100, W = 40 vs 32
-    for Ww in (40, 32):
-        _, a, h, acc_a, acc_h = _warp(torch.full((1, 1, 2, Ww), 100),
-                                      _const_flow(1, 2, Ww, 0.5, 0.0))
-        _v("D1 | HW Q10", f"W {Ww} (padded to {h['hw_ref_code'].shape[-1]}), "
-           f"x = W-1+0.5 on 100: ALG {float(acc_a[0, 0, 0, -1]):g}, "
-           f"HW {float(acc_h[0, 0, 0, -1]):g}")
-    print("  (D10, their float product in bcu, does not show here: the sim feeds "
-          "float64 coordinates, as their notebooks do)")
+    for v in _WV.vectors(CFG):
+        print(f"  [{v['label']}] {v['text']}")
+    print(f"  {_WV.D10_NOTE}")
 
 
 if ARGS.only == "warp":

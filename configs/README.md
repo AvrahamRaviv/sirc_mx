@@ -16,8 +16,9 @@ conv), and **warp**.
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
 | `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv (incl. PLA via a labelled bins stand-in) and warp (`CalibratedMXWarp`) run on their code. convT is a placeholder: their emulator has no convT |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop. `--only warp`: the warp vectors (T12) alone |
+| `warp_vectors.py` | the T12 warp vectors: label, printed text, and each side's values |
 | `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
-| `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib) |
+| `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib; per-call-site fxp lists by the lib's pure rule, `fixed_point/fxp_sites.py`) |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
 | `mx_config_npe_e4_pla.json` | npe_e4 + output window + PLA in HW bin form, `hw_grids` for `conv_prelu`, `conv_relu`, `conv_prelu_negb` |
 | `mx_config_npe_hw_exact.json` (+ `_nearest`, `_in`) | the lib's HW-exact switches M1-M8 (from `mx_config_dof_run_hw_exact.json`) with `hw_grids` for the conv cases; `_nearest`: mantissa round to nearest (the truncate share); `_in`: first-layer integer input (`in_mode int`, POT scale) |
@@ -110,8 +111,10 @@ calls it; nothing of theirs is reimplemented or edited:
    `coords` = absolute positions, mesh + flow, `[B, H, W, 2]`, float64 as in
    their notebooks (their weights and bcu product take the coordinates' dtype).
 2. Config: grid word width (their `grid_bit_width`) and fraction bits from the
-   warp entry's grid fxp at call site 0 (a per-site list is indexed; the sim
-   runs one forward, so both sides use site 0; `call_sites` is tapped);
+   warp entry's grid fxp at call site 0 (a per-site list must hold one spec
+   per call site, by the lib's rule in `fixed_point/fxp_sites.py`, else
+   refused; the sim runs one forward, so both sides use site 0; `call_sites`
+   is tapped);
    accumulator width from `xblock_accum.bits` (the BCU conv uses). Refused
    unless the reference is 8-bit and the grid word at most 16 bits.
 3. Setup: `LayerMXQParams(x_cal=0, w_cal=0, out_cal=0)` (output in code
@@ -133,15 +136,20 @@ a `!!` line is printed when they differ; their code runs on its own.
 
 Refused, because their code would give wrong numbers without an error:
 batch > 1 with different flows (they read batch 0's grid), a reference their
-packer would clamp (negative or above 255, so the randn warp cases), H < 2, and an
-axis whose fraction bits come out infinite. The `warp_u8_*` cases (codes
+packer would clamp (negative or above 255, so the randn warp cases), a
+non-finite reference, H < 2, and an axis whose fraction bits come out infinite
+or negative. The `warp_u8_*` cases (codes
 0..127, the range both sides hold the same) run on both sides.
 
 main.py adds, per stage and labelled with the numbers of the questions sent
 to the HW team: ref code, grid position (px), acc inside the frame and on the
 border (code units), and their float32 output against their own int64 acc.
 The generic compare covers `out`. ALG's int8 `out_code` has no HW counterpart.
-`hw_vs_alg_check.py` T12 has one vector per difference, labelled the same way.
+`hw_vs_alg_check.py` T12 has one vector per difference, labelled the same way
+(built in `warp_vectors.py`, which keeps each vector's ALG and HW values for
+the tests). On a config the warp cannot run on (main_ALG needs the warp
+entry's `output` fxp, which the `hw_exact` configs lack) T12 prints
+`T12 skipped on <config>: <why>` and the run ends normally.
 
 ## Static grids and PLA
 

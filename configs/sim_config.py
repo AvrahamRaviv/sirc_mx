@@ -6,12 +6,21 @@ sim_config.py - the one config both sides read (pure json, no MX lib import).
 
 A framework mx_config.json, read as is. main_ALG builds its MXQuantizer
 config from it; main_HW maps the same mx_specs onto the HW emulator.
+Per-call-site fxp lists are read by the lib's one rule (fixed_point/fxp_sites,
+pure python), so both sides accept and refuse the same configs.
 """
 
 import json
 import os
+import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.append(_ROOT)
+
+from fixed_point.fxp_sites import entry_call_sites, expand_sites   # noqa: E402
+
 DEFAULT_CONFIG = os.path.join(_HERE, "mx_config_dof.json")
 
 
@@ -52,10 +61,11 @@ def entry_name(cfg, op):
     return name
 
 
-def site_fxp(fxp, site):
-    """One operand's fxp spec at call site `site`: a per-site list is indexed,
-    a single spec is shared by every site (as the lib's MXActQuant reads it)."""
-    return fxp[site] if isinstance(fxp, (list, tuple)) else fxp
+def site_fxp(entry, fxp, site, where):
+    """One operand's fxp spec at call site `site` of `entry`, by the lib's
+    rule: a per-site list must hold one spec per call site (ValueError
+    otherwise), a single spec is shared by every site."""
+    return expand_sites(fxp, entry_call_sites(entry, where), where)[site]
 
 
 def grid_key(cfg, case):
