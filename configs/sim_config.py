@@ -37,8 +37,8 @@ def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
     """Framework mx_config.json -> sim config dict.
 
     Refused (SystemExit) unless the file has global mx_specs with the
-    element formats. Returns {"file", "mx_specs", "groups", "entries", "hw_grids", "layer",
-    "backend"}. Nothing in the file is changed except what --layer / --backend
+    element formats. Returns {"file", "mx_specs", "groups", "entries",
+    "hw_grids", "layer", "backend"}. Nothing in the file is changed except what --layer / --backend
     name. hw_grids: the file's static per-layer grids (calibrated offline; the
     sim never calibrates), {} when the file has none.
     """
@@ -62,7 +62,7 @@ def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
 def _need_global_formats(raw, path):
     """The sim runs one layer on the file's global mx_specs, both sides: a
     file with none (groups only), or whose mx_specs leave the element
-    formats to a per-layer assignment (auto_mixed), is refused here."""
+    formats to a per-layer assignment (auto mixed precision), is refused."""
     sp = raw.get("mx_specs")
     if not isinstance(sp, dict):
         raise SystemExit(f"{os.path.basename(path)}: no global mx_specs (per-layer "
