@@ -408,8 +408,10 @@ def test_hw_warp_stages_name_the_border_rule():
 
 def test_hw_warp_refuses_what_their_code_would_get_wrong():
     """Batch > 1 with different flows (their batch-0 grid), a reference their
-    packer would clamp (signed, or above 255), H < 2, an axis whose fraction
-    bits come out infinite. Same flows over a batch run."""
+    packer would clamp (signed, or above 255), a non-finite reference (their
+    packer makes NaN code 0), H < 2, an axis whose fraction bits come out
+    infinite or negative (an 8-bit grid on W = 200). Same flows over a batch
+    run."""
     ok = torch.randint(0, 128, (2, 1, 3, 8), generator=torch.Generator().manual_seed(1))
     f = C.const_flow(2, 3, 8, 0.5, 0.0)
     t = HW.run(C.warp_case("b", ok, f, C.P2, C.P2), E4)
@@ -424,6 +426,15 @@ def test_hw_warp_refuses_what_their_code_would_get_wrong():
         ref[0, 0, 0, 0] = bad
         with pytest.raises(NotImplementedError, match="clamps to uint8"):
             HW.run(C.warp_case("r", ref, C.const_flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
+    ref = ok[:1].double().clone()
+    ref[0, 0, 0, 0] = float("nan")
+    with pytest.raises(NotImplementedError, match="uint8"):
+        HW.run(C.warp_case("n", ref, C.const_flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
+    g8 = copy.deepcopy(E4)
+    g8["entries"]["model.warp"]["inputs"][1]["fxp"]["total_bits"] = 8
+    with pytest.raises(NotImplementedError, match="fraction bits"):   # x frac -1
+        HW.run(C.warp_case("g8", torch.full((1, 1, 2, 200), 10),
+                           C.const_flow(1, 2, 200, 0, 0), C.P2, C.P2), g8)
     with pytest.raises(NotImplementedError, match="H = 1"):
         HW.run(C.warp_case("h", ok[:1, :, :1], C.const_flow(1, 1, 8, 0, 0), C.P2, C.P2), E4)
     fy = C.const_flow(1, 3, 8, 0.0, 0.0)
@@ -529,13 +540,15 @@ def test_t12_border_q1():
     ref = left["ref"][0, 0].double()
     # x = -0.25 at (y 1, x 0): ALG 0.25 * 0 + 0.75 * ref[1, 0]
     assert left["alg"] == pytest.approx(0.75 * float(ref[1, 0])) == pytest.approx(8.25)
-    # their integer part truncates toward zero and keeps the low bits as the
-    # fraction: x0 = 0, fraction 0.75 -> 0.25 * ref[1, 0] + 0.75 * ref[1, 1]
+    # their index is floor (q >> frac = -1), which get_ref_frame clamps to 0;
+    # the fraction is the low bits, 0.75 -> 0.25 * ref[1, 0] + 0.75 * ref[1, 1]
     assert left["hw"] == pytest.approx(0.25 * float(ref[1, 0]) + 0.75 * float(ref[1, 1]))
     assert left["hw"] == pytest.approx(18.5)
-    # y = H-1+0.25 at (y 3, x 2): ALG 0.75 * ref[3, 2], HW reads a nonzero row there
+    # y = H-1+0.25 at (y 3, x 2): ALG 0.75 * ref[3, 2]; HW (question 1): their
+    # index clamped to H-2, the raw fraction 0.25 kept
     assert bottom["alg"] == pytest.approx(0.75 * float(ref[3, 2]))
-    assert bottom["hw"] > bottom["alg"]
+    assert bottom["hw"] == pytest.approx(
+        0.75 * float(ref[2, 2]) + 0.25 * float(ref[3, 2])) == pytest.approx(32.25)
 
 
 def test_t12_identity_q2():

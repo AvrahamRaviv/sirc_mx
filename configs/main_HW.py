@@ -15,7 +15,9 @@ Same interface as main_ALG:
 Rules:
   1. No MX lib import (microxcaling / mx_quantizer / mx_layers_*). Integer ops,
      shifts and a saturating accumulator only - if both sides shared the
-     quantizer, agreeing would prove nothing.
+     quantizer, agreeing would prove nothing. Config reading is shared on
+     purpose: per-call-site fxp lists go through fixed_point/fxp_sites (pure
+     python, via sim_config), so both sides accept and refuse the same configs.
   2. Take the float inputs from the case (x, w, b, flow) and quantize them here.
   3. Log every stage with `tap`, same names as ALG. main.py compares shared
      names in order and blames the first that differs; extra HW-only taps are
