@@ -769,6 +769,9 @@ def test_main_cli_reports_each_refusal_and_goes_on():
     assert "=== warp_u8_subpix_w64 ===" in out
     refused = _refused_names(out[-1])
     assert {"conv1x1_in", "conv3x3_in", "conv_prelu"} <= set(refused)
+    p = _cli("main.py", "-m", "conv1x1_in", "--config", "mx_config_npe_e4.json")
+    assert p.returncode == 2, p.stdout[-2000:]                # refused alone: 2
+    assert p.stdout.splitlines()[-1] == "0/1 bit-exact, refused: conv1x1_in"
 
 
 def test_main_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys):
