@@ -816,3 +816,25 @@ def test_hw_vs_alg_check_exit_0_only_when_every_section_ran():
     p = _cli("hw_vs_alg_check.py", "--config", "mx_config_npe_cpu.json")
     assert p.returncode == 2
     assert p.stdout.splitlines()[-1] == "skipped on mx_config_npe_cpu.json: T12"
+
+
+# --- configs the sim does not model are refused, with why -------------------
+
+@pytest.mark.parametrize("cfg_name, why", [
+    ("mx_config_auto_mixed.json", "no global mx_specs"),
+    ("mx_config_auto_ladder.json", "mx_specs has no a_elem_format, w_elem_format"),
+])
+def test_load_config_refuses_a_file_without_global_formats(cfg_name, why):
+    with pytest.raises(SystemExit, match=f"{cfg_name}: {why}"):
+        SC.load_config(cfg_name)
+
+
+@pytest.mark.parametrize("cfg_name, layer, blk", [
+    ("mx_config_int8.json", "Conv2d", "channel / channel"),     # no xblock_accum
+    ("mx_config_int8_hw.json", "MXConv2dHW", "channel / channel"),
+])
+def test_alg_conv_refuses_what_it_cannot_decode(cfg_name, layer, blk):
+    """The conv taps decode NPE blocks of the lib's HW conv; another layer or
+    blocking is refused instead of decoded on the wrong axis."""
+    with pytest.raises(SystemExit, match=f"this config gives {layer}, blockify {blk}"):
+        ALG.run(C.build("conv1x1"), SC.load_config(cfg_name))

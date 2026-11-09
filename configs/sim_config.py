@@ -36,7 +36,8 @@ REFUSED = (NotImplementedError, SystemExit)
 def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
     """Framework mx_config.json -> sim config dict.
 
-    Returns {"file", "mx_specs", "groups", "entries", "hw_grids", "layer",
+    Refused (SystemExit) unless the file has global mx_specs with the
+    element formats. Returns {"file", "mx_specs", "groups", "entries", "hw_grids", "layer",
     "backend"}. Nothing in the file is changed except what --layer / --backend
     name. hw_grids: the file's static per-layer grids (calibrated offline; the
     sim never calibrates), {} when the file has none.
@@ -45,6 +46,7 @@ def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
         path = os.path.join(_HERE, path)
     with open(path) as f:
         raw = json.load(f)
+    _need_global_formats(raw, path)
     entries = {}
     for e in raw.get("layers", []):
         e = {"name": e} if isinstance(e, str) else e
@@ -55,6 +57,20 @@ def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
             "groups": raw.get("groups", {}), "entries": entries,
             "hw_grids": raw.get("hw_grids", {}),
             "layer": layer, "backend": backend}
+
+
+def _need_global_formats(raw, path):
+    """The sim runs one layer on the file's global mx_specs, both sides: a
+    file with none (groups only), or whose mx_specs leave the element
+    formats to a per-layer assignment (auto_mixed), is refused here."""
+    sp = raw.get("mx_specs")
+    if not isinstance(sp, dict):
+        raise SystemExit(f"{os.path.basename(path)}: no global mx_specs (per-layer "
+                         f"groups only); the sim runs one layer on the file's mx_specs")
+    miss = [k for k in ("a_elem_format", "w_elem_format") if k not in sp]
+    if miss:
+        raise SystemExit(f"{os.path.basename(path)}: mx_specs has no {', '.join(miss)} "
+                         f"(formats assigned per layer); the sim reads them from mx_specs")
 
 
 def entry_name(cfg, op):

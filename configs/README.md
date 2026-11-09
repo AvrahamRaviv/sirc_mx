@@ -229,6 +229,12 @@ unchanged; `layers` is reduced to the one layer under test:
   Defaults: conv/convT use plain global `mx_specs`; warp uses the file's first
   `act_quant` entry.
 - `--backend` overrides `xblock_accum.backend` and nothing else.
+- Refused, with the reason, instead of run on the wrong thing: a file with
+  no global `mx_specs` or no element formats in it (per-layer groups or
+  auto assignment), and, for conv (and the convT HW path), a config that
+  does not give the lib's HW conv on NPE blocks (`xblock_accum` mode
+  `hw_fixed_point`, `act_blockify: xblock`, `weight_blockify: flatten`):
+  the taps decode those blocks.
 - With no CUDA, `custom_cuda` is set to False; triton already falls back to
   python on a CPU tensor.
 - Warp: the case's static ref/out scales replace the file's `calibrate` (or

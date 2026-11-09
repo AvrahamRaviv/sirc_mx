@@ -163,6 +163,21 @@ def mx_decode(q, axis, bs=C.BS, mbits=8, scale_bits=8):
 # Ops
 # =============================================================================
 
+def _need_npe_conv(cfg, mod):
+    """The conv taps decode the lib's HW conv (MXConv2dHW) on NPE blocks
+    (activations along W, weights per flattened filter). A config that gives
+    another layer or blocking is refused, instead of decoding it wrongly."""
+    xa = cfg["mx_specs"].get("xblock_accum")
+    xa = xa if isinstance(xa, dict) else {}
+    blk = (xa.get("act_blockify", "channel"), xa.get("weight_blockify", "channel"))
+    if not isinstance(mod, MXConv2dHW) or blk != ("xblock", "flatten"):
+        raise SystemExit(
+            f"{os.path.basename(cfg['file'])}: ALG conv taps need the lib's HW conv "
+            f"on NPE blocks (xblock_accum mode hw_fixed_point, act_blockify xblock, "
+            f"weight_blockify flatten); this config gives {type(mod).__name__}, "
+            f"blockify {blk[0]} / {blk[1]}")
+
+
 def conv(case, cfg, taps):
     """MXConv2dHW, NPE. Taps: x w | a_int a_exp | w_int w_exp | acc sat | out.
 
@@ -190,6 +205,7 @@ def conv(case, cfg, taps):
         mod = seq[0]
     else:
         mod = seq = quantize(layer, cfg, _entry(cfg, "conv"), grid)
+    _need_npe_conv(cfg, mod)
     mod._tap_acc = True                 # keep qi, qw and the int64 acc word
     sp = mod.mx_specs
 
@@ -308,6 +324,7 @@ def convt(case, cfg, taps):
         # the compact input (NPE blocks along W), zero-inserts the extracted
         # operand and runs the HW conv. Taps as conv; w_int / w_exp are its
         # equivalent conv weight (transposed, flipped) [O, Cin, kH, kW].
+        _need_npe_conv(cfg, mod)
         mod._tap_acc = True
         with torch.no_grad():
             out = mod(x)
