@@ -577,4 +577,9 @@ python hw_vs_alg_check.py --only warp                    # one vector per HW que
 ## Notes
 
 - `scale_bits` is shared between weights and activations (library constraint).
+- The block shared exponent is `floor(log2(amax))` computed in float32 (microxcaling, and the HW
+  team's emulator `mx_format` the same). For a block max just below a power of two (e.g. `2^22 - 1`)
+  its float32 log2 rounds up to the integer, so the exponent comes out one too high. Measured: about 3e-7
+  of random float blocks, 9e-7 of random integer blocks. ALG and the emulator agree; the silicon
+  may differ (question sent to the HW team).
 - Spec priority (highest to lowest): per-layer `mx_specs` > group > global `mx_specs`.
