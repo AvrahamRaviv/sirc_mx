@@ -48,10 +48,11 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
 
 from mx_quantizer import MXQuantizer
 from mx_layers_blocked import MXConv2dHW
-from fixed_point.fxp_quant import fxp_step
+from fixed_point.fxp_quant import fxp_step, normalize_out_quant
 from fixed_point.fxp_sites import entry_call_sites, expand_sites
 
 import cases as C
+import sim_cli as CLI
 from taps import tap, show
 
 # =============================================================================
@@ -370,11 +371,13 @@ def _fix_scale(entry, operand, scale, where):
 
 
 def warp_out_note(cfg):
-    """None when the config's warp entry rounds the output to an fxp word,
-    else the line saying what the lib does instead: with no `output` entry it
-    leaves the warp result unrounded (MXActQuant.quant_output passes it
-    through), with a non-fxp `output` it holds no fixed-point word either. No
-    format is invented: the sim then has no out_code."""
+    """None when the config's warp entry rounds the output to an fxp word at
+    call site 0 (the one ALG runs), else the line saying what the lib does
+    instead: with no `output` entry, or an output fxp the lib reads as off
+    (false, null, {"enabled": false}: normalize_out_quant), it leaves the
+    warp result unrounded (MXActQuant.quant_output passes it through); with a
+    non-fxp `output` it holds no fixed-point word either. No format is
+    invented: the sim then has no out_code."""
     e = cfg["entries"][entry_name(cfg, "warp")]
     out = e.get("output")
     if out is None:
@@ -383,6 +386,11 @@ def warp_out_note(cfg):
     if "fxp" not in out:
         return (f"ALG out: warp entry {e['name']!r} output is not fxp; the lib "
                 f"gives no fixed-point output word, so there is no out_code")
+    fxp = out["fxp"]
+    site0 = fxp[0] if isinstance(fxp, (list, tuple)) and fxp else fxp
+    if not normalize_out_quant(site0)["enabled"]:
+        return (f"ALG out: warp entry {e['name']!r} output fxp is off; the lib "
+                f"leaves the warp output unrounded (float), so there is no out_code")
     return None
 
 
@@ -459,21 +467,25 @@ def main():
     ap.add_argument("--dump", default=None, help="save all taps to a .pt file")
     args = ap.parse_args()
 
-    cfg = load_config(args.config, args.layer, args.backend)
+    cfg = CLI.load_config(args.config, args.layer, args.backend)
     print(f"config: {cfg['file']}  layer: {args.layer or 'default'}  "
           f"backend: {args.backend or 'from file'}"
           + ("" if torch.cuda.is_available() else "  (no CUDA: custom_cuda off, python)"))
     dump = {}
-    for name in C.select(args.m):
+
+    def run_one(name):
         taps = run(C.build(name), cfg)
         show(taps, f"{name}  ALG")
         note = warp_out_note(cfg) if C.CASES[name]["op"] == "warp" else None
         if note is not None:
             print(f"  {note}")
         dump[name] = taps
+
+    code = CLI.run_each(C.select(args.m), "ALG", run_one)
     if args.dump:
         torch.save(dump, args.dump)
-        print(f"\nwrote {args.dump}")
+        print(f"\nwrote {args.dump} ({len(dump)} cases that ran)")
+    sys.exit(code)
 
 
 if __name__ == "__main__":

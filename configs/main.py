@@ -24,8 +24,9 @@ Every case is run: a side that refuses a case (sim_config.REFUSED: the HW
 code cannot run it, or the config lacks what the sim reads) or fails is
 reported and the run goes on.
 
-Exit code: 0 all bit-exact, 1 a mismatch or a failure, 2 a refusal (HW side
-not implemented, or refused), 3 only float differences.
+Exit code (sim_cli): 0 all bit-exact, 1 a mismatch or a failure, 2 a refusal
+(HW side not implemented, a case or the config refused), 3 only float
+differences.
 """
 
 import argparse
@@ -42,6 +43,7 @@ import torch
 import cases as C
 import main_ALG as ALG
 import main_HW as HW
+import sim_cli as CLI
 import sim_config as SC
 from taps import is_int
 
@@ -196,7 +198,7 @@ def main():
                     help="integer input grid: x in units of 2^-x_frac (default 4)")
     args = ap.parse_args()
 
-    cfg = SC.load_config(args.config, args.layer, args.backend)
+    cfg = CLI.load_config(args.config, args.layer, args.backend)
     modes = {"float": [None], "int": [args.x_frac],
              "both": [None, args.x_frac]}[args.input]
     results, outd = {}, {}
@@ -270,7 +272,8 @@ def main():
           + (f", HW missing: {len(skip)}" if skip else "")
           + (f", refused: {', '.join(refused)}" if refused else "")
           + (f", FAILED: {', '.join(failed)}" if failed else ""))
-    sys.exit(1 if bad or failed else 2 if skip or refused else 3 if fd else 0)
+    code = CLI.exit_code(bad or failed, skip or refused)
+    sys.exit(3 if code == CLI.EXIT_CLEAN and fd else code)
 
 
 if __name__ == "__main__":

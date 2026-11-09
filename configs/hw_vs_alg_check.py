@@ -24,7 +24,8 @@ difference moved. Sections:
       (warp_vectors.py)
 A section whose cases a config cannot run (no grids for them, a format a side
 refuses) prints "<T> skipped on <config>: <why>" and the run goes on; the last
-line names every skipped section. Exit 0: every section ran; 2: one skipped.
+line names every skipped section. Exit (sim_cli): 0 every section ran; 2 one
+skipped, or the config refused; 1 an error.
 --config: default mx_config_npe_e4.json; mx_config_npe_hw_exact.json = lib HW-exact switches.
 --only warp: T12 alone.
 """
@@ -32,7 +33,7 @@ import math, os, sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import torch, torch.nn.functional as F
-import cases as C, main_ALG as _A, main_HW as _H, sim_config as SC
+import cases as C, main_ALG as _A, main_HW as _H, sim_cli as CLI, sim_config as SC
 
 # --config: default mx_config_npe_e4.json (NPE 4-bit exponent, ALG defaults);
 # mx_config_npe_hw_exact.json = the lib's HW-exact switches M1-M8, with grids.
@@ -41,7 +42,7 @@ _ap = argparse.ArgumentParser()
 _ap.add_argument("--config", default="mx_config_npe_e4.json")
 _ap.add_argument("--only", choices=("warp",), default=None, help="run T12 alone")
 ARGS = _ap.parse_args()
-CFG = SC.load_config(ARGS.config)
+CFG = CLI.load_config(ARGS.config)
 print(f"config: {os.path.basename(CFG['file'])}")
 
 
@@ -65,7 +66,10 @@ SKIPPED = []
 
 
 def skip(label, why):
-    print(f"  {label} skipped on {os.path.basename(CFG['file'])}: {why}")
+    """`<label> skipped on <config>: <why>`; a sim refusal already names the
+    config first, so it is not said twice."""
+    f = os.path.basename(CFG["file"])
+    print(f"  {label} skipped on {f}: {str(why).removeprefix(f + ': ')}")
     SKIPPED.append(label)
 
 
@@ -79,11 +83,11 @@ def section(label, fn):
 
 
 def finish():
-    """Exit 0 when every section ran, 2 (as main.py: a refusal) when one was
-    skipped, named on the last line."""
+    """Exit 0 when every section ran, 2 when one was skipped (sim_cli: a
+    skip never reads as clean), named on the last line."""
     if SKIPPED:
         print(f"\nskipped on {os.path.basename(CFG['file'])}: {', '.join(SKIPPED)}")
-    sys.exit(2 if SKIPPED else 0)
+    sys.exit(CLI.exit_code(False, SKIPPED))
 
 
 # ---------------------------------------------------------------- T12 warp

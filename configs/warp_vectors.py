@@ -192,12 +192,12 @@ def _ref_format(sim):
 def _out_requant(sim):
     """D7 output requant, Q7: acc 37.5, out step = ref step."""
     ref = _ramp(2, 40, lambda x, y: 37 + x % 2)
-    _, a, h, _, acc_h = sim.warp(ref, C.const_flow(1, 2, 40, 0.5, 0.0))
+    _, a, h, acc_a, acc_h = sim.warp(ref, C.const_flow(1, 2, 40, 0.5, 0.0))
     pcu = int(pcu_div(h["hw_acc"][0, 0, 0, :1], -int(h["frac_sum"]), "round"))
     acc = float(acc_h[0, 0, 0, 0])
     ch = float(h["out_raw"][0, 0, 0, 0])
     if "out_code" not in a:         # no output fxp: the lib leaves it unrounded
-        ca = float(a["out_pre"][0, 0, 0, 0] / C.P2)
+        ca = float(acc_a[0, 0, 0, 0])
         alg = f"ALG unrounded {ca:g} (config has no output fxp)"
     else:
         ca = int(a["out_code"][0, 0, 0, 0])

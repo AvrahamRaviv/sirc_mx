@@ -88,9 +88,12 @@ def main():
 
     out = args.out if os.path.isabs(args.out) else os.path.join(_HERE, args.out)
     tmp = out + ".tmp"
-    json.dump(raw, open(tmp, "w"), indent=1)
-    cfg = SC.load_config(tmp)
-    os.remove(tmp)
+    with open(tmp, "w") as f:
+        json.dump(raw, f, indent=1)
+    try:                                # load_config may refuse the file
+        cfg = SC.load_config(tmp)
+    finally:
+        os.remove(tmp)
     raw["hw_grids"] = {n: grids_for(n, cfg, seeds) for n in args.cases}
     raw["_comment"] = (f"{os.path.basename(base)} + xblock_accum {args.set}; "
                        f"hw_grids from gen_hw_grids.py (lib calibrate_hw_grids, "

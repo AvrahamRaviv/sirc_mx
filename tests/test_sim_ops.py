@@ -3,6 +3,7 @@ integer taps explain its own output - conv acc from a_int/w_int, warp out_code
 from ref_code/grid_code."""
 
 import copy
+import json
 import os
 import sys
 
@@ -18,6 +19,7 @@ for p in (os.path.join(_ROOT, "configs"), _ROOT, os.path.dirname(_ROOT)):
 import cases as C           # noqa: E402
 import main_ALG as ALG      # noqa: E402
 import main_HW as HW        # noqa: E402
+import sim_cli as CLI       # noqa: E402
 import sim_config as SC     # noqa: E402
 
 E4 = SC.load_config("mx_config_npe_e4.json")   # NPE exponent width (4 bits)
@@ -233,7 +235,6 @@ def test_pla_bins_standin_bit_exact_incl_tie(b, tie):
 def test_alg_convt_hw_path_taps():
     """xblock_accum.convT = "hw": main_ALG taps the lib's MXConvTranspose2dHW
     like a conv (compact input blocked along W, equivalent conv weight)."""
-    import json
     cfg = json.loads(json.dumps(E4))
     cfg["mx_specs"]["xblock_accum"].update(convT="hw", backend="python")
     c = C.build("convt_k4_s2")
@@ -563,6 +564,24 @@ def test_alg_warp_non_fxp_output_has_no_out_code():
     assert "output is not fxp" in ALG.warp_out_note(cfg)
 
 
+@pytest.mark.parametrize("fxp", [False, None, {"enabled": False}, [{"enabled": False}] * 3],
+                         ids=["false", "null", "enabled_false", "per_site_off"])
+def test_alg_warp_output_fxp_off_is_unrounded_as_the_lib(fxp):
+    """An output fxp the lib reads as off (normalize_out_quant enabled False):
+    the lib passes the warp result through, as with no output, so ALG out is
+    out_pre, off the out_scale lattice, with no out_code, and the sim says
+    why."""
+    cfg = copy.deepcopy(E4)                    # warp call_sites 3
+    cfg["entries"]["model.warp"]["output"]["fxp"] = fxp
+    case = C.build("warp_subpix")
+    t = ALG.run(case, cfg)
+    assert "out_code" not in t
+    assert torch.equal(t["out"], t["out_pre"])
+    v = t["out"].double() / case["warp"]["out_scale"]
+    assert bool(((v - v.round()).abs() > 1e-3).any())
+    assert "output fxp is off" in ALG.warp_out_note(cfg)
+
+
 def test_t12_output_requant_q7_without_output_fxp():
     """D7 on a config with no output fxp: ALG gives the acc unrounded."""
     (v,) = [x for x in WV.vectors(HWX) if x["label"] == "D7 | HW Q7"]
@@ -722,10 +741,10 @@ def _refused_names(summary):
 def test_main_hw_cli_reports_each_refusal_and_goes_on():
     """-m all on npe_e4: conv3x3 (padding) is refused by their code, and the
     run goes on to the end; every refusal is named with its reason and in
-    the summary, never counted as ran; only refusals: exit 0."""
+    the summary, never counted as ran; refusals and no failure: exit 2."""
     names = C.select("all")
     p = _cli("main_HW.py", "-m", "all", "--config", "mx_config_npe_e4.json")
-    assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
+    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
     out = p.stdout.splitlines()
     assert "  refused: Padding not yet supported" in out
     assert "=== warp_u8_subpix_w64  HW ===" in out          # the last case ran
@@ -755,6 +774,85 @@ def test_main_hw_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys
     assert "  FAILED: RuntimeError: boom" in out
     assert "=== conv3x3_p0  HW ===" in out                    # went on
     assert ", FAILED: conv1x1" in out[-1]
+
+
+def test_main_alg_cli_reports_each_refusal_and_goes_on(tmp_path):
+    """main_ALG -m all on npe_hw_exact: the cases it holds no grids for are
+    refused, with why, the run goes on to the last case, the summary names
+    each, and the exit code is 2 (refused, nothing failed). --dump holds the
+    cases that ran."""
+    names = C.select("all")
+    dump = tmp_path / "taps.pt"
+    p = _cli("main_ALG.py", "-m", "all", "--config", "mx_config_npe_hw_exact.json",
+             "--dump", str(dump))
+    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
+    out = p.stdout.splitlines()
+    assert "  refused: mx_config_npe_hw_exact.json: no hw_grids entry 'conv3x3' " \
+           "and xblock_accum has no e_layer_min/e_qa_out, but out_window is on. " \
+           "The sim does not calibrate: write the grids into the config " \
+           "(gen_hw_grids.py)." in out
+    assert "=== warp_u8_subpix_w64  ALG ===" in out          # the last case ran
+    summary = out[-3]                          # then the --dump line
+    refused = _refused_names(summary)
+    assert {"conv3x3", "convt_k3_s2"} <= set(refused) and "conv1x1" not in refused
+    assert summary.startswith(f"{len(names) - len(refused)}/{len(names)} ran")
+    assert out[-1] == f"wrote {dump} ({len(names) - len(refused)} cases that ran)"
+    assert sum(ln.startswith("  refused: ") for ln in out) == len(refused)
+    ran = torch.load(dump)
+    assert set(ran) == set(names) - set(refused)
+
+
+def test_main_alg_cli_fails_on_an_error_that_is_not_a_refusal(monkeypatch, capsys):
+    """An error other than a documented refusal is reported, the run goes
+    on, and the exit code is 1, also beside refusals."""
+    real = ALG.run
+
+    def run(case, cfg=None):
+        if case["name"] == "conv1x1":
+            raise RuntimeError("boom")
+        return real(case, cfg)
+
+    monkeypatch.setattr(ALG, "run", run)
+    monkeypatch.setattr(sys, "argv", ["main_ALG.py", "-m", "conv", "--config",
+                                      "mx_config_npe_hw_exact.json"])
+    with pytest.raises(SystemExit) as ex:
+        ALG.main()
+    out = capsys.readouterr().out.splitlines()
+    assert ex.value.code == 1
+    assert "  FAILED: RuntimeError: boom" in out
+    assert "=== conv3x3_p0  ALG ===" in out                   # went on
+    assert ", refused: conv3x3" in out[-1] and ", FAILED: conv1x1" in out[-1]
+
+
+@pytest.mark.parametrize("script", ["main.py", "main_HW.py", "main_ALG.py",
+                                    "hw_vs_alg_check.py"])
+def test_cli_exits_2_on_a_config_it_refuses(script):
+    """A config the sim refuses at load is said, with why, and exits 2 in
+    every CLI (sim_cli): refused, nothing failed - never 0, never a crash."""
+    p = _cli(script, "--config", "mx_config_auto_mixed.json")
+    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
+    assert p.stdout.splitlines()[-1] == (
+        "refused: mx_config_auto_mixed.json: no global mx_specs (per-layer groups "
+        "only); the sim runs one layer on the file's mx_specs")
+    assert "Traceback" not in p.stderr
+
+
+def test_run_each_refuses_an_empty_case_list():
+    with pytest.raises(ValueError, match="no cases to run"):
+        CLI.run_each([], "ALG", lambda name: None)
+
+
+def test_gen_hw_grids_leaves_no_tmp_file_on_a_refused_base(tmp_path):
+    """A base the sim refuses (no element formats in mx_specs) stops
+    gen_hw_grids with why, and its temporary config is removed."""
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps({"mx_specs": {"xblock_accum": {}}, "layers": []}))
+    out = tmp_path / "out.json"
+    p = _cli("gen_hw_grids.py", "--base", str(base), "--out", str(out),
+             "--cases", "conv1x1")
+    assert p.returncode == 1
+    assert "mx_specs has no a_elem_format, w_elem_format" in p.stderr
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["base.json"]
 
 
 def test_main_cli_reports_each_refusal_and_goes_on():
@@ -804,7 +902,7 @@ def test_hw_vs_alg_check_skips_sections_without_grids_and_goes_on(cfg_name):
     p = _cli("hw_vs_alg_check.py", "--config", cfg_name)
     assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
     out = p.stdout.splitlines()
-    assert any(ln.startswith(f"  T1 T7 skipped on {cfg_name}: {cfg_name}: no hw_grids "
+    assert any(ln.startswith(f"  T1 T7 skipped on {cfg_name}: no hw_grids "
                              f"entry 'conv3x3_p0'") for ln in out)
     for t in ("### T6", "### T9", "### T11", "### T12"):
         assert any(ln.startswith(t) for ln in out), t
@@ -841,3 +939,19 @@ def test_alg_conv_refuses_what_it_cannot_decode(cfg_name, layer, blk):
     blocking is refused instead of decoded on the wrong axis."""
     with pytest.raises(SystemExit, match=f"this config gives {layer}, blockify {blk}"):
         ALG.run(C.build("conv1x1"), SC.load_config(cfg_name))
+
+
+def test_alg_convt_hw_path_refuses_what_it_cannot_decode():
+    """xblock_accum.convT "hw" gives the lib's MXConvTranspose2dHW, whose taps
+    decode NPE blocks as conv's: on NPE blocks it runs, on channel blocks it
+    is refused (no shipped config reaches this path with grids: E4, no
+    window, as test_alg_convt_hw_path_taps)."""
+    cfg = copy.deepcopy(E4)                    # xblock / flatten
+    cfg["mx_specs"]["xblock_accum"].update(convT="hw", backend="python")
+    case = C.build("convt_k3_s2")
+    assert "acc" in ALG.run(case, cfg)         # the HW path, NPE blocks: runs
+    xa = cfg["mx_specs"]["xblock_accum"]
+    xa["act_blockify"] = xa["weight_blockify"] = "channel"
+    with pytest.raises(SystemExit, match="this config gives MXConvTranspose2dHW, "
+                                         "blockify channel / channel"):
+        ALG.run(case, cfg)

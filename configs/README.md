@@ -19,6 +19,7 @@ conv), and **warp**.
 | `warp_vectors.py` | the T12 warp vectors: label, printed text, and each side's values |
 | `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib; per-call-site fxp lists by the lib's pure rule, `fixed_point/fxp_sites.py`) |
+| `sim_cli.py` | what the CLIs share: the exit codes, and the many-case loop that reports each refusal and goes on |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
 | `mx_config_npe_e4_pla.json` | npe_e4 + output window + PLA in HW bin form, `hw_grids` for `conv_prelu`, `conv_relu`, `conv_prelu_negb` |
 | `mx_config_npe_hw_exact.json` (+ `_nearest`, `_in`) | the lib's HW-exact switches M1-M8 (from `mx_config_dof_run_hw_exact.json`) with `hw_grids` for the conv cases; `_nearest`: mantissa round to nearest (the truncate share); `_in`: first-layer integer input (`in_mode int`, POT scale) |
@@ -46,7 +47,8 @@ conv), and **warp**.
   - `grid` is Q8.8: a displacement in px, channel 0 = x.
   - Bilinear with 8-bit weights; samples outside the image count as 0.
   - `out` is int8 with a static scale, when the warp entry has an `output` fxp. With none (the
-    `hw_exact` and `dof_run` configs) the lib leaves the warp result unrounded: ALG `out` is
+    `hw_exact` and `dof_run` configs), or one the lib reads as off (`false`, `null`,
+    `{"enabled": false}`), the lib leaves the warp result unrounded: ALG `out` is
     `out_pre`, there is no `out_code`, and the run prints a line saying so (`main_ALG.warp_out_note`).
   - Every step rounds half away from zero and saturates.
 
@@ -67,14 +69,25 @@ python main.py -m conv3x3_p0 --config mx_config_npe_e4.json --input both   # flo
 pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 ```
 
-Over many cases (`-m all`, an op), `main.py` and `main_HW.py` run every case.
-A case a side refuses (`sim_config.REFUSED`: their code cannot run it, or the
+Over many cases (`-m all`, an op), `main.py`, `main_HW.py` and `main_ALG.py`
+run every case (one loop, `sim_cli.run_each`; `main.py` runs both sides). A
+case a side refuses (`sim_config.REFUSED`: their code cannot run it, or the
 config lacks what the sim reads, such as static grids) prints `refused: <why>`
 and the run goes on; any other error prints `FAILED` with its traceback and
-the run goes on. The last line names the refused and failed cases. Exit:
-`main_HW.py` 1 if a case failed, else 0; `main.py` 1 on a mismatch or a
-failure, 2 if a case was refused or not implemented on HW, 3 float
-differences only, 0 all bit-exact.
+the run goes on. The last line names the refused and failed cases. A config
+the sim refuses at load prints `refused: <why>`.
+
+Exit codes, one meaning in `main.py`, `main_HW.py`, `main_ALG.py` and
+`hw_vs_alg_check.py` (`sim_cli.py`):
+
+| code | meaning |
+|---|---|
+| 0 | every case (section) ran clean |
+| 1 | a failure (an error that is not a refusal) or a mismatch |
+| 2 | something was refused or skipped (a case, a section, the config), nothing failed |
+| 3 | `main.py` only: everything ran, only float taps differ |
+
+A refusal is never a pass: it never exits 0.
 
 ## HW side (npe_mx_emu)
 
@@ -165,7 +178,7 @@ run on fixed conv cases (`conv3x3_p0`, `conv1x1`, `conv3x3_p0_bias`), so a
 config that holds grids only for its own cases (`npe_e4_pla`,
 `npe_hw_exact_in`) skips them with the reason, and the rest runs. The last
 line names the skipped sections; exit 0 when every section ran, 2 when one
-was skipped.
+was skipped (the exit codes above).
 
 ## Static grids and PLA
 

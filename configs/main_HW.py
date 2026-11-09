@@ -35,7 +35,6 @@ if _HERE not in sys.path:
 
 import contextlib
 import dataclasses
-import traceback
 
 import torch
 
@@ -44,6 +43,7 @@ if _HW_DIR not in sys.path:
     sys.path.insert(0, _HW_DIR)
 
 import cases as C
+import sim_cli as CLI
 import sim_config as SC
 from taps import tap, show
 
@@ -557,30 +557,16 @@ def main():
     ap.add_argument("--config", default=SC.DEFAULT_CONFIG,
                     help="framework mx_config.json (same file ALG reads)")
     args = ap.parse_args()
-    cfg = SC.load_config(args.config)
-    names = C.select(args.m)
-    refused, failed = [], []
-    for name in names:
-        try:
-            taps = run(C.build(name), cfg)
-        except SC.REFUSED as e:              # documented: what and why
-            print(f"\n=== {name}  HW ===\n  refused: {e}")
-            refused.append(name)
-            continue
-        except Exception as e:               # not a refusal: a failure
-            print(f"\n=== {name}  HW ===\n  FAILED: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            failed.append(name)
-            continue
+    cfg = CLI.load_config(args.config)
+
+    def run_one(name):
+        taps = run(C.build(name), cfg)
         show(taps, f"{name}  HW")
         if C.CASES[name]["op"] == "warp":
             for line in warp_notes(taps):
                 print(f"  {line}")
-    ran = len(names) - len(refused) - len(failed)
-    print(f"\n{ran}/{len(names)} ran"
-          + (f", refused: {', '.join(refused)}" if refused else "")
-          + (f", FAILED: {', '.join(failed)}" if failed else ""))
-    sys.exit(1 if failed else 0)
+
+    sys.exit(CLI.run_each(C.select(args.m), "HW", run_one))
 
 
 if __name__ == "__main__":
