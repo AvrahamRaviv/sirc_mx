@@ -19,7 +19,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.append(_ROOT)
 
-from fixed_point.fxp_sites import entry_call_sites, expand_sites   # noqa: E402
+from fixed_point.fxp_sites import check_site_list, entry_call_sites, expand_sites   # noqa: E402
 
 DEFAULT_CONFIG = os.path.join(_HERE, "mx_config_dof.json")
 
@@ -31,6 +31,22 @@ DEFAULT_CONFIG = os.path.join(_HERE, "mx_config_dof.json")
 # never calibrates). A CLI over many cases reports each and goes on; any other
 # error is a failure.
 REFUSED = (NotImplementedError, SystemExit)
+
+
+def require(d, keys, where, why):
+    """Refuse (SystemExit, a REFUSED) unless mapping `d` holds every key:
+    `<where> lacks [<missing keys>]; <why>`. `where` names the config entry
+    (file first), `why` what the sim reads from it."""
+    miss = [k for k in keys if k not in d]
+    if miss:
+        raise SystemExit(f"{where} lacks {miss}; {why}")
+
+
+class SiteListError(ValueError):
+    """The lib's per-call-site length error (fixed_point/fxp_sites
+    check_site_list: a per-site fxp list that does not hold one spec per call
+    site), as the sim raises it: a config the lib itself refuses, told by
+    type from any other ValueError (a bug)."""
 
 
 def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
@@ -93,18 +109,45 @@ WARP_CALL_SITE = 0
 
 def sites_fxp(entry, fxp, where):
     """One operand's fxp spec per call site of `entry`, by the lib's rule: a
-    per-site list must hold one spec per call site (ValueError otherwise), a
-    single spec is shared by every site, and so is a bare null / true /
-    false (the lib reads them as off / defaults / off)."""
+    per-site list must hold one spec per call site (SiteListError, a
+    ValueError, otherwise), a single spec is shared by every site, and so is
+    a bare null / true / false (the lib reads them as off / defaults / off)."""
     n = entry_call_sites(entry, where)
     if fxp is None or isinstance(fxp, bool):
         return [fxp] * n
+    try:
+        check_site_list(fxp, n, where)
+    except ValueError as e:
+        raise SiteListError(str(e)) from e
     return expand_sites(fxp, n, where)
 
 
 def site_fxp(entry, fxp, site, where):
     """One operand's fxp spec at call site `site` of `entry` (sites_fxp)."""
     return sites_fxp(entry, fxp, where)[site]
+
+
+# The warp entry's inputs, in order: the reference frame and the flow grid.
+WARP_INPUTS = ("ref", "grid")
+
+
+def warp_sites(cfg, entry):
+    """The fxp specs per call site (sites_fxp) of the warp entry's inputs, in
+    WARP_INPUTS order. `entry` is the warp entry of `cfg` (or a copy). Refused,
+    naming the entry and the input, when it has no such input or the input
+    has no `fxp`: the sim reads both operand formats from the config."""
+    f = os.path.basename(cfg["file"])
+    name = entry_name(cfg, "warp")
+    inputs = entry.get("inputs")
+    inputs = inputs if isinstance(inputs, list) else []
+    sites = []
+    for i, role in enumerate(WARP_INPUTS):
+        why = f"the sim reads the warp's {role} format from the config"
+        if i >= len(inputs) or not isinstance(inputs[i], dict):
+            raise SystemExit(f"{f}: warp entry {name!r} has no input {i} ({role}); {why}")
+        require(inputs[i], ("fxp",), f"{f}: warp entry {name!r} input {i} ({role})", why)
+        sites.append(sites_fxp(entry, inputs[i]["fxp"], f"{entry['name']} input {i}"))
+    return sites
 
 
 def grid_key(cfg, case):

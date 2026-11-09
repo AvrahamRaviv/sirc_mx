@@ -5,6 +5,7 @@ from ref_code/grid_code."""
 import copy
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -1029,3 +1030,147 @@ def test_alg_convt_hw_path_refuses_what_it_cannot_decode():
     with pytest.raises(SystemExit, match="this config gives MXConvTranspose2dHW, "
                                          "blockify channel / channel"):
         ALG.run(case, cfg)
+
+
+# --- a missing config entry is a named refusal; any other error a failure ----
+
+def _drop(cfg, path):
+    """A copy of `cfg` whose warp entry lacks what `path` names."""
+    cfg = copy.deepcopy(cfg)
+    e = cfg["entries"]["model.warp"]
+    {"inputs": lambda: e.pop("inputs"),
+     "input 1": lambda: e.__setitem__("inputs", e["inputs"][:1]),
+     "input 0 fxp": lambda: e["inputs"][0].pop("fxp"),
+     "input 1 fxp": lambda: e["inputs"][1].pop("fxp")}[path]()
+    return cfg
+
+
+@pytest.mark.parametrize("path, why", [
+    ("inputs", "has no input 0 (ref); the sim reads the warp's ref format from the config"),
+    ("input 1", "has no input 1 (grid); the sim reads the warp's grid format from the config"),
+    ("input 0 fxp", "input 0 (ref) lacks ['fxp']; the sim reads the warp's ref format "
+                    "from the config"),
+    ("input 1 fxp", "input 1 (grid) lacks ['fxp']; the sim reads the warp's grid format "
+                    "from the config")])
+def test_warp_entry_missing_an_input_is_a_named_refusal(path, why):
+    """Both sides refuse a warp entry that lacks an input or its fxp, naming
+    the entry and why (sim_config.warp_sites), instead of a KeyError or an
+    IndexError; T12's probe reports it as why the warp cannot run."""
+    cfg = _drop(E4, path)
+    msg = f"mx_config_npe_e4.json: warp entry 'model.warp' {why}"
+    for run in (ALG.run, HW.run):
+        with pytest.raises(SystemExit) as ex:
+            run(C.build("warp_u8_half"), cfg)
+        assert str(ex.value) == msg
+    assert WV.probe(cfg) == f"main_ALG SystemExit: {msg}"
+
+
+@pytest.mark.parametrize("role, i", [("ref", 0), ("grid", 1)])
+def test_hw_warp_fxp_without_total_bits_is_a_named_refusal(role, i):
+    cfg = copy.deepcopy(E4)
+    cfg["entries"]["model.warp"]["inputs"][i]["fxp"].pop("total_bits")
+    with pytest.raises(SystemExit, match=re.escape(
+            f"mx_config_npe_e4.json: model.warp {role} fxp (call site 0) lacks "
+            f"['total_bits']; their lane widths come from the config")):
+        HW.warp_spec(cfg)
+
+
+def test_pla_grids_missing_a_key_are_a_named_refusal():
+    """ALG's PCU alone (pcu_on) and HW's PLA bins read the layer's hw_grids:
+    a missing key is refused, naming the entry, not a KeyError."""
+    cfg = copy.deepcopy(PLA)
+    case = C.build("conv_prelu")
+    cfg["hw_grids"]["conv_prelu"].pop("pla_m_pos")
+    acc = torch.zeros(1, case["w"].shape[0], 2, 2, dtype=torch.int64)
+    with pytest.raises(SystemExit, match=re.escape(
+            "mx_config_npe_e4_pla.json: hw_grids 'conv_prelu' lacks ['pla_m_pos']; the "
+            "lib's PCU reads its PLA bins and grids from the config")):
+        ALG.pcu_on(acc, cfg, case, -12)
+    cfg = copy.deepcopy(PLA)
+    del cfg["mx_specs"]["xblock_accum"]
+    with pytest.raises(SystemExit, match=re.escape(
+            "mx_config_npe_e4_pla.json: mx_specs lacks ['xblock_accum']")):
+        ALG.pcu_on(acc, cfg, case, -12)
+    cfg = copy.deepcopy(PLA)
+    cfg["hw_grids"]["conv_prelu"].pop("e_layer_min")
+    with pytest.raises(SystemExit, match=re.escape(
+            "mx_config_npe_e4_pla.json: hw_grids 'conv_prelu' lacks ['e_layer_min']; "
+            "the HW PCU bins come from the config")):
+        HW.run(case, cfg)
+
+
+def test_probe_skips_only_a_refusal_or_the_libs_site_list_error():
+    """T12's probe turns into a skip only a documented refusal or the lib's
+    per-call-site length error (sim_config.SiteListError); any other
+    ValueError (here call_sites 0) or KeyError propagates: a bug fails."""
+    cfg = copy.deepcopy(E4)                    # warp call_sites 3
+    g = cfg["entries"]["model.warp"]["inputs"][1]["fxp"]
+    cfg["entries"]["model.warp"]["inputs"][1]["fxp"] = [g, g]
+    assert WV.probe(cfg) == ("main_ALG SiteListError: op input 1: 2 per-call-site fxp "
+                             "configs for call_sites=3")
+    with pytest.raises(SC.SiteListError):
+        HW.warp_spec(cfg)
+    cfg["entries"]["model.warp"]["call_sites"] = 0
+    with pytest.raises(ValueError, match="call_sites must be an int >= 1") as ex:
+        WV.probe(cfg)
+    assert type(ex.value) is ValueError
+
+
+def _tmp_config(tmp_path, cfg_name, edit):
+    """`cfg_name` of configs/, edited by edit(raw json), written to tmp_path."""
+    with open(os.path.join(_ROOT, "configs", cfg_name)) as f:
+        raw = json.load(f)
+    edit(raw)
+    p = tmp_path / cfg_name
+    p.write_text(json.dumps(raw))
+    return str(p)
+
+
+def _no_ref_fxp(raw):
+    warp = next(e for e in raw["layers"] if isinstance(e, dict) and e.get("kind") == "act_quant")
+    warp["inputs"][0].pop("fxp")
+
+
+def test_every_cli_refuses_a_warp_entry_missing_an_fxp_with_why(tmp_path):
+    """A config whose warp entry lacks its ref fxp: every CLI says refused
+    (or T12 skipped) and why, naming the entry, and exits 2, not 1 (a
+    failure) and not 0."""
+    path = _tmp_config(tmp_path, "mx_config_npe_e4.json", _no_ref_fxp)
+    why = ("mx_config_npe_e4.json: warp entry 'model.warp' input 0 (ref) lacks ['fxp']; "
+           "the sim reads the warp's ref format from the config")
+    for script, side in (("main_ALG.py", ""), ("main_HW.py", ""), ("main.py", "ALG ")):
+        p = _cli(script, "-m", "warp_u8_half", "--config", path)
+        assert p.returncode == 2, script + p.stdout[-2000:] + p.stderr[-2000:]
+        assert f"  {side}refused: {why}" in p.stdout.splitlines(), script
+    p = _cli("hw_vs_alg_check.py", "--only", "warp", "--config", path)
+    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
+    out = p.stdout.splitlines()
+    assert f"  T12 skipped on mx_config_npe_e4.json: main_ALG SystemExit: {why}" in out
+    assert out[-1] == "skipped on mx_config_npe_e4.json: T12"
+
+
+_INJECT = """
+import runpy, sys
+sys.path.insert(0, {configs!r})
+import {module} as m
+def boom(*a, **k):
+    raise KeyError("injected")
+m.{name} = boom
+sys.argv = ["hw_vs_alg_check.py", "--only", "warp"]
+runpy.run_path({script!r}, run_name="__main__")
+"""
+
+
+@pytest.mark.parametrize("module, name", [("main_ALG", "_code"), ("main_HW", "abs_coords")])
+def test_hw_vs_alg_check_fails_on_a_key_error_inside_the_warp(tmp_path, module, name):
+    """A KeyError raised inside either warp side (a bug, not a config entry
+    the sim lacks) is a failure: traceback, exit 1, never "T12 skipped"."""
+    configs = os.path.join(_ROOT, "configs")
+    runner = tmp_path / "inject.py"
+    runner.write_text(_INJECT.format(configs=configs, module=module, name=name,
+                                     script=os.path.join(configs, "hw_vs_alg_check.py")))
+    p = subprocess.run([sys.executable, str(runner)], cwd=configs, capture_output=True,
+                       text=True, timeout=600)
+    assert p.returncode == 1, p.stdout[-2000:] + p.stderr[-2000:]
+    assert "KeyError: 'injected'" in p.stderr
+    assert "skipped" not in p.stdout

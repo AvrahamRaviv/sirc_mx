@@ -59,7 +59,8 @@ from taps import tap, show
 # =============================================================================
 
 from sim_config import DEFAULT_CONFIG, load_config, hw_grid   # noqa: E402  (re-exported)
-from sim_config import entry_name, site_fxp, sites_fxp, WARP_CALL_SITE   # noqa: E402
+from sim_config import entry_name, grid_key, require, site_fxp, sites_fxp   # noqa: E402
+from sim_config import warp_sites, WARP_CALL_SITE   # noqa: E402
 
 
 def _entry(cfg, op, as_name="op"):
@@ -256,6 +257,13 @@ def pcu_on(acc, cfg, case, e_out):
                                                _apply_out_window, out_window_sat_word,
                                                resolve_out_window_bits)
     g = hw_grid(cfg, case)
+    f = os.path.basename(cfg["file"])
+    require(g or {}, ("e_layer_min", "pla_frac", "pla_m_pos", "pla_m_neg", "pla_bin_bounds",
+                      "pla_bin_scales", "pla_bin_biases"),
+            f"{f}: hw_grids {grid_key(cfg, case)!r}", "the lib's PCU reads its PLA bins "
+            "and grids from the config")
+    require(cfg["mx_specs"], ("xblock_accum",), f"{f}: mx_specs",
+            "the lib's PCU reads its window and rounding from it")
     xa = cfg["mx_specs"]["xblock_accum"]
     t = lambda k: torch.tensor(g[k], dtype=torch.int64)
     pla = PLAParams(t("pla_m_pos"), t("pla_m_neg"), int(g["pla_frac"]), "bins",
@@ -360,14 +368,13 @@ def convt(case, cfg, taps):
     return out
 
 
-def _fix_scale(entry, operand, scale, where):
+def _fix_scale(operand, sites, scale):
     """The case's static scale in place of the file's (calibrate or a
-    frozen scale), at every call site the lib quantizes. Per-site fxp lists
-    are read by the lib's rule (sim_config.sites_fxp), so a list and a
-    single spec are accepted and refused exactly as the lib does; a site the
-    lib reads as off (normalize_out_quant) stays off, and `true` is the
-    lib's defaults."""
-    sites = sites_fxp(entry, operand["fxp"], where)
+    frozen scale), at every call site the lib quantizes. `sites`: the
+    operand's fxp per call site, read by the lib's rule (sim_config.sites_fxp),
+    so a list and a single spec are accepted and refused exactly as the lib
+    does; a site the lib reads as off (normalize_out_quant) stays off, and
+    `true` is the lib's defaults."""
     operand["fxp"] = [dict({} if d is True else d, scale=scale, calibrate=False)
                       if normalize_out_quant(d)["enabled"] else d for d in sites]
 
@@ -410,11 +417,14 @@ def warp(case, cfg, taps):
     x, flow, s = case["x"], case["flow"], case["warp"]
     entry = _entry(cfg, "warp")
     name = entry["name"]
-    # the file calibrates ref/out scales on data; the case fixes them
-    _fix_scale(entry, entry["inputs"][0], s["ref_scale"], f"{name} input 0")
+    # both inputs read by the lib's rule (refused when missing); the file
+    # calibrates ref/out scales on data, the case fixes them
+    ref_sites, _ = warp_sites(cfg, entry)
+    _fix_scale(entry["inputs"][0], ref_sites, s["ref_scale"])
     out_rounded = warp_out_note(cfg) is None
     if out_rounded:
-        _fix_scale(entry, entry["output"], s["out_scale"], f"{name} output")
+        output = entry["output"]
+        _fix_scale(output, sites_fxp(entry, output["fxp"], f"{name} output"), s["out_scale"])
     mod = quantize(C.Warp(), cfg, entry)
     mod._tap = True
 

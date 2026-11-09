@@ -73,10 +73,11 @@ class _Sim:
             return f"refused ({str(e)[:width]}...)"
 
 
-# What a side raises on a config the warp cannot run on: main_ALG a missing
-# fxp entry (KeyError) or a bad one (ValueError), either side a documented
-# refusal (sim_config.REFUSED). Any other error is a bug and propagates.
-CANNOT_RUN = (KeyError, ValueError) + SC.REFUSED
+# What a side raises on a config the warp cannot run on: a documented refusal
+# (sim_config.REFUSED; a missing entry is one, named), or a per-site fxp list
+# the lib refuses (sim_config.SiteListError). Any other error, a KeyError or
+# ValueError included, is a bug: it propagates and the run fails.
+CANNOT_RUN = SC.REFUSED + (SC.SiteListError,)
 
 
 def probe(cfg):

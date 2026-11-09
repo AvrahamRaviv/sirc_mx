@@ -153,12 +153,10 @@ def _capture_bcu():
 def _pla_bins(case, cfg, qp, O, s_shift=0):
     """The config's PLA bins for this layer, on their accumulator grid."""
     g = SC.hw_grid(cfg, case) or {}
-    keys = ("pla_frac", "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases")
-    miss = [k for k in keys if k not in g]
-    if miss:
-        raise SystemExit(f"{os.path.basename(cfg['file'])}: hw_grids "
-                         f"{SC.grid_key(cfg, case)!r} lacks {miss}; the HW PCU "
-                         f"bins come from the config")
+    SC.require(g, ("e_layer_min", "pla_frac", "pla_bin_bounds", "pla_bin_scales",
+                   "pla_bin_biases"),
+               f"{os.path.basename(cfg['file'])}: hw_grids {SC.grid_key(cfg, case)!r}",
+               "the HW PCU bins come from the config")
     # bounds / biases sit on the grid of the config's e_layer_min; their
     # accumulator LSB is 2^-(x_cal + w_cal). Same grid needed, else the values
     # would have to be re-derived (= calibration, which the sim does not do).
@@ -373,11 +371,14 @@ def warp_spec(cfg):
     """The config's warp entry, as their code takes it: grid word width
     (their grid_bit_width), the grid fraction bits per axis (frx, fry) at the
     sim's call site, and how many call sites the config declares.
-    Refused when their lanes can't hold what the config describes."""
+    Refused when their lanes can't hold what the config describes, or the
+    entry lacks an input, its fxp (sim_config.warp_sites) or its total_bits."""
     name = SC.entry_name(cfg, "warp")
     e = cfg["entries"][name]
-    ref = SC.site_fxp(e, e["inputs"][0]["fxp"], SC.WARP_CALL_SITE, f"{name} input 0")
-    grid = SC.site_fxp(e, e["inputs"][1]["fxp"], SC.WARP_CALL_SITE, f"{name} input 1")
+    ref, grid = (s[SC.WARP_CALL_SITE] for s in SC.warp_sites(cfg, e))
+    for role, fxp in zip(SC.WARP_INPUTS, (ref, grid)):
+        SC.require(fxp, ("total_bits",), f"{os.path.basename(cfg['file'])}: {name} {role} "
+                   f"fxp (call site {SC.WARP_CALL_SITE})", "their lane widths come from the config")
     if int(ref["total_bits"]) != 8:
         raise NotImplementedError(
             f"HW warp: {name} ref is {ref['total_bits']}-bit; their reference "
