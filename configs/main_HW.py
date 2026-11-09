@@ -153,10 +153,10 @@ def _capture_bcu():
 def _pla_bins(case, cfg, qp, O, s_shift=0):
     """The config's PLA bins for this layer, on their accumulator grid."""
     g = SC.hw_grid(cfg, case) or {}
-    SC.require(g, ("e_layer_min", "pla_frac", "pla_bin_bounds", "pla_bin_scales",
-                   "pla_bin_biases"),
-               f"{os.path.basename(cfg['file'])}: hw_grids {SC.grid_key(cfg, case)!r}",
-               "the HW PCU bins come from the config")
+    where = f"{os.path.basename(cfg['file'])}: hw_grids {SC.grid_key(cfg, case)!r}"
+    SC.require(g, ("pla_frac", "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases"),
+               where, "the HW PCU bins come from the config")
+    SC.require(g, ("e_layer_min",), where, "the bins sit on its accumulator grid")
     # bounds / biases sit on the grid of the config's e_layer_min; their
     # accumulator LSB is 2^-(x_cal + w_cal). Same grid needed, else the values
     # would have to be re-derived (= calibration, which the sim does not do).

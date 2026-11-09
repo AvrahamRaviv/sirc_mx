@@ -1095,7 +1095,7 @@ def test_pla_grids_missing_a_key_are_a_named_refusal():
     cfg["hw_grids"]["conv_prelu"].pop("e_layer_min")
     with pytest.raises(SystemExit, match=re.escape(
             "mx_config_npe_e4_pla.json: hw_grids 'conv_prelu' lacks ['e_layer_min']; "
-            "the HW PCU bins come from the config")):
+            "the bins sit on its accumulator grid")):
         HW.run(case, cfg)
 
 
