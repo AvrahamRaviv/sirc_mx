@@ -148,7 +148,7 @@ def warp_float32_store(hw):
             int((back != acc.double()).sum()))
 
 
-def report_warp(case, alg, hw):
+def report_warp(case, alg, hw, cfg):
     print("  warp per stage (HW question):")
     for r in warp_stages(case, alg, hw):
         print(f"    {r['stage']:<13} {r['q']:<10} {r['n_diff']:>6}/{r['n']:<6} "
@@ -156,7 +156,9 @@ def report_warp(case, alg, hw):
     n, big, rounded = warp_float32_store(hw)
     print(f"    their float32 output vs their int64 acc (Q9): {big}/{n} acc above "
           f"2^24, {rounded} rounded")
-    print("    ALG out_code: no HW counterpart, their PCU is bypassed (Q7)")
+    note = ALG.warp_out_note(cfg)
+    print(f"    {note}" if note is not None else
+          "    ALG out_code: no HW counterpart, their PCU is bypassed (Q7)")
     for line in HW.warp_notes(hw):
         print(f"  {line}")
 
@@ -195,7 +197,7 @@ def main():
                 continue
             results[key] = report(key, compare(alg, hw), alg, hw)
             if case["op"] == "warp":
-                report_warp(case, alg, hw)
+                report_warp(case, alg, hw, cfg)
             if "pre_round_moved" in hw:
                 print(f"  HW input off its integer grid (x*2^x_cal): "
                       f"{int(hw['pre_round_moved'])}/{case['x'].numel()} elements"

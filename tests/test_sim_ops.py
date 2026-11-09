@@ -514,6 +514,62 @@ def test_hw_warp_per_site_list_of_wrong_length_refused():
         HW.warp_spec(cfg)
 
 
+# --- ALG warp on every shape of warp entry the configs hold -----------------
+
+DOF_RUN = SC.load_config("mx_config_dof_run.json")         # ref fxp: per-site list
+HW_EXACT = SC.load_config("mx_config_npe_hw_exact.json")   # warp entry: no output
+
+
+def test_alg_warp_reads_a_per_site_ref_list_by_the_lib_rule():
+    """dof_run's ref fxp is one spec per call site (call_sites 3): ALG runs
+    call site 0 with the case's static scale in place of the file's, and a
+    list of the wrong length is refused by the lib's rule (fxp_sites)."""
+    assert isinstance(DOF_RUN["entries"]["model.warp"]["inputs"][0]["fxp"], list)
+    case = C.build("warp_u8_half")
+    t = ALG.run(case, DOF_RUN)
+    codes = (case["x"].double() / case["warp"]["ref_scale"]).round()
+    assert torch.equal(t["ref_code"].double(), codes)
+    bad = copy.deepcopy(DOF_RUN)
+    ref = bad["entries"]["model.warp"]["inputs"][0]
+    ref["fxp"] = ref["fxp"][:2]
+    with pytest.raises(ValueError, match="2 per-call-site fxp configs for call_sites=3"):
+        ALG.run(case, bad)
+
+
+@pytest.mark.parametrize("cfg", [DOF_RUN, HW_EXACT], ids=["dof_run", "hw_exact"])
+def test_alg_warp_without_output_fxp_is_unrounded_as_the_lib(cfg):
+    """A warp entry with no output: the lib passes the bilinear result
+    through (MXActQuant.quant_output), so ALG out is out_pre, off the
+    out_scale lattice, with no out_code, and the sim says why."""
+    assert "output" not in cfg["entries"]["model.warp"]
+    case = C.build("warp_subpix")              # out_scale 0.0137
+    t = ALG.run(case, cfg)
+    assert "out_code" not in t
+    assert torch.equal(t["out"], t["out_pre"])
+    v = t["out"].double() / case["warp"]["out_scale"]
+    assert bool(((v - v.round()).abs() > 1e-3).any())
+    assert "no output fxp" in ALG.warp_out_note(cfg)
+    assert ALG.warp_out_note(E4) is None
+    assert "out_code" in ALG.run(case, E4)
+
+
+def test_alg_warp_non_fxp_output_has_no_out_code():
+    """An MX (non-fxp) output: the lib holds no fixed-point output word, so
+    ALG taps no out_code and says so; no format is invented."""
+    cfg = copy.deepcopy(E4)
+    cfg["entries"]["model.warp"]["output"] = {"axes": [1]}   # global mx_specs
+    t = ALG.run(C.build("warp_u8_half"), cfg)
+    assert "out_code" not in t
+    assert "output is not fxp" in ALG.warp_out_note(cfg)
+
+
+def test_t12_output_requant_q7_without_output_fxp():
+    """D7 on a config with no output fxp: ALG gives the acc unrounded."""
+    (v,) = [x for x in WV.vectors(HW_EXACT) if x["label"] == "D7 | HW Q7"]
+    assert (v["acc"], v["alg"], v["hw"], v["pcu"]) == (37.5, 37.5, 37.5, 38)
+    assert "no output fxp" in v["text"]
+
+
 # --- hw_vs_alg_check T12: the warp vectors sent with the HW questions --------
 
 import warp_vectors as WV             # noqa: E402
@@ -638,13 +694,12 @@ def test_hw_vs_alg_check_prints_the_t12_vectors():
 
 
 def test_hw_vs_alg_check_runs_on_hw_exact():
-    """The script's HW-exact mode runs T1-T11 to the end and says why T12
-    is skipped (main_ALG.warp has no output fxp in that config)."""
+    """The script's HW-exact mode runs T1-T12 to the end; that config's warp
+    entry has no output fxp, so D7 shows ALG's unrounded value."""
     p = subprocess.run([sys.executable, "hw_vs_alg_check.py", "--config",
                         "mx_config_npe_hw_exact.json"],
                        cwd=os.path.join(_ROOT, "configs"), capture_output=True,
                        text=True, timeout=600)
     assert p.returncode == 0, p.stderr[-2000:]
-    assert "### T11" in p.stdout
-    assert ("T12 skipped on mx_config_npe_hw_exact.json: main_ALG KeyError: 'output'"
-            in p.stdout), p.stdout[-2000:]
+    assert "### T11" in p.stdout and "T12 skipped" not in p.stdout
+    assert "(config has no output fxp)" in p.stdout, p.stdout[-2000:]

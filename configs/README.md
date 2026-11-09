@@ -45,7 +45,9 @@ conv), and **warp**.
   - `ref` is int8 with a static scale.
   - `grid` is Q8.8: a displacement in px, channel 0 = x.
   - Bilinear with 8-bit weights; samples outside the image count as 0.
-  - `out` is int8 with a static scale.
+  - `out` is int8 with a static scale, when the warp entry has an `output` fxp. With none (the
+    `hw_exact` and `dof_run` configs) the lib leaves the warp result unrounded: ALG `out` is
+    `out_pre`, there is no `out_code`, and the run prints a line saying so (`main_ALG.warp_out_note`).
   - Every step rounds half away from zero and saturates.
 
 ## Usage
@@ -147,8 +149,8 @@ border (code units), and their float32 output against their own int64 acc.
 The generic compare covers `out`. ALG's int8 `out_code` has no HW counterpart.
 `hw_vs_alg_check.py` T12 has one vector per difference, labelled the same way
 (built in `warp_vectors.py`, which keeps each vector's ALG and HW values for
-the tests). On a config the warp cannot run on (main_ALG needs the warp
-entry's `output` fxp, which the `hw_exact` configs lack) T12 prints
+the tests). On a config the warp cannot run on (no `act_quant` entry, a
+per-site list of the wrong length, a refusal) T12 prints
 `T12 skipped on <config>: <why>` and the run ends normally.
 
 ## Static grids and PLA
@@ -215,6 +217,9 @@ unchanged; `layers` is reduced to the one layer under test:
 - `--backend` overrides `xblock_accum.backend` and nothing else.
 - With no CUDA, `custom_cuda` is set to False; triton already falls back to
   python on a CPU tensor.
-- Warp: the case's static ref/out scales replace the file's `calibrate`.
+- Warp: the case's static ref/out scales replace the file's `calibrate` (or
+  frozen scale) at every call site; a per-site fxp list is read by the lib's
+  rule (`fixed_point/fxp_sites.py`). One forward of a fresh module runs call
+  site 0. An entry with no `output` fxp is run as the lib runs it: unrounded.
 
 To debug, start in `main_ALG.py`, set `-m <case>`, and break in the op function.

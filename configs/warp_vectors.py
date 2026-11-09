@@ -194,8 +194,14 @@ def _out_requant(sim):
     _, a, h, _, acc_h = sim.warp(ref, C.const_flow(1, 2, 40, 0.5, 0.0))
     pcu = int(pcu_div(h["hw_acc"][0, 0, 0, :1], -int(h["frac_sum"]), "round"))
     acc = float(acc_h[0, 0, 0, 0])
-    ca, ch = int(a["out_code"][0, 0, 0, 0]), float(h["out_raw"][0, 0, 0, 0])
-    return _vec("D7 | HW Q7", f"acc {acc:g}: ALG int8 code {ca}, HW out {ch:g} (no PCU), "
+    ch = float(h["out_raw"][0, 0, 0, 0])
+    if "out_code" not in a:         # no output fxp: the lib leaves it unrounded
+        ca = float(a["out_pre"][0, 0, 0, 0] / C.P2)
+        alg = f"ALG unrounded {ca:g} (config has no output fxp)"
+    else:
+        ca = int(a["out_code"][0, 0, 0, 0])
+        alg = f"ALG int8 code {ca}"
+    return _vec("D7 | HW Q7", f"acc {acc:g}: {alg}, HW out {ch:g} (no PCU), "
                 f"their pcu_div half up {pcu}; negative ties need a signed ref",
                 ca, ch, acc=acc, pcu=pcu)
 

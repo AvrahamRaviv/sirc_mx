@@ -49,6 +49,7 @@ for p in (_HERE, _ROOT, os.path.dirname(_ROOT)):
 from mx_quantizer import MXQuantizer
 from mx_layers_blocked import MXConv2dHW
 from fixed_point.fxp_quant import fxp_step
+from fixed_point.fxp_sites import entry_call_sites, expand_sites
 
 import cases as C
 from taps import tap, show
@@ -342,24 +343,51 @@ def convt(case, cfg, taps):
     return out
 
 
+def _fix_scale(entry, operand, scale, where):
+    """The case's static scale in place of the file's (calibrate or a
+    frozen scale), at every call site. Per-site fxp lists are read by the
+    lib's rule (fxp_sites.expand_sites), so a list and a single spec are
+    accepted and refused exactly as the lib does."""
+    sites = expand_sites(operand["fxp"], entry_call_sites(entry, where), where)
+    operand["fxp"] = [dict(d, scale=scale, calibrate=False) for d in sites]
+
+
+def warp_out_note(cfg):
+    """None when the config's warp entry rounds the output to an fxp word,
+    else the line saying what the lib does instead: with no `output` entry it
+    leaves the warp result unrounded (MXActQuant.quant_output passes it
+    through), with a non-fxp `output` it holds no fixed-point word either. No
+    format is invented: the sim then has no out_code."""
+    e = cfg["entries"][entry_name(cfg, "warp")]
+    out = e.get("output")
+    if out is None:
+        return (f"ALG out: warp entry {e['name']!r} has no output fxp; the lib "
+                f"leaves the warp output unrounded (float), so there is no out_code")
+    if "fxp" not in out:
+        return (f"ALG out: warp entry {e['name']!r} output is not fxp; the lib "
+                f"gives no fixed-point output word, so there is no out_code")
+    return None
+
+
 def warp(case, cfg, taps):
     """MXActQuant around cases.Warp. Taps: x flow | ref_code grid_code |
     out_pre out_code | out.
 
     ref: int8, static scale.  grid: Q8.8 (int16, step 1/256 px).
     out: int8, static scale.  All round half away from zero and saturate.
-    One real forward; `_tap` makes it keep its quantized inputs, the raw
-    bilinear result and the quantized output.
+    One real forward of a fresh module: call site 0 of a per-site config.
+    `_tap` makes it keep its quantized inputs, the raw bilinear result and
+    the quantized output. An entry with no output fxp: out as the lib gives
+    it and no out_code (warp_out_note says why).
     """
     x, flow, s = case["x"], case["flow"], case["warp"]
     entry = _entry(cfg, "warp")
+    name = entry["name"]
     # the file calibrates ref/out scales on data; the case fixes them
-    for d, sc in ((entry["inputs"][0]["fxp"], s["ref_scale"]),
-                  (entry["output"]["fxp"], s["out_scale"])):
-        d.update(scale=sc, calibrate=False)
-    ref_cfg = entry["inputs"][0]["fxp"]
-    grid_cfg = entry["inputs"][1]["fxp"]
-    out_cfg = entry["output"]["fxp"]
+    _fix_scale(entry, entry["inputs"][0], s["ref_scale"], f"{name} input 0")
+    out_rounded = warp_out_note(cfg) is None
+    if out_rounded:
+        _fix_scale(entry, entry["output"], s["out_scale"], f"{name} output")
     mod = quantize(C.Warp(), cfg, entry)
     mod._tap = True
 
@@ -367,12 +395,14 @@ def warp(case, cfg, taps):
         out = mod(x, flow)
     q_ref, q_grid = mod._last_in
 
+    # the formats the lib applied in this forward (its call site)
     tap(taps, "x", x)
     tap(taps, "flow", flow)
-    tap(taps, "ref_code", _code(q_ref, ref_cfg, torch.int8))
-    tap(taps, "grid_code", _code(q_grid, grid_cfg, torch.int16))
+    tap(taps, "ref_code", _code(q_ref, mod.fxp_cfg(0), torch.int8))
+    tap(taps, "grid_code", _code(q_grid, mod.fxp_cfg(1), torch.int16))
     tap(taps, "out_pre", mod._last_pre)          # bilinear on quantized operands
-    tap(taps, "out_code", _code(out, out_cfg, torch.int8))
+    if out_rounded:
+        tap(taps, "out_code", _code(out, mod.out_fxp_cfg(), torch.int8))
     tap(taps, "out", out)
     return out
 
@@ -420,6 +450,9 @@ def main():
     for name in C.select(args.m):
         taps = run(C.build(name), cfg)
         show(taps, f"{name}  ALG")
+        note = warp_out_note(cfg) if C.CASES[name]["op"] == "warp" else None
+        if note is not None:
+            print(f"  {note}")
         dump[name] = taps
     if args.dump:
         torch.save(dump, args.dump)
