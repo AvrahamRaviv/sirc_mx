@@ -73,22 +73,18 @@ class _Sim:
             return f"refused ({str(e)[:width]}...)"
 
 
-# What a side raises on a config the warp cannot run on: a documented refusal
-# (sim_config.REFUSED; a missing entry is one, named), or a per-site fxp list
-# the lib refuses (sim_config.SiteListError). Any other error, a KeyError or
-# ValueError included, is a bug: it propagates and the run fails.
-CANNOT_RUN = SC.REFUSED + (SC.SiteListError,)
-
-
 def probe(cfg):
     """None when both sides run a plain warp case on `cfg`, else why not
-    ("<side> <error>"): every vector would fail the same way."""
+    ("<side> <error>"): every vector would fail the same way. Only a
+    documented refusal (sim_config.REFUSED: a missing entry, named, or a
+    per-site fxp list the lib refuses) is a why; any other error, a KeyError
+    or a ValueError included, is a bug: it propagates and the run fails."""
     case = C.warp_case("probe", _ramp(2, 4, lambda x, y: x + y),
                        C.const_flow(1, 2, 4, 0.0, 0.0), C.P2, C.P2)
     for side, run in (("main_ALG", ALG.run), ("main_HW", HW.run)):
         try:
             run(case, cfg)
-        except CANNOT_RUN as e:
+        except SC.REFUSED as e:
             return f"{side} {type(e).__name__}: {e}"
     return None
 

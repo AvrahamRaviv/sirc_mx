@@ -1099,16 +1099,20 @@ def test_pla_grids_missing_a_key_are_a_named_refusal():
         HW.run(case, cfg)
 
 
+SITE_LIST_WHY = ("mx_config_npe_e4.json: warp entry 'model.warp' input 1 (grid): 2 "
+                 "per-call-site fxp configs for call_sites=3")
+
+
 def test_probe_skips_only_a_refusal_or_the_libs_site_list_error():
-    """T12's probe turns into a skip only a documented refusal or the lib's
-    per-call-site length error (sim_config.SiteListError); any other
-    ValueError (here call_sites 0) or KeyError propagates: a bug fails."""
+    """T12's probe turns into a skip only a documented refusal, the lib's
+    per-call-site length error (sim_config.SiteListError) among them, named
+    by the config's entry; any other ValueError (here call_sites 0) or
+    KeyError propagates: a bug fails."""
     cfg = copy.deepcopy(E4)                    # warp call_sites 3
     g = cfg["entries"]["model.warp"]["inputs"][1]["fxp"]
     cfg["entries"]["model.warp"]["inputs"][1]["fxp"] = [g, g]
-    assert WV.probe(cfg) == ("main_ALG SiteListError: op input 1: 2 per-call-site fxp "
-                             "configs for call_sites=3")
-    with pytest.raises(SC.SiteListError):
+    assert WV.probe(cfg) == f"main_ALG SiteListError: {SITE_LIST_WHY}"
+    with pytest.raises(SC.SiteListError, match=re.escape(SITE_LIST_WHY)):
         HW.warp_spec(cfg)
     cfg["entries"]["model.warp"]["call_sites"] = 0
     with pytest.raises(ValueError, match="call_sites must be an int >= 1") as ex:
@@ -1131,13 +1135,23 @@ def _no_ref_fxp(raw):
     warp["inputs"][0].pop("fxp")
 
 
-def test_every_cli_refuses_a_warp_entry_missing_an_fxp_with_why(tmp_path):
-    """A config whose warp entry lacks its ref fxp: every CLI says refused
-    (or T12 skipped) and why, naming the entry, and exits 2, not 1 (a
-    failure) and not 0."""
-    path = _tmp_config(tmp_path, "mx_config_npe_e4.json", _no_ref_fxp)
-    why = ("mx_config_npe_e4.json: warp entry 'model.warp' input 0 (ref) lacks ['fxp']; "
-           "the sim reads the warp's ref format from the config")
+def _short_grid_list(raw):
+    warp = next(e for e in raw["layers"] if isinstance(e, dict) and e.get("kind") == "act_quant")
+    g = warp["inputs"][1]["fxp"]
+    warp["inputs"][1]["fxp"] = [g, g]              # call_sites 3
+
+
+@pytest.mark.parametrize("edit, kind, why", [
+    (_no_ref_fxp, "SystemExit",
+     "mx_config_npe_e4.json: warp entry 'model.warp' input 0 (ref) lacks ['fxp']; "
+     "the sim reads the warp's ref format from the config"),
+    (_short_grid_list, "SiteListError", SITE_LIST_WHY)], ids=["no_ref_fxp", "short_site_list"])
+def test_every_cli_refuses_a_bad_warp_entry_with_why(tmp_path, edit, kind, why):
+    """A warp entry that lacks its ref fxp, or whose grid list does not hold
+    one spec per call site (the lib's error): every CLI says refused (or T12
+    skipped) and why, naming the entry, and exits 2, not 1 (a failure) and
+    not 0."""
+    path = _tmp_config(tmp_path, "mx_config_npe_e4.json", edit)
     for script, side in (("main_ALG.py", ""), ("main_HW.py", ""), ("main.py", "ALG ")):
         p = _cli(script, "-m", "warp_u8_half", "--config", path)
         assert p.returncode == 2, script + p.stdout[-2000:] + p.stderr[-2000:]
@@ -1145,7 +1159,7 @@ def test_every_cli_refuses_a_warp_entry_missing_an_fxp_with_why(tmp_path):
     p = _cli("hw_vs_alg_check.py", "--only", "warp", "--config", path)
     assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
     out = p.stdout.splitlines()
-    assert f"  T12 skipped on mx_config_npe_e4.json: main_ALG SystemExit: {why}" in out
+    assert f"  T12 skipped on mx_config_npe_e4.json: main_ALG {kind}: {why}" in out
     assert out[-1] == "skipped on mx_config_npe_e4.json: T12"
 
 

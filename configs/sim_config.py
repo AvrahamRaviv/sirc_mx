@@ -24,13 +24,20 @@ from fixed_point.fxp_sites import check_site_list, entry_call_sites, expand_site
 DEFAULT_CONFIG = os.path.join(_HERE, "mx_config_dof.json")
 
 
+class SiteListError(ValueError):
+    """The lib's per-call-site length error (fixed_point/fxp_sites
+    check_site_list: a per-site fxp list that does not hold one spec per call
+    site), as the sim raises it: a config the lib itself refuses, told by
+    type from any other ValueError (a bug)."""
+
+
 # What a side raises when it cannot run a case as configured - a documented
 # refusal, with a message naming what and why: NotImplementedError (the HW
-# code cannot run it, or would give wrong numbers without an error) and
+# code cannot run it, or would give wrong numbers without an error),
 # SystemExit (the config lacks what the sim reads, e.g. static grids: the sim
-# never calibrates). A CLI over many cases reports each and goes on; any other
-# error is a failure.
-REFUSED = (NotImplementedError, SystemExit)
+# never calibrates) and SiteListError (a per-site fxp list the lib refuses).
+# A CLI over many cases reports each and goes on; any other error is a failure.
+REFUSED = (NotImplementedError, SystemExit, SiteListError)
 
 
 def require(d, keys, where, why):
@@ -40,13 +47,6 @@ def require(d, keys, where, why):
     miss = [k for k in keys if k not in d]
     if miss:
         raise SystemExit(f"{where} lacks {miss}; {why}")
-
-
-class SiteListError(ValueError):
-    """The lib's per-call-site length error (fixed_point/fxp_sites
-    check_site_list: a per-site fxp list that does not hold one spec per call
-    site), as the sim raises it: a config the lib itself refuses, told by
-    type from any other ValueError (a bug)."""
 
 
 def load_config(path=DEFAULT_CONFIG, layer=None, backend=None):
@@ -145,8 +145,9 @@ def warp_sites(cfg, entry):
         why = f"the sim reads the warp's {role} format from the config"
         if i >= len(inputs) or not isinstance(inputs[i], dict):
             raise SystemExit(f"{f}: warp entry {name!r} has no input {i} ({role}); {why}")
-        require(inputs[i], ("fxp",), f"{f}: warp entry {name!r} input {i} ({role})", why)
-        sites.append(sites_fxp(entry, inputs[i]["fxp"], f"{entry['name']} input {i}"))
+        where = f"{f}: warp entry {name!r} input {i} ({role})"
+        require(inputs[i], ("fxp",), where, why)
+        sites.append(sites_fxp(entry, inputs[i]["fxp"], where))
     return sites
 
 

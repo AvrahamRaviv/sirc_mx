@@ -72,15 +72,18 @@ pytest ../tests/test_sim_ops.py      # ALG taps explain ALG output
 Over many cases (`-m all`, an op), `main.py`, `main_HW.py` and `main_ALG.py`
 run every case (`main_HW` and `main_ALG` through one loop, `sim_cli.run_each`;
 `main.py` loops over both sides itself and reports each case by the same
-`sim_cli` rule, `not_run`). A case a side refuses (`sim_config.REFUSED`: their code cannot run it, or the
-config lacks what the sim reads, such as static grids) prints `refused: <why>`
+`sim_cli` rule, `not_run`). A case a side refuses (`sim_config.REFUSED`: their code cannot run it, the
+config lacks what the sim reads, such as static grids, or a per-site fxp list
+does not hold one spec per call site, the lib's error,
+`sim_config.SiteListError`) prints `refused: <why>`
 and the run goes on; any other error prints `FAILED` with its traceback and
 the run goes on. The last line names the refused and failed cases. A config
-the sim refuses at load prints `refused: <why>`. A config entry a side needs
-and the file lacks is a refusal that names the entry and why
-(`sim_config.require`; the warp's two inputs and their fxp:
-`sim_config.warp_sites`), never a `KeyError`: a `KeyError` or any other error
-is a bug, a failure.
+the sim refuses at load prints `refused: <why>`. These missing config entries
+are refusals that name the entry and why (`sim_config.require`), not a
+`KeyError`: the warp entry's inputs and their fxp (`sim_config.warp_sites`),
+HW's ref/grid `total_bits`, and the PLA keys HW's bins read. A grid the lib
+itself rejects (`fixed_point/hw_grids.check_hw_grid`) is still the lib's
+`ValueError`, a failure.
 
 Exit codes, one meaning in `main.py`, `main_HW.py`, `main_ALG.py` and
 `hw_vs_alg_check.py` (`sim_cli.py`):
@@ -177,9 +180,9 @@ The generic compare covers `out`. ALG's int8 `out_code` has no HW counterpart.
 `hw_vs_alg_check.py` T12 has one vector per difference, labelled the same way
 (built in `warp_vectors.py`, which keeps each vector's ALG and HW values for
 the tests). On a config the warp cannot run on (no `act_quant` entry, a
-warp entry missing an input or its fxp, a per-site list of the wrong length:
-the lib's error, `sim_config.SiteListError`; any other refusal) T12 prints
-`T12 skipped on <config>: <why>` (`warp_vectors.CANNOT_RUN`). The same
+warp entry missing an input or its fxp, a per-site list of the wrong length;
+any refusal, `sim_config.REFUSED`) T12 prints
+`T12 skipped on <config>: <why>` (`warp_vectors.probe`). The same
 holds for every section: T1-T10 run on fixed conv cases (`conv3x3_p0`, `conv1x1`, `conv3x3_p0_bias`), so a
 config that holds grids only for its own cases (`npe_e4_pla`,
 `npe_hw_exact_in`) skips them with the reason, and the rest runs. The last
@@ -255,8 +258,9 @@ unchanged; `layers` is reduced to the one layer under test:
   does not give the lib's HW conv on NPE blocks (`xblock_accum` mode
   `hw_fixed_point`, `act_blockify: xblock`, `weight_blockify: flatten`):
   the taps decode those blocks. Also a warp entry without its two inputs
-  (ref, grid), each with an `fxp` (and, for HW, its `total_bits`), and PLA
-  grids missing a key the PCU reads: each refusal names the entry.
+  (ref, grid), each with an `fxp` (and, for HW, its `total_bits`), and a
+  grid missing a PLA key HW's bins read: each refusal names the entry. A
+  grid the lib rejects (`check_hw_grid`) stays the lib's error, a failure.
 - With no CUDA, `custom_cuda` is set to False; triton already falls back to
   python on a CPU tensor.
 - Warp: the case's static ref/out scales replace the file's `calibrate` (or
