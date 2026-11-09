@@ -56,9 +56,9 @@ def not_run(header, e, side=""):
 
 def run_each(names, side, run_one):
     """run_one(name) for every case name, in order. A documented refusal
-    or any other error is reported by not_run; either way the run goes on. Prints the summary line
-    `<n>/<total> ran[, refused: ...][, FAILED: ...]` and returns the exit
-    code."""
+    or any other error is reported by not_run; either way the run goes on.
+    Prints the summary line `<n>/<total> ran[, refused: ...][, FAILED: ...]`
+    and returns the exit code."""
     if not names:
         raise ValueError("no cases to run")        # 0/0 ran must never read as clean
     refused, failed = [], []
