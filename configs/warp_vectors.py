@@ -3,14 +3,15 @@ warp_vectors.py - the warp test vectors of hw_vs_alg_check.py (T12).
 
     for v in vectors(cfg):            # one per ALG-vs-HW difference
         print(v["label"], v["text"])  # "D1 | HW Q1", the numbers it shows
-        v["alg"], v["hw"]             # the values the text prints, per side
+        v["alg"], v["hw"]             # each side's values (None: one side only)
 
 One vector per difference D1-D10 of the warp deep run, labelled with the number
 of its question in the list sent to the HW team. Both sides through the sim
 (main_ALG.warp, main_HW.warp); where main_HW refuses (batch, signed reference),
 the refusal is recorded and their code is called directly. Reference values are
 codes; acc = the bilinear sum in reference code units. The text is built from
-the "alg" / "hw" values, so a test of the values tests what is printed.
+the vector's own values ("alg", "hw" and its extra keys: counts, refusal), so a
+test of the values tests what is printed.
 """
 import os
 import sys

@@ -497,7 +497,7 @@ def test_hw_warp_per_site_list_of_wrong_length_refused():
         HW.warp_spec(cfg)
     with pytest.raises(ValueError, match="2 per-call-site fxp configs for call_sites=3"):
         MXActQuant(torch.nn.Identity(), [None, None],
-                       fxp_per_input=[None, e["inputs"][1]["fxp"]], call_sites=3)
+                   fxp_per_input=[None, e["inputs"][1]["fxp"]], call_sites=3)
     e["call_sites"] = 0
     with pytest.raises(ValueError, match="call_sites must be an int >= 1"):
         HW.warp_spec(cfg)
