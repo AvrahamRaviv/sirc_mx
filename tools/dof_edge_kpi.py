@@ -249,9 +249,10 @@ def use_diff_name_pairing(diffs):
 
 
 def split_diff_name(stem, image_stems):
-    """(A, B) of '<A>_<B>_diff_L' where both are image stems; None if none."""
+    """(A, B) of '<A>_<B>_diff_L' where both are image stems; None if none
+    (or the name does not end in _diff_L)."""
     if not stem.endswith(DIFF_NAME_SUFFIX):
-        raise KpiError(f"diff {stem!r}: name does not end in {DIFF_NAME_SUFFIX}")
+        return None
     core = stem[:-len(DIFF_NAME_SUFFIX)]
     splits = [(core[:i], core[i + 1:]) for i, ch in enumerate(core)
               if ch == "_" and core[:i] in image_stems and core[i + 1:] in image_stems]
@@ -275,7 +276,10 @@ def pair_from_diff_name(images, diffs, ref_frame, allow_unpaired):
         ref = split[0] if ref_frame == "first" else split[1]
         pairs.append((stem, images[ref], diffs[stem]))
     for stem in unsplit:
-        print(f"diff whose name splits into no two images: {stem}", file=sys.stderr)
+        label = ("diff whose name splits into no two images"
+                 if stem.endswith(DIFF_NAME_SUFFIX)
+                 else f"diff not named <A>_<B>{DIFF_NAME_SUFFIX}")
+        print(f"{label}: {stem}", file=sys.stderr)
     if unsplit and not allow_unpaired:
         raise KpiError(f"{len(unsplit)} diff(s) name no two images in --images "
                        f"(listed above); pass --allow-unpaired to skip them")
@@ -438,7 +442,7 @@ def build_parser():
                          "DOF infer's im0)")
     ap.add_argument("--diff-channel-tol", type=float, default=DIFF_CHANNEL_TOL,
                     help="a 3-channel diff is gray if its channels differ by "
-                         "at most this (default 2, JPEG noise)")
+                         "at most this (default %(default)g, JPEG noise)")
     ap.add_argument("--diff-offset", type=float, default=None,
                     help="subtracted from png/tif/jpg diff values before abs "
                          "(signed diff stored with an offset, e.g. 128 or "

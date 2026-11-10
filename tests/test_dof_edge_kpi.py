@@ -457,9 +457,54 @@ def test_mixed_diff_names_are_an_error_unless_a_mode_is_forced(tmp_path, capsys)
     assert code == 0 and set(rows) == {A, "TOTAL"}
 
 
-def test_forced_diff_name_pairing_refuses_another_name(tmp_path, capsys):
+def test_forced_diff_name_pairing_lists_another_name_and_skips_it_if_allowed(tmp_path, capsys):
+    images, diffs = diff_name_folder(tmp_path)
+    np.save(diffs / "a_1_a_0_flow.npy", band_diff())              # not a diff L name
+    code, rows = run_cli(tmp_path, images, diffs, "--pair-from-diff-name")
+    assert code == 2 and rows is None
+    assert "diff not named <A>_<B>_diff_L: a_1_a_0_flow" in capsys.readouterr().err
+    code, rows = run_cli(tmp_path, images, diffs, "--pair-from-diff-name", "--allow-unpaired")
+    assert code == 0 and set(rows) == {AB, "TOTAL"}
+    assert "diff not named <A>_<B>_diff_L: a_1_a_0_flow" in capsys.readouterr().err
+
+
+def test_default_canny_thresholds_are_0_66_and_1_33_of_the_median():
+    assert K.canny_thresholds(np.full((4, 4), 100, np.uint8)) == pytest.approx((66.0, 133.0))
+    lo, hi = K.canny_thresholds(np.full((4, 4), 200, np.uint8))
+    assert lo == pytest.approx(132.0) and hi == 255.0              # 266 clipped to 255
+
+
+@pytest.mark.parametrize("extra, cols", [
+    ((), [STEP - 1, STEP, 47, 48]),                    # default 90: both steps
+    (("--sobel-percentile", "95"), [STEP - 1, STEP]),  # 95: the strong step only
+])
+def test_sobel_percentile_keeps_the_strongest_gradients(tmp_path, extra, cols):
+    # Strong step 60 -> 180 at column 32, weak step of 10 levels at column 48.
+    # A 3x3 Sobel answers on the two columns beside each step: 4 of 64 columns
+    # are non-zero, 2 strong + 2 weak. The 90th percentile is 0 (60 zero
+    # columns), so all 4 pass; the 95th falls among the weak ones, so only the
+    # strong 2 are above it.
     images, diffs = make_dirs(tmp_path)
-    cv2.imwrite(str(images / "a.png"), step_image())
+    img = step_image()
+    img[:, 48:] = 190
+    cv2.imwrite(str(images / "a.png"), img)
     np.save(diffs / "a.npy", band_diff())
-    code, _ = run_cli(tmp_path, images, diffs, "--pair-from-diff-name")
-    assert code == 2 and "does not end in _diff_L" in capsys.readouterr().err
+    masks = tmp_path / "masks"
+    code, _ = run_cli(tmp_path, images, diffs, "--detector", "sobel", "--sigma", "0",
+                      "--dilate", "0", "--save-masks", str(masks), *extra)
+    assert code == 0
+    mask = cv2.imread(str(masks / "a.png"), cv2.IMREAD_UNCHANGED)
+    assert sorted(set(np.where(mask > 0)[1])) == cols
+
+
+def test_canny_uses_the_l2_gradient():
+    # A 45-degree step: L1 |gx|+|gy| is sqrt(2) times L2 there. With a high
+    # threshold between the two magnitudes only the L1 norm would pass it.
+    luma = (np.add.outer(np.arange(48), np.arange(W)) >= 48).astype(np.float32) * (20 / 255)
+    luma8 = np.rint(luma * 255).astype(np.uint8)
+    gx = cv2.Sobel(luma8, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(luma8, cv2.CV_32F, 0, 1, ksize=3)
+    l2, l1 = float(np.hypot(gx, gy).max()), float((np.abs(gx) + np.abs(gy)).max())
+    assert l2 < l1
+    high = (l2 + l1) / 2
+    assert not K.canny_mask(luma, 0, low=high, high=high).any()
