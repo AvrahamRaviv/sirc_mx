@@ -38,7 +38,7 @@ Edge detectors:
                   second classic detector to cross-check Canny.
 --dilate N widens each edge into a (2N+1)x(2N+1) square band ("near edges").
 
-Needs OpenCV: pip install opencv-python-headless (or `pip install .[eval]`).
+Needs OpenCV: pip install opencv-python-headless (or `pip install '.[eval]'`).
 """
 
 import argparse

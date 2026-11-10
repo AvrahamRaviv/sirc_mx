@@ -568,7 +568,7 @@ from quantization, so the KPI finds the edge pixels of each reference frame,
 widens them into a band, and sums |diff L| over it.
 
 ```bash
-pip install opencv-python-headless        # or: pip install .[eval]
+pip install opencv-python-headless        # or: pip install '.[eval]'
 python tools/dof_edge_kpi.py --images REF_DIR --diffs DIFF_DIR --out kpi.csv
 ```
 
