@@ -562,26 +562,38 @@ Set to `false` to disable.
 ## DOF edge KPI (`tools/dof_edge_kpi.py`)
 
 Quality of DOF under quantization, by the DOF owner's method: diff L is the luma
-difference between the warped target and the reference (written by the DOF
-owner's tool). Errors near edges are the most motion-sensitive and suffer most
-from quantization, so the KPI finds the edge pixels of each reference frame,
-widens them into a band, and sums |diff L| over it.
+difference between the reference and the other frame warped onto it, written by
+DOF infer as `diff_img = (full_res_y[0] - rgb_to_grayscale(im0_recon)).abs().clamp(max=255)`,
+i.e. |Y(A) - gray(warp of B onto A)|, already abs, in [0, 255], no offset (the
+script takes it as given and never recomputes it). Errors near edges are the most
+motion-sensitive and suffer most from quantization, so the KPI finds the edge
+pixels of the reference frame A, widens them into a band, and sums |diff L| over it.
 
 ```bash
 pip install opencv-python-headless        # or: pip install '.[eval]'
-python tools/dof_edge_kpi.py --images REF_DIR --diffs DIFF_DIR --out kpi.csv
+python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs DIFF_DIR --out kpi.csv
 ```
 
-- Pairing. When every diff is named `<A>_<B>_diff_L.<ext>` (the DOF owner's tool,
-  e.g. `0115_IMX874_Front_136_0115_IMX874_Front_135_diff_L.jpg`), each diff pairs
-  with its reference image: `--ref-frame first` (A) or `second` (B, the default
-  until the DOF owner confirms; each run prints which). Stems hold `_`, so the
-  split used is the one where both halves are stems in `--images`; none or
-  several is an error naming the file. Otherwise pairs by file stem (`img_001.png`
-  with `img_001.npy`). `--pair-from-diff-name` / `--pair-same-stem` force a mode.
-  An unpaired file is listed and is an error unless `--allow-unpaired`. An empty
-  folder is an error.
-- Images: png/jpg/tif, 8 or 16 bit, gray or color (BT.601 luma).
+Without OpenCV, `tests/test_dof_edge_kpi.py` is skipped with the reason "OpenCV
+missing: pip install '.[eval]' to run the DOF edge KPI tests" (`pytest -rs` shows
+it); the rest of the suite does not need it.
+
+- `--images` holds every input frame, both A and B; edges are found on Y of the
+  reference A. Preferred: the network's Y8 inputs (e.g. `Y8_LME_576x1024_PNG/`,
+  one channel, already luma).
+- Pairing. When every diff is named `<A>_<B>_diff_L.<ext>` (DOF infer's
+  `common_name`, e.g. `0115_IMX874_Front_142_0115_IMX874_Front_141_diff_L.jpg` or
+  `0015_GN3_001_0015_GN3_000_diff_L.png`), each diff pairs with its reference.
+  Reference = first stem of the diff name (DOF infer's im0: confirmed from its save
+  code, and measured 2026-11-10 on the DOF infer output); `--ref-frame second` to
+  flip, as an override only. Each run prints which. Stems hold `_`, so the split
+  used is the one where both halves are stems in `--images`; none or several is an
+  error naming the file. Otherwise pairs by file stem (`img_001.png` with
+  `img_001.npy`). `--pair-from-diff-name` / `--pair-same-stem` force a mode.
+  An unpaired file (a diff with no images, or an image no diff names) is listed
+  and is an error unless `--allow-unpaired`. An empty folder is an error.
+- Images: png/bmp/jpg/tif, 8 or 16 bit. One channel is used as is; color is
+  reduced to BT.601 luma (the same weights as torchvision `rgb_to_grayscale`).
 - diff L: `.npy`, 8/16-bit png/tif, or 8-bit jpg. A 3-channel diff whose channels
   agree within `--diff-channel-tol` (default 2) is read as gray (channel 0);
   otherwise it is an error naming the largest channel difference (a colormap

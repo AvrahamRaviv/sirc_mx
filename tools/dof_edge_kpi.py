@@ -5,7 +5,11 @@ written by the DOF owner's tool. Errors near edges are the most sensitive to
 motion and the ones quantization hurts most, so the KPI is: find the edge
 pixels of the image, widen them into a band, and sum |diff L| over that band.
 
-    python tools/dof_edge_kpi.py --images REF_DIR --diffs DIFF_DIR --out kpi.csv
+    python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs DIFF_DIR --out kpi.csv
+
+--images holds every input frame (in diff-name pairing both A and B); edges
+are found on the reference one. Best: the network's Y8 inputs (one channel,
+already luma, read as is).
 
 Pairing, one of two modes:
   same stem       img_001.png with img_001.npy.
@@ -13,14 +17,17 @@ Pairing, one of two modes:
                   image stems in --images (they may hold "_": the split used
                   is the one where both halves are image stems, and none or
                   several is an error). Edges are found on the reference,
-                  --ref-frame first (A) or second (B, the default for now;
-                  each run prints which). Used when every diff stem ends in
-                  _diff_L, or forced by --pair-from-diff-name.
+                  --ref-frame first (A, the default: DOF infer's im0, from
+                  its save code and measured 2026-11-10) or second (B); each
+                  run prints which. An image no diff names is listed and is
+                  an error unless --allow-unpaired. Used when every diff stem
+                  ends in _diff_L, or forced by --pair-from-diff-name.
 One CSV row per pair (named by the diff stem), then a TOTAL row built from the
 summed counts (never an average of the per-image means), which is also printed.
 
-Image formats: .png .jpg .jpeg .tif .tiff, 8 or 16 bit, gray or color.
-Color is reduced to luma with BT.601: Y = 0.299 R + 0.587 G + 0.114 B.
+Image formats: .png .bmp .jpg .jpeg .tif .tiff, 8 or 16 bit, gray or color.
+A one-channel image is used as is; color is reduced to luma with BT.601:
+Y = 0.299 R + 0.587 G + 0.114 B.
 
 diff L formats (load_diff_raw, the one place to extend):
   .npy            any real dtype
@@ -69,10 +76,11 @@ try:
 except ImportError:                         # optional "eval" extra
     cv2 = None
 
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+IMAGE_EXTS = (".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff")
 DIFF_EXTS = (".npy", ".png", ".tif", ".tiff", ".jpg", ".jpeg")
 OFFSET_EXTS = (".png", ".tif", ".tiff", ".jpg", ".jpeg")   # integer storage: --diff-offset applies
 DIFF_NAME_SUFFIX = "_diff_L"
+DIFF_CHANNEL_TOL = 2.0          # JPEG writes a gray diff as 3 channels, +-1 or 2 apart
 BT601 = (0.114, 0.587, 0.299)               # weights for B, G, R (OpenCV order)
 CANNY_LOW_FACTOR, CANNY_HIGH_FACTOR = 0.66, 1.33
 CSV_FIELDS = ("name", "H", "W", "edge_pixels", "edge_fraction",
@@ -121,7 +129,7 @@ def gray_channel(diff, path, tol):
     return diff[..., 0]
 
 
-def load_diff_raw(path, channel_tol=2.0):
+def load_diff_raw(path, channel_tol=DIFF_CHANNEL_TOL):
     """diff L values of one file as stored (no offset, no abs), float64.
     Add a new format here."""
     ext = os.path.splitext(path)[1].lower()
@@ -133,7 +141,9 @@ def load_diff_raw(path, channel_tol=2.0):
         diff = _imread(path)
         if diff.dtype not in (np.uint8, np.uint16):
             raise KpiError(f"{path}: diff dtype {diff.dtype}, expected 8 or 16 bit")
-    diff = np.squeeze(diff).astype(np.float64)
+    diff = diff.astype(np.float64)
+    if diff.ndim == 3 and diff.shape[2] == 1:          # (H, W, 1): H or W may be 1
+        diff = diff[..., 0]
     if diff.ndim == 3 and diff.shape[2] <= 4:          # channels last, as imread
         diff = gray_channel(diff, path, channel_tol)
     if diff.ndim != 2:
@@ -192,7 +202,7 @@ def _stems(folder, exts, label):
 
 
 def pair_files(images_dir, diffs_dir, allow_unpaired=False,
-               from_diff_name=None, ref_frame="second"):
+               from_diff_name=None, ref_frame="first"):
     """[(name, image_path, diff_path)] sorted by name; unpaired listed.
 
     from_diff_name: True / False forces a mode; None picks diff-name pairing
@@ -238,20 +248,26 @@ def split_diff_name(stem, image_stems):
 
 
 def pair_from_diff_name(images, diffs, ref_frame, allow_unpaired):
-    """Pairs each <A>_<B>_diff_L diff with its reference image (A or B)."""
-    pairs, unsplit = [], []
+    """Pairs each <A>_<B>_diff_L diff with its reference image (A or B).
+    A diff naming no two images, or an image no diff names, is listed."""
+    pairs, unsplit, named = [], [], set()
     for stem in sorted(diffs):
         split = split_diff_name(stem, images)
         if split is None:
             unsplit.append(stem)
             continue
+        named.update(split)
         ref = split[0] if ref_frame == "first" else split[1]
         pairs.append((stem, images[ref], diffs[stem]))
-    for stem in unsplit:
-        print(f"diff whose name splits into no two images: {stem}", file=sys.stderr)
-    if unsplit and not allow_unpaired:
-        raise KpiError(f"{len(unsplit)} diff(s) name no two images in --images "
-                       f"(listed above); pass --allow-unpaired to skip them")
+    unnamed = sorted(set(images) - named)
+    for label, stems in (("diff whose name splits into no two images", unsplit),
+                         ("image no diff names", unnamed)):
+        for stem in stems:
+            print(f"{label}: {stem}", file=sys.stderr)
+    if (unsplit or unnamed) and not allow_unpaired:
+        raise KpiError(f"{len(unsplit)} diff(s) name no two images and "
+                       f"{len(unnamed)} image(s) are named by no diff (listed "
+                       f"above); pass --allow-unpaired to skip them")
     return pairs
 
 
@@ -390,7 +406,9 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--images", required=True,
-                    help="folder of images to find edges on (the reference frames)")
+                    help="folder of every input frame (both A and B in "
+                         "diff-name pairing); edges are found on the "
+                         "reference. Y8 inputs (1 channel) preferred")
     ap.add_argument("--diffs", required=True, help="folder of diff L files")
     ap.add_argument("--out", required=True, help="CSV to write")
     ap.add_argument("--allow-unpaired", action="store_true",
@@ -403,10 +421,11 @@ def build_parser():
     mode.add_argument("--pair-same-stem", dest="from_diff_name",
                       action="store_const", const=False,
                       help="pair files of one stem (default otherwise)")
-    ap.add_argument("--ref-frame", choices=("first", "second"), default="second",
+    ap.add_argument("--ref-frame", choices=("first", "second"), default="first",
                     help="diff-name pairing: which of A, B is the reference "
-                         "image the edges are found on (default second)")
-    ap.add_argument("--diff-channel-tol", type=float, default=2.0,
+                         "image the edges are found on (default first: "
+                         "DOF infer's im0)")
+    ap.add_argument("--diff-channel-tol", type=float, default=DIFF_CHANNEL_TOL,
                     help="a 3-channel diff is gray if its channels differ by "
                          "at most this (default 2, JPEG noise)")
     ap.add_argument("--diff-offset", type=float, default=None,

@@ -13,7 +13,8 @@ import sys
 import numpy as np
 import pytest
 
-cv2 = pytest.importorskip("cv2", reason="optional eval extra (opencv) not installed")
+cv2 = pytest.importorskip(
+    "cv2", reason="OpenCV missing: pip install '.[eval]' to run the DOF edge KPI tests")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools")))
 
@@ -279,10 +280,10 @@ def test_canny_low_without_high_is_refused(tmp_path):
                 "--out", str(tmp_path / "o.csv"), "--canny-low", "10"])
 
 
-# ---------------------------------------------- the DOF tool's files (t50)
-# Names of the real shape, synthetic content: <A>_<B>_diff_L.jpg, A and B
-# image stems that hold underscores themselves.
-A, B = "0115_IMX874_Front_136", "0115_IMX874_Front_135"
+# ---------------------------------------------- the DOF tool's files
+# Names of the real shape, synthetic content: <A>_<B>_diff_L.<ext>, A and B
+# image stems that hold underscores themselves; A (im0) is the reference.
+A, B = "0115_IMX874_Front_142", "0115_IMX874_Front_141"
 AB = f"{A}_{B}_diff_L"
 
 
@@ -314,12 +315,55 @@ def test_diff_name_pairs_with_the_reference_frame(tmp_path, capsys, ref_frame,
     assert f"edges on the {ref_frame} frame" in capsys.readouterr().out
 
 
-def test_diff_name_default_reference_is_second_and_said(tmp_path, capsys):
+def test_diff_name_default_reference_is_first_and_said(tmp_path, capsys):
     images, diffs = diff_name_folder(tmp_path)
     code, rows = run_cli(tmp_path, images, diffs, "--dilate", "2")
     assert code == 0
-    assert int(rows[AB]["edge_pixels"]) == 0               # B, the flat frame
-    assert "edges on the second frame (B, --ref-frame second)" in capsys.readouterr().out
+    assert int(rows[AB]["edge_pixels"]) == 240             # A, the step frame
+    assert float(rows[AB]["sum_abs_diff_on_edges"]) == 576.0
+    assert "edges on the first frame (A, --ref-frame first)" in capsys.readouterr().out
+
+
+def test_image_no_diff_names_is_listed_and_an_error(tmp_path, capsys):
+    # Frames 141, 142, 143 and only the 142_141 diff: 143 is in no diff.
+    images, diffs = diff_name_folder(tmp_path)
+    lone = "0115_IMX874_Front_143"
+    cv2.imwrite(str(images / f"{lone}.png"), step_image())
+    code, rows = run_cli(tmp_path, images, diffs)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert f"image no diff names: {lone}" in err
+    code, rows = run_cli(tmp_path, images, diffs, "--allow-unpaired")
+    assert code == 0 and set(rows) == {AB, "TOTAL"}
+    assert f"image no diff names: {lone}" in capsys.readouterr().err
+
+
+def test_bmp_frames_and_y8_png_frames_pair_by_their_real_names(tmp_path):
+    # DOF infer's two name shapes: bmp dataset frames, and Y8 PNG inputs.
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / f"{A}.bmp"), step_image())
+    cv2.imwrite(str(images / f"{B}.bmp"), step_image())
+    cv2.imwrite(str(diffs / f"{AB}.jpg"), np.zeros((48, W, 3), np.uint8))
+    y8_a, y8_b = "0015_GN3_001", "0015_GN3_000"
+    cv2.imwrite(str(images / f"{y8_a}.png"), step_image(24))
+    cv2.imwrite(str(images / f"{y8_b}.png"), np.full((24, W), 90, np.uint8))
+    np.save(diffs / f"{y8_a}_{y8_b}_diff_L.npy", band_diff(24, 1.0))
+    code, rows = run_cli(tmp_path, images, diffs, "--dilate", "2")
+    assert code == 0
+    assert set(rows) == {AB, f"{y8_a}_{y8_b}_diff_L", "TOTAL"}
+    assert int(rows[AB]["edge_pixels"]) == 240                       # bmp step read
+    y8 = rows[f"{y8_a}_{y8_b}_diff_L"]
+    assert int(y8["edge_pixels"]) == 5 * 24                          # edges on A (step)
+    assert float(y8["sum_abs_diff_on_edges"]) == 1.0 * 4 * 24
+
+
+def test_one_channel_image_is_read_as_is(tmp_path):
+    path = tmp_path / "y8.png"
+    y8 = (np.arange(48 * W) % 256).astype(np.uint8).reshape(48, W)
+    cv2.imwrite(str(path), y8)
+    luma = K.load_luma(str(path))
+    assert luma.shape == (48, W)
+    assert np.array_equal(luma, (y8 / 255.0).astype(np.float32))      # no weights
 
 
 def test_jpg_diff_with_equal_channels_is_read_as_gray(tmp_path):
@@ -333,6 +377,24 @@ def test_jpg_diff_with_equal_channels_is_read_as_gray(tmp_path):
     code, rows = run_cli(tmp_path, images, diffs)
     assert code == 0
     assert float(rows[AB]["sum_abs_diff_all"]) == 7 * 48 * W
+
+
+def test_default_channel_tolerance_accepts_a_spread_of_2(tmp_path):
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    diff = np.full((48, W, 3), 10, np.uint8)
+    diff[..., 1] = 12                                       # spread exactly 2
+    cv2.imwrite(str(diffs / "a.png"), diff)
+    code, rows = run_cli(tmp_path, images, diffs)           # no --diff-channel-tol
+    assert code == 0
+    assert float(rows["a"]["sum_abs_diff_all"]) == 10 * 48 * W   # channel 0
+
+
+def test_diff_of_one_row_or_column_is_kept(tmp_path):
+    for shape in ((1, W), (48, 1), (1, W, 1)):
+        path = tmp_path / "d.npy"
+        np.save(path, np.ones(shape))
+        assert K.load_diff_raw(str(path)).shape == shape[:2]
 
 
 def test_3_channel_diff_within_tolerance_takes_channel_0(tmp_path):
