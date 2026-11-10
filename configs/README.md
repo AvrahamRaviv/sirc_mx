@@ -25,6 +25,7 @@ conv), and **warp**.
 | `mx_config_npe_hw_exact.json` (+ `_nearest`, `_in`) | the lib's HW-exact switches M1-M8 (from `mx_config_dof_run_hw_exact.json`) with `hw_grids` for the conv cases; `_nearest`: mantissa round to nearest (the truncate share); `_in`: first-layer integer input (`in_mode int`, POT scale) |
 | `gen_hw_grids.py` | writes a config's `hw_grids` from an OFFLINE lib calibration on seeds 1-8 (never the test seed). The sim itself never calibrates |
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
+| `infer_dof/` | not the sim: one framework config per DOF inference experiment, to make its HW grids from (its `README.md`) |
 
 ## Taps
 
