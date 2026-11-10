@@ -572,11 +572,25 @@ pip install opencv-python-headless        # or: pip install '.[eval]'
 python tools/dof_edge_kpi.py --images REF_DIR --diffs DIFF_DIR --out kpi.csv
 ```
 
-- Pairs by file stem (`img_001.png` with `img_001.npy`); an unpaired file is listed
-  and is an error unless `--allow-unpaired`. An empty folder is an error.
+- Pairing. When every diff is named `<A>_<B>_diff_L.<ext>` (the DOF owner's tool,
+  e.g. `0115_IMX874_Front_136_0115_IMX874_Front_135_diff_L.jpg`), each diff pairs
+  with its reference image: `--ref-frame first` (A) or `second` (B, the default
+  until the DOF owner confirms; each run prints which). Stems hold `_`, so the
+  split used is the one where both halves are stems in `--images`; none or
+  several is an error naming the file. Otherwise pairs by file stem (`img_001.png`
+  with `img_001.npy`). `--pair-from-diff-name` / `--pair-same-stem` force a mode.
+  An unpaired file is listed and is an error unless `--allow-unpaired`. An empty
+  folder is an error.
 - Images: png/jpg/tif, 8 or 16 bit, gray or color (BT.601 luma).
-- diff L: `.npy`, or 8/16-bit single-channel png/tif. `--diff-offset` is subtracted
-  from png/tif values before abs, for a signed diff stored with an offset (never
+- diff L: `.npy`, 8/16-bit png/tif, or 8-bit jpg. A 3-channel diff whose channels
+  agree within `--diff-channel-tol` (default 2) is read as gray (channel 0);
+  otherwise it is an error naming the largest channel difference (a colormap
+  needs another rule), never a silent luma. JPEG is lossy: the diff carries
+  compression noise of a few levels everywhere. The KPI compares runs on the same
+  data, so it stays fair, but png is cleaner when the DOF owner can give it.
+  The DOF tool's files measured 2026-11-10: jpg, uint8, 3 equal channels, min 0,
+  median 7: plain |diff|, no offset. `--diff-offset` is subtracted
+  from png/tif/jpg values before abs, for a signed diff stored with an offset (never
   from a `.npy`, already signed). To tell which a png is, run once
   and read the printed `diff L as stored: min, max, median` line: a plain |diff| has
   min 0 and a median near 0; a signed diff with an offset has its median near the

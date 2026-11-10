@@ -227,7 +227,7 @@ def test_empty_folder_is_an_error_not_a_csv_of_zeros(tmp_path, capsys):
 
 @pytest.mark.parametrize("bad, message", [
     (np.full((48, W), np.nan, np.float32), "NaN or inf"),
-    (np.zeros((48, W, 3), np.float32), "one channel"),
+    (np.zeros((2, 48, W), np.float32), "expected (H, W)"),
 ])
 def test_bad_diff_is_an_error(tmp_path, capsys, bad, message):
     images, diffs = make_dirs(tmp_path)
@@ -277,3 +277,123 @@ def test_canny_low_without_high_is_refused(tmp_path):
     with pytest.raises(SystemExit):
         K.main(["--images", str(tmp_path), "--diffs", str(tmp_path),
                 "--out", str(tmp_path / "o.csv"), "--canny-low", "10"])
+
+
+# ---------------------------------------------- the DOF tool's files (t50)
+# Names of the real shape, synthetic content: <A>_<B>_diff_L.jpg, A and B
+# image stems that hold underscores themselves.
+A, B = "0115_IMX874_Front_136", "0115_IMX874_Front_135"
+AB = f"{A}_{B}_diff_L"
+
+
+def diff_name_folder(tmp_path, diff_ext=".npy"):
+    """A = step picture, B = flat picture; the diff has 3 on the step band."""
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / f"{A}.png"), step_image())
+    cv2.imwrite(str(images / f"{B}.png"), np.full((48, W), 90, np.uint8))
+    if diff_ext == ".npy":
+        np.save(diffs / f"{AB}.npy", band_diff())
+    else:
+        cv2.imwrite(str(diffs / f"{AB}{diff_ext}"), band_diff().astype(np.uint8))
+    return images, diffs
+
+
+@pytest.mark.parametrize("ref_frame, edge_pixels, on_edges", [
+    ("first", 240, 576.0),     # A, the step: the 5-column band
+    ("second", 0, 0.0),        # B, flat: no edges
+])
+def test_diff_name_pairs_with_the_reference_frame(tmp_path, capsys, ref_frame,
+                                                  edge_pixels, on_edges):
+    images, diffs = diff_name_folder(tmp_path)
+    code, rows = run_cli(tmp_path, images, diffs, "--dilate", "2", "--ref-frame", ref_frame)
+    assert code == 0
+    assert set(rows) == {AB, "TOTAL"}
+    assert int(rows[AB]["edge_pixels"]) == edge_pixels
+    assert float(rows[AB]["sum_abs_diff_on_edges"]) == on_edges
+    assert float(rows[AB]["sum_abs_diff_all"]) == 576.0
+    assert f"edges on the {ref_frame} frame" in capsys.readouterr().out
+
+
+def test_diff_name_default_reference_is_second_and_said(tmp_path, capsys):
+    images, diffs = diff_name_folder(tmp_path)
+    code, rows = run_cli(tmp_path, images, diffs, "--dilate", "2")
+    assert code == 0
+    assert int(rows[AB]["edge_pixels"]) == 0               # B, the flat frame
+    assert "edges on the second frame (B, --ref-frame second)" in capsys.readouterr().out
+
+
+def test_jpg_diff_with_equal_channels_is_read_as_gray(tmp_path):
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / f"{A}.png"), step_image())
+    cv2.imwrite(str(images / f"{B}.png"), step_image())
+    # A constant JPEG decodes exactly, so the sum is known: 7 per pixel.
+    cv2.imwrite(str(diffs / f"{AB}.jpg"), np.full((48, W, 3), 7, np.uint8))
+    raw = K.load_diff_raw(str(diffs / f"{AB}.jpg"))
+    assert raw.shape == (48, W)
+    code, rows = run_cli(tmp_path, images, diffs)
+    assert code == 0
+    assert float(rows[AB]["sum_abs_diff_all"]) == 7 * 48 * W
+
+
+def test_3_channel_diff_within_tolerance_takes_channel_0(tmp_path):
+    path = tmp_path / "d.png"
+    diff = np.full((8, 8, 3), 10, np.uint8)
+    diff[..., 1] = 12                                       # +2: JPEG-like noise
+    diff[..., 2] = 9
+    cv2.imwrite(str(path), diff)
+    raw = K.load_diff_raw(str(path), channel_tol=3)
+    assert np.array_equal(raw, np.full((8, 8), 10.0))       # channel 0 (B), not luma
+
+
+def test_3_channel_diff_beyond_tolerance_is_an_error_naming_the_spread(tmp_path, capsys):
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    diff = np.zeros((48, W, 3), np.uint8)
+    diff[..., 2] = 3                                        # a color diff, spread 3
+    cv2.imwrite(str(diffs / "a.png"), diff)
+    code, _ = run_cli(tmp_path, images, diffs)
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "a.png" in err and "differ by up to 3" in err
+    code, rows = run_cli(tmp_path, images, diffs, "--diff-channel-tol", "3")
+    assert code == 0 and float(rows["a"]["sum_abs_diff_all"]) == 0.0
+
+
+def test_ambiguous_diff_name_split_is_an_error(tmp_path, capsys):
+    images, diffs = make_dirs(tmp_path)
+    for stem in ("cam_1", "cam_1_x", "x_cam_2", "cam_2"):
+        cv2.imwrite(str(images / f"{stem}.png"), step_image())
+    np.save(diffs / "cam_1_x_cam_2_diff_L.npy", band_diff())   # cam_1|x_cam_2 or cam_1_x|cam_2
+    code, rows = run_cli(tmp_path, images, diffs)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert "cam_1_x_cam_2_diff_L" in err and "ambiguous" in err
+
+
+def test_diff_name_with_no_matching_images_is_listed_and_an_error(tmp_path, capsys):
+    images, diffs = diff_name_folder(tmp_path)
+    lost = f"{A}_0115_IMX874_Front_999_diff_L"
+    np.save(diffs / f"{lost}.npy", band_diff())
+    code, rows = run_cli(tmp_path, images, diffs)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert f"splits into no two images: {lost}" in err
+    code, rows = run_cli(tmp_path, images, diffs, "--allow-unpaired")
+    assert code == 0 and set(rows) == {AB, "TOTAL"}
+
+
+def test_mixed_diff_names_are_an_error_unless_a_mode_is_forced(tmp_path, capsys):
+    images, diffs = diff_name_folder(tmp_path)
+    np.save(diffs / f"{A}.npy", band_diff())                   # a same-stem diff too
+    code, _ = run_cli(tmp_path, images, diffs)
+    assert code == 2 and "mixes *_diff_L names" in capsys.readouterr().err
+    code, rows = run_cli(tmp_path, images, diffs, "--pair-same-stem", "--allow-unpaired")
+    assert code == 0 and set(rows) == {A, "TOTAL"}
+
+
+def test_forced_diff_name_pairing_refuses_another_name(tmp_path, capsys):
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff())
+    code, _ = run_cli(tmp_path, images, diffs, "--pair-from-diff-name")
+    assert code == 2 and "does not end in _diff_L" in capsys.readouterr().err

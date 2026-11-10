@@ -7,17 +7,32 @@ pixels of the image, widen them into a band, and sum |diff L| over that band.
 
     python tools/dof_edge_kpi.py --images REF_DIR --diffs DIFF_DIR --out kpi.csv
 
-Pairs are matched by file stem (img_001.png with img_001.npy). One CSV row per
-pair, then a TOTAL row built from the summed counts (never an average of the
-per-image means), which is also printed.
+Pairing, one of two modes:
+  same stem       img_001.png with img_001.npy.
+  from diff name  the diff names both frames: <A>_<B>_diff_L.<ext>, A and B
+                  image stems in --images (they may hold "_": the split used
+                  is the one where both halves are image stems, and none or
+                  several is an error). Edges are found on the reference,
+                  --ref-frame first (A) or second (B, the default for now;
+                  each run prints which). Used when every diff stem ends in
+                  _diff_L, or forced by --pair-from-diff-name.
+One CSV row per pair (named by the diff stem), then a TOTAL row built from the
+summed counts (never an average of the per-image means), which is also printed.
 
 Image formats: .png .jpg .jpeg .tif .tiff, 8 or 16 bit, gray or color.
 Color is reduced to luma with BT.601: Y = 0.299 R + 0.587 G + 0.114 B.
 
 diff L formats (load_diff_raw, the one place to extend):
-  .npy            any real dtype, one channel
-  .png .tif .tiff 8 or 16 bit, one channel
---diff-offset is subtracted from png/tif values first, for a signed diff
+  .npy            any real dtype
+  .png .tif .tiff 8 or 16 bit
+  .jpg .jpeg      8 bit. JPEG is lossy: the diff carries compression noise of
+                  a few levels everywhere. The KPI compares runs on the same
+                  data, so it stays fair, but png is cleaner when available.
+A diff with 3 channels is taken as gray when its channels agree within
+--diff-channel-tol (default 2, for JPEG): channel 0 is used. Otherwise it is an
+error naming the largest channel difference (a colormap needs another rule);
+a color diff is never turned into luma.
+--diff-offset is subtracted from png/tif/jpg values first, for a signed diff
 stored with an offset (e.g. 128); abs() is taken after the offset. A .npy is
 already signed and never gets the offset.
 
@@ -55,8 +70,9 @@ except ImportError:                         # optional "eval" extra
     cv2 = None
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
-DIFF_EXTS = (".npy", ".png", ".tif", ".tiff")
-OFFSET_EXTS = (".png", ".tif", ".tiff")      # integer storage: --diff-offset applies
+DIFF_EXTS = (".npy", ".png", ".tif", ".tiff", ".jpg", ".jpeg")
+OFFSET_EXTS = (".png", ".tif", ".tiff", ".jpg", ".jpeg")   # integer storage: --diff-offset applies
+DIFF_NAME_SUFFIX = "_diff_L"
 BT601 = (0.114, 0.587, 0.299)               # weights for B, G, R (OpenCV order)
 CANNY_LOW_FACTOR, CANNY_HIGH_FACTOR = 0.66, 1.33
 CSV_FIELDS = ("name", "H", "W", "edge_pixels", "edge_fraction",
@@ -95,7 +111,17 @@ def load_luma(path):
     return img.astype(np.float32)
 
 
-def load_diff_raw(path):
+def gray_channel(diff, path, tol):
+    """Channel 0 of an (H, W, C) diff whose channels agree within `tol`."""
+    spread = float((diff.max(axis=2) - diff.min(axis=2)).max())
+    if spread > tol:
+        raise KpiError(f"{path}: diff has {diff.shape[2]} channels that differ by "
+                       f"up to {spread:g} (> --diff-channel-tol {tol:g}); a color "
+                       f"or colormap diff is not supported")
+    return diff[..., 0]
+
+
+def load_diff_raw(path, channel_tol=2.0):
     """diff L values of one file as stored (no offset, no abs), float64.
     Add a new format here."""
     ext = os.path.splitext(path)[1].lower()
@@ -108,8 +134,11 @@ def load_diff_raw(path):
         if diff.dtype not in (np.uint8, np.uint16):
             raise KpiError(f"{path}: diff dtype {diff.dtype}, expected 8 or 16 bit")
     diff = np.squeeze(diff).astype(np.float64)
+    if diff.ndim == 3 and diff.shape[2] <= 4:          # channels last, as imread
+        diff = gray_channel(diff, path, channel_tol)
     if diff.ndim != 2:
-        raise KpiError(f"{path}: diff shape {diff.shape}, expected one channel (H, W)")
+        raise KpiError(f"{path}: diff shape {diff.shape}, expected (H, W) "
+                       f"or (H, W, channels)")
     if not np.all(np.isfinite(diff)):
         raise KpiError(f"{path}: diff holds NaN or inf")
     return diff
@@ -162,10 +191,72 @@ def _stems(folder, exts, label):
     return found
 
 
-def pair_files(images_dir, diffs_dir, allow_unpaired=False):
-    """[(stem, image_path, diff_path)] sorted by stem; unpaired listed."""
+def pair_files(images_dir, diffs_dir, allow_unpaired=False,
+               from_diff_name=None, ref_frame="second"):
+    """[(name, image_path, diff_path)] sorted by name; unpaired listed.
+
+    from_diff_name: True / False forces a mode; None picks diff-name pairing
+    when every diff stem ends in _diff_L."""
     images = _stems(images_dir, IMAGE_EXTS, "images")
     diffs = _stems(diffs_dir, DIFF_EXTS, "diffs")
+    if from_diff_name is None:
+        from_diff_name = use_diff_name_pairing(diffs)
+    if from_diff_name:
+        print(f"pairing: from <A>_<B>{DIFF_NAME_SUFFIX} names, edges on the "
+              f"{ref_frame} frame ({'A' if ref_frame == 'first' else 'B'}, "
+              f"--ref-frame {ref_frame})")
+        pairs = pair_from_diff_name(images, diffs, ref_frame, allow_unpaired)
+    else:
+        pairs = pair_same_stem(images, diffs, allow_unpaired)
+    if not pairs:
+        raise KpiError(f"no (image, diff) pairs in {images_dir} and {diffs_dir}")
+    return pairs
+
+
+def use_diff_name_pairing(diffs):
+    """True when every diff stem ends in _diff_L; a mix is an error."""
+    named = [s for s in diffs if s.endswith(DIFF_NAME_SUFFIX)]
+    if named and len(named) != len(diffs):
+        other = sorted(set(diffs) - set(named))
+        raise KpiError(f"--diffs mixes *{DIFF_NAME_SUFFIX} names with others "
+                       f"({', '.join(other)}); pass --pair-from-diff-name or "
+                       f"--pair-same-stem")
+    return bool(named)
+
+
+def split_diff_name(stem, image_stems):
+    """(A, B) of '<A>_<B>_diff_L' where both are image stems; None if none."""
+    if not stem.endswith(DIFF_NAME_SUFFIX):
+        raise KpiError(f"diff {stem!r}: name does not end in {DIFF_NAME_SUFFIX}")
+    core = stem[:-len(DIFF_NAME_SUFFIX)]
+    splits = [(core[:i], core[i + 1:]) for i, ch in enumerate(core)
+              if ch == "_" and core[:i] in image_stems and core[i + 1:] in image_stems]
+    if len(splits) > 1:
+        raise KpiError(f"diff {stem!r}: ambiguous, several splits name two "
+                       f"images: {', '.join(f'{a} + {b}' for a, b in splits)}")
+    return splits[0] if splits else None
+
+
+def pair_from_diff_name(images, diffs, ref_frame, allow_unpaired):
+    """Pairs each <A>_<B>_diff_L diff with its reference image (A or B)."""
+    pairs, unsplit = [], []
+    for stem in sorted(diffs):
+        split = split_diff_name(stem, images)
+        if split is None:
+            unsplit.append(stem)
+            continue
+        ref = split[0] if ref_frame == "first" else split[1]
+        pairs.append((stem, images[ref], diffs[stem]))
+    for stem in unsplit:
+        print(f"diff whose name splits into no two images: {stem}", file=sys.stderr)
+    if unsplit and not allow_unpaired:
+        raise KpiError(f"{len(unsplit)} diff(s) name no two images in --images "
+                       f"(listed above); pass --allow-unpaired to skip them")
+    return pairs
+
+
+def pair_same_stem(images, diffs, allow_unpaired):
+    """Pairs files of one stem: img_001.png with img_001.npy."""
     no_diff = sorted(set(images) - set(diffs))
     no_image = sorted(set(diffs) - set(images))
     for label, stems in (("image without a diff", no_diff),
@@ -176,10 +267,7 @@ def pair_files(images_dir, diffs_dir, allow_unpaired=False):
         raise KpiError(f"{len(no_diff)} image(s) without a diff and "
                        f"{len(no_image)} diff(s) without an image (listed "
                        f"above); pass --allow-unpaired to skip them")
-    pairs = [(s, images[s], diffs[s]) for s in sorted(set(images) & set(diffs))]
-    if not pairs:
-        raise KpiError(f"no (image, diff) pairs in {images_dir} and {diffs_dir}")
-    return pairs
+    return [(s, images[s], diffs[s]) for s in sorted(set(images) & set(diffs))]
 
 
 # ---------------------------------------------------------------- edges
@@ -272,7 +360,7 @@ def total_row(rows):
 
 def measure_pair(stem, image_path, diff_path, args, raw_range):
     luma = load_luma(image_path)
-    raw = load_diff_raw(diff_path)
+    raw = load_diff_raw(diff_path, args.diff_channel_tol)
     raw_range.update(raw)
     if luma.shape != raw.shape:
         raise KpiError(f"{stem}: image {os.path.basename(image_path)} is "
@@ -307,8 +395,22 @@ def build_parser():
     ap.add_argument("--out", required=True, help="CSV to write")
     ap.add_argument("--allow-unpaired", action="store_true",
                     help="skip (still list) files with no partner instead of failing")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--pair-from-diff-name", dest="from_diff_name",
+                      action="store_const", const=True, default=None,
+                      help="pair by <A>_<B>_diff_L names (default when every "
+                           "diff stem ends in _diff_L)")
+    mode.add_argument("--pair-same-stem", dest="from_diff_name",
+                      action="store_const", const=False,
+                      help="pair files of one stem (default otherwise)")
+    ap.add_argument("--ref-frame", choices=("first", "second"), default="second",
+                    help="diff-name pairing: which of A, B is the reference "
+                         "image the edges are found on (default second)")
+    ap.add_argument("--diff-channel-tol", type=float, default=2.0,
+                    help="a 3-channel diff is gray if its channels differ by "
+                         "at most this (default 2, JPEG noise)")
     ap.add_argument("--diff-offset", type=float, default=None,
-                    help="subtracted from png/tif diff values before abs "
+                    help="subtracted from png/tif/jpg diff values before abs "
                          "(signed diff stored with an offset, e.g. 128 or "
                          "32768); default none. The run prints the stored "
                          "min/max/median to tell which one a file is")
@@ -343,6 +445,8 @@ def check_args(ap, args):
         ap.error("--sobel-percentile must be in [0, 100)")
     if args.dilate < 0:
         ap.error("--dilate must be >= 0")
+    if args.diff_channel_tol < 0:
+        ap.error("--diff-channel-tol must be >= 0")
 
 
 def format_total(row):
@@ -357,7 +461,8 @@ def format_total(row):
 def run(args):
     if cv2 is None:
         raise KpiError("OpenCV is missing: pip install opencv-python-headless")
-    pairs = pair_files(args.images, args.diffs, args.allow_unpaired)
+    pairs = pair_files(args.images, args.diffs, args.allow_unpaired,
+                       args.from_diff_name, args.ref_frame)
     if args.save_masks:
         os.makedirs(args.save_masks, exist_ok=True)
     raw_range = RawRange()
