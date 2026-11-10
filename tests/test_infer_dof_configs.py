@@ -27,9 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-for p in (os.path.join(_ROOT, "configs"), _ROOT, os.path.dirname(_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+sys.path.insert(0, os.path.join(_ROOT, "configs"))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, "/Users/avrahamraviv/PycharmProjects")
+sys.path.insert(0, "/home/avrahamra/PycharmProjects")
 
 from cases import Warp                    # noqa: E402  the float warp spec
 from mx_layers_act import MXActQuant      # noqa: E402
@@ -50,6 +51,14 @@ CONVT_HW = [f"model.block{b}.conv1" for b in (2, 3, 4)]               # dense
 CONVT_PLAIN = [f"model.block{b}.convtranspose_2" for b in (2, 3)]     # grouped
 WARP = "model.warp"
 WARP_SITES = 2
+# The warp operands as arch set them (2026-10-08): ref plain int8 with a
+# calibrated static scale, grid Q8.8 signed 16-bit.
+WARP_REF = {"total_bits": 8, "signed": True, "calibrate": True,
+            "round": "half_away", "saturate": True}
+WARP_GRID = {"total_bits": 16, "frac_bits": 8, "signed": True,
+             "round": "half_away", "saturate": True}
+# Where the README says the warp and convT entries come from.
+SOURCE = os.path.join(_ROOT, "configs", "mx_config_dof_run_win_cal_convT.json")
 
 # Config -> (parent, convT on, warp on, 4-bit SE register on): README.md.
 EXPECTED = {
@@ -172,10 +181,22 @@ def test_folder_holds_exactly_the_documented_configs():
         assert f"`{name}.json`" in readme, f"{name}.json is not in README.md"
 
 
+def _name(entry):
+    return entry if isinstance(entry, str) else entry["name"]
+
+
+def _source_entries(names):
+    """The `layers` entries for `names`, as the source config holds them."""
+    with open(SOURCE) as f:
+        src = json.load(f)
+    by_name = {_name(l): l for l in src["layers"]}
+    return src, [by_name[n] for n in names]
+
+
 def _without(cfg, layers=(), xblock=(), top=()):
     c = copy.deepcopy(cfg)
     c["layers"] = [l for l in c["layers"]
-                   if (l if isinstance(l, str) else l["name"]) not in layers]
+                   if _name(l) not in layers]
     for k in xblock:
         del c["mx_specs"]["xblock_accum"][k]
     for k in top:
@@ -198,13 +219,22 @@ def test_config_is_its_parent_plus_the_named_change(name):
         assert xb["convT"] == "hw"
         rm_layers += CONVT_HW + CONVT_PLAIN
     if warp and not p_warp:
-        entry = next(l for l in cfg["layers"]
-                     if isinstance(l, dict) and l["name"] == WARP)
-        assert entry["kind"] == "act_quant" and entry["call_sites"] == WARP_SITES
-        assert cfg["calibrate_act_scales"]["enabled"] is True
         rm_layers.append(WARP)
         rm_top.append("calibrate_act_scales")
     assert _without(cfg, rm_layers, rm_xblock, rm_top) == par
+
+    # What was added is the source's entries, key for key.
+    added = [l for l in cfg["layers"] if _name(l) in rm_layers]
+    assert sorted(map(_name, added)) == sorted(rm_layers)
+    src, expected = _source_entries(rm_layers)
+    for got, want in zip(sorted(added, key=_name), sorted(expected, key=_name)):
+        assert got == want, f"{name}: {_name(got)} differs from {SOURCE}"
+    if warp and not p_warp:
+        assert cfg["calibrate_act_scales"] == src["calibrate_act_scales"]
+        entry = next(l for l in added if _name(l) == WARP)
+        assert entry["kind"] == "act_quant" and entry["call_sites"] == WARP_SITES
+        assert [i["fxp"] for i in entry["inputs"]] == [WARP_REF, WARP_GRID]
+        assert "output" not in entry      # README: the warp output stays float
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
