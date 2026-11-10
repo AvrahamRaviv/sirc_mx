@@ -590,8 +590,10 @@ it); the rest of the suite does not need it.
   used is the one where both halves are stems in `--images`; none or several is an
   error naming the file. Otherwise pairs by file stem (`img_001.png` with
   `img_001.npy`). `--pair-from-diff-name` / `--pair-same-stem` force a mode.
-  An unpaired file (a diff with no images, or an image no diff names) is listed
-  and is an error unless `--allow-unpaired`. An empty folder is an error.
+  An unpaired file is listed and is an error unless `--allow-unpaired`; in
+  diff-name pairing that is a diff whose A or B frame is missing, while frames no
+  diff names (a dataset folder always holds some) are only a note: their count and
+  first names, in the run summary. An empty folder is an error.
 - Images: png/bmp/jpg/tif, 8 or 16 bit. One channel is used as is; color is
   reduced to BT.601 luma (the same weights as torchvision `rgb_to_grayscale`).
 - diff L: `.npy`, 8/16-bit png/tif, or 8-bit jpg. A 3-channel diff whose channels

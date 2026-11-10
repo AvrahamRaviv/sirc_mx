@@ -19,9 +19,11 @@ Pairing, one of two modes:
                   several is an error). Edges are found on the reference,
                   --ref-frame first (A, the default: DOF infer's im0, from
                   its save code and measured 2026-11-10) or second (B); each
-                  run prints which. An image no diff names is listed and is
-                  an error unless --allow-unpaired. Used when every diff stem
-                  ends in _diff_L, or forced by --pair-from-diff-name.
+                  run prints which. A diff whose A or B frame is missing is
+                  an error (unless --allow-unpaired); frames no diff names
+                  are only a note (a dataset folder always has some). Used
+                  when every diff stem ends in _diff_L, or forced by
+                  --pair-from-diff-name.
 One CSV row per pair (named by the diff stem), then a TOTAL row built from the
 summed counts (never an average of the per-image means), which is also printed.
 
@@ -80,6 +82,7 @@ IMAGE_EXTS = (".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff")
 DIFF_EXTS = (".npy", ".png", ".tif", ".tiff", ".jpg", ".jpeg")
 OFFSET_EXTS = (".png", ".tif", ".tiff", ".jpg", ".jpeg")   # integer storage: --diff-offset applies
 DIFF_NAME_SUFFIX = "_diff_L"
+NOTE_NAMES_SHOWN = 5            # frames no diff names: how many the note lists
 DIFF_CHANNEL_TOL = 2.0          # JPEG writes a gray diff as 3 channels, +-1 or 2 apart
 BT601 = (0.114, 0.587, 0.299)               # weights for B, G, R (OpenCV order)
 CANNY_LOW_FACTOR, CANNY_HIGH_FACTOR = 0.66, 1.33
@@ -203,7 +206,8 @@ def _stems(folder, exts, label):
 
 def pair_files(images_dir, diffs_dir, allow_unpaired=False,
                from_diff_name=None, ref_frame="first"):
-    """[(name, image_path, diff_path)] sorted by name; unpaired listed.
+    """([(name, image_path, diff_path)] sorted by name, [note lines]).
+    Unpaired files are listed.
 
     from_diff_name: True / False forces a mode; None picks diff-name pairing
     when every diff stem ends in _diff_L."""
@@ -215,12 +219,22 @@ def pair_files(images_dir, diffs_dir, allow_unpaired=False,
         print(f"pairing: from <A>_<B>{DIFF_NAME_SUFFIX} names, edges on the "
               f"{ref_frame} frame ({'A' if ref_frame == 'first' else 'B'}, "
               f"--ref-frame {ref_frame})")
-        pairs = pair_from_diff_name(images, diffs, ref_frame, allow_unpaired)
+        pairs, unnamed = pair_from_diff_name(images, diffs, ref_frame,
+                                             allow_unpaired)
+        notes = [unnamed_note(unnamed)] if unnamed else []
     else:
-        pairs = pair_same_stem(images, diffs, allow_unpaired)
+        pairs, notes = pair_same_stem(images, diffs, allow_unpaired), []
     if not pairs:
         raise KpiError(f"no (image, diff) pairs in {images_dir} and {diffs_dir}")
-    return pairs
+    return pairs, notes
+
+
+def unnamed_note(stems):
+    """The note for frames no diff names: their count and the first few."""
+    shown = ", ".join(stems[:NOTE_NAMES_SHOWN])
+    more = ", ..." if len(stems) > NOTE_NAMES_SHOWN else ""
+    return (f"note: {len(stems)} frame(s) in --images named by no diff, "
+            f"not measured: {shown}{more}")
 
 
 def use_diff_name_pairing(diffs):
@@ -248,8 +262,9 @@ def split_diff_name(stem, image_stems):
 
 
 def pair_from_diff_name(images, diffs, ref_frame, allow_unpaired):
-    """Pairs each <A>_<B>_diff_L diff with its reference image (A or B).
-    A diff naming no two images, or an image no diff names, is listed."""
+    """(pairs, frames no diff names). A diff naming no two images is listed
+    and is an error unless allow_unpaired; a frame no diff names is not an
+    error: a dataset folder always holds some (a sequence's ends)."""
     pairs, unsplit, named = [], [], set()
     for stem in sorted(diffs):
         split = split_diff_name(stem, images)
@@ -259,16 +274,12 @@ def pair_from_diff_name(images, diffs, ref_frame, allow_unpaired):
         named.update(split)
         ref = split[0] if ref_frame == "first" else split[1]
         pairs.append((stem, images[ref], diffs[stem]))
-    unnamed = sorted(set(images) - named)
-    for label, stems in (("diff whose name splits into no two images", unsplit),
-                         ("image no diff names", unnamed)):
-        for stem in stems:
-            print(f"{label}: {stem}", file=sys.stderr)
-    if (unsplit or unnamed) and not allow_unpaired:
-        raise KpiError(f"{len(unsplit)} diff(s) name no two images and "
-                       f"{len(unnamed)} image(s) are named by no diff (listed "
-                       f"above); pass --allow-unpaired to skip them")
-    return pairs
+    for stem in unsplit:
+        print(f"diff whose name splits into no two images: {stem}", file=sys.stderr)
+    if unsplit and not allow_unpaired:
+        raise KpiError(f"{len(unsplit)} diff(s) name no two images in --images "
+                       f"(listed above); pass --allow-unpaired to skip them")
+    return pairs, sorted(set(images) - named)
 
 
 def pair_same_stem(images, diffs, allow_unpaired):
@@ -480,8 +491,8 @@ def format_total(row):
 def run(args):
     if cv2 is None:
         raise KpiError("OpenCV is missing: pip install opencv-python-headless")
-    pairs = pair_files(args.images, args.diffs, args.allow_unpaired,
-                       args.from_diff_name, args.ref_frame)
+    pairs, notes = pair_files(args.images, args.diffs, args.allow_unpaired,
+                              args.from_diff_name, args.ref_frame)
     if args.save_masks:
         os.makedirs(args.save_masks, exist_ok=True)
     raw_range = RawRange()
@@ -494,6 +505,8 @@ def run(args):
     total = total_row(rows)
     write_csv(args.out, rows + [total])
     print(f"{len(rows)} pairs -> {args.out}")
+    for note in notes:
+        print(note)
     print(raw_range.line(args.diff_offset))
     print(format_total(total))
     return total

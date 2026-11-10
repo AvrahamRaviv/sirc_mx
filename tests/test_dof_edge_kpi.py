@@ -176,7 +176,8 @@ def test_pairs_by_stem_across_extensions(tmp_path):
     np.save(diffs / "img_001.npy", band_diff())
     cv2.imwrite(str(images / "img_002.tif"), step_image())
     cv2.imwrite(str(diffs / "img_002.png"), np.zeros((48, W), np.uint8))
-    pairs = K.pair_files(str(images), str(diffs))
+    pairs, notes = K.pair_files(str(images), str(diffs))
+    assert notes == []
     assert [(s, os.path.basename(i), os.path.basename(d)) for s, i, d in pairs] == [
         ("img_001", "img_001.png", "img_001.npy"),
         ("img_002", "img_002.tif", "img_002.png")]
@@ -324,18 +325,21 @@ def test_diff_name_default_reference_is_first_and_said(tmp_path, capsys):
     assert "edges on the first frame (A, --ref-frame first)" in capsys.readouterr().out
 
 
-def test_image_no_diff_names_is_listed_and_an_error(tmp_path, capsys):
-    # Frames 141, 142, 143 and only the 142_141 diff: 143 is in no diff.
+def test_frames_no_diff_names_are_a_note_not_an_error(tmp_path, capsys):
+    # A dataset folder: frames 141..149, only the 142_141 diff. 143..149 (7
+    # frames) are in no diff: a note with the count and the first 5, exit 0.
     images, diffs = diff_name_folder(tmp_path)
-    lone = "0115_IMX874_Front_143"
-    cv2.imwrite(str(images / f"{lone}.png"), step_image())
-    code, rows = run_cli(tmp_path, images, diffs)
-    err = capsys.readouterr().err
-    assert code == 2 and rows is None
-    assert f"image no diff names: {lone}" in err
-    code, rows = run_cli(tmp_path, images, diffs, "--allow-unpaired")
+    lone = [f"0115_IMX874_Front_{f}" for f in range(143, 150)]
+    for stem in lone:
+        cv2.imwrite(str(images / f"{stem}.png"), step_image())
+    code, rows = run_cli(tmp_path, images, diffs, "--dilate", "2")
+    out = capsys.readouterr().out
     assert code == 0 and set(rows) == {AB, "TOTAL"}
-    assert f"image no diff names: {lone}" in capsys.readouterr().err
+    assert int(rows["TOTAL"]["edge_pixels"]) == 240            # 142 only
+    assert (f"note: 7 frame(s) in --images named by no diff, not measured: "
+            f"{', '.join(lone[:5])}, ...") in out
+    summary = out[out.index("1 pairs ->"):]                    # the run summary
+    assert "note: 7 frame(s)" in summary and "TOTAL |" in summary
 
 
 def test_bmp_frames_and_y8_png_frames_pair_by_their_real_names(tmp_path):
