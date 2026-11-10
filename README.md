@@ -559,6 +559,45 @@ Set to `false` to disable.
 
 ---
 
+## DOF edge KPI (`tools/dof_edge_kpi.py`)
+
+Quality of DOF under quantization, by the DOF owner's method: diff L is the luma
+difference between the warped target and the reference (written by the DOF
+owner's tool). Errors near edges are the most motion-sensitive and suffer most
+from quantization, so the KPI finds the edge pixels of each reference frame,
+widens them into a band, and sums |diff L| over it.
+
+```bash
+pip install opencv-python-headless        # or: pip install .[eval]
+python tools/dof_edge_kpi.py --images REF_DIR --diffs DIFF_DIR --out kpi.csv
+```
+
+- Pairs by file stem (`img_001.png` with `img_001.npy`); an unpaired file is listed
+  and is an error unless `--allow-unpaired`. An empty folder is an error.
+- Images: png/jpg/tif, 8 or 16 bit, gray or color (BT.601 luma).
+- diff L: `.npy`, or 8/16-bit single-channel png/tif. `--diff-offset` is subtracted
+  from png/tif values before abs, for a signed diff stored with an offset (never
+  from a `.npy`, already signed). To tell which a png is, run once
+  and read the printed `diff L as stored: min, max, median` line: a plain |diff| has
+  min 0 and a median near 0; a signed diff with an offset has its median near the
+  offset (128 for 8 bit, 32768 for 16 bit) with values on both sides: rerun with
+  `--diff-offset 128` (or `32768`).
+- Edges: `--detector canny` (default; Gaussian blur `--sigma` 1.0, thresholds 0.66 /
+  1.33 x the median per image, or fixed `--canny-low/--canny-high`), or `sobel`
+  (gradient magnitude above `--sobel-percentile`, default 90) as a cross-check.
+  `--dilate N` (default 1) widens each edge by N px. `--save-masks DIR` writes the
+  masks as png to check by eye.
+- CSV: one row per pair (`name, H, W, edge_pixels, edge_fraction,
+  sum_abs_diff_on_edges, mean_abs_diff_on_edges, sum_abs_diff_all,
+  ratio_edge_to_all`), then a TOTAL row from the summed counts (means recomputed,
+  never averaged). A frame with no edge pixels has mean `nan` and still counts.
+- Decision: OpenCV (`opencv-python-headless`, optional `eval` extra) for the edges
+  and the image IO: the mainstream library, one dependency for both. Rejected:
+  scikit-image, a second large dependency for the same job. The library does not
+  import it.
+
+---
+
 ## Single-op simulator (`configs/`)
 
 Each NPE op (conv, convT, warp) runs alone through the MX lib (ALG) and the
