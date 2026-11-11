@@ -46,7 +46,8 @@ frame, and the same band is used for every measure. Each row adds:
   diff_kind  signed, or abs when a file of the pair is a plain |diff| (no
            offset): qerr_* is then not that difference and only delta_* is
            meaningful; the run warns. TOTAL: signed, abs or mixed.
---diff-offset-float is the float run's offset (default: --diff-offset). The
+--diff-offset-float is the float run's offset (default: --diff-offset;
+"none" for a plain |diff| float run against a signed quant one). The
 two files of a pair must have one shape, and one stored dtype when both are
 .npy or both are images (8 vs 16 bit is an error; npy vs png is allowed).
 
@@ -110,6 +111,8 @@ NOTE_NAMES_SHOWN = 5            # frames no diff names: how many the note lists
 DIFF_CHANNEL_TOL = 2.0          # JPEG writes a gray diff as 3 channels, +-1 or 2 apart
 BT601 = (0.114, 0.587, 0.299)               # weights for B, G, R (OpenCV order)
 CANNY_LOW_FACTOR, CANNY_HIGH_FACTOR = 0.66, 1.33
+# --diff-offset-float not given: a sentinel, as None already means "none".
+SAME_AS_DIFF_OFFSET = object()
 MASK_FIELDS = ("name", "H", "W", "edge_pixels", "edge_fraction")
 # The measures of one |diff| on the band; float_/delta_/qerr_ prefix them.
 DIFF_FIELDS = ("sum_abs_diff_on_edges", "mean_abs_diff_on_edges",
@@ -164,11 +167,6 @@ def gray_channel(diff, path, tol):
 class StoredDiff(NamedTuple):
     values: np.ndarray      # (H, W) float64, as stored: no offset, no abs
     dtype: np.dtype         # the file's own dtype, before float64
-
-
-def load_diff_raw(path, channel_tol=DIFF_CHANNEL_TOL):
-    """diff L values of one file as stored (no offset, no abs), float64."""
-    return read_diff(path, channel_tol).values
 
 
 def read_diff(path, channel_tol=DIFF_CHANNEL_TOL):
@@ -275,9 +273,10 @@ def pair_files(images_dir, diffs_dir, allow_unpaired=False,
     if from_diff_name is None:
         from_diff_name = use_diff_name_pairing(diffs, diffs_label)
     if from_diff_name:
-        print(f"pairing{where}: from <A>_<B>{DIFF_NAME_SUFFIX} names, edges on the "
-              f"{ref_frame} frame ({'A' if ref_frame == 'first' else 'B'}, "
-              f"--ref-frame {ref_frame})")
+        # Edges are found on --diffs' pairs only: the float run's line says the mode.
+        edges = ("" if where else f", edges on the {ref_frame} frame "
+                 f"({'A' if ref_frame == 'first' else 'B'}, --ref-frame {ref_frame})")
+        print(f"pairing{where}: from <A>_<B>{DIFF_NAME_SUFFIX} names{edges}")
         pairs, unnamed = pair_from_diff_name(images, diffs, ref_frame,
                                              allow_unpaired, where)
         notes = [unnamed_note(unnamed)] if unnamed else []
@@ -573,6 +572,11 @@ def write_csv(path, rows, fields=CSV_FIELDS):
 
 # ---------------------------------------------------------------- CLI
 
+def offset_arg(text):
+    """An offset flag's value: a number, or 'none' for no offset."""
+    return None if text.lower() == "none" else float(text)
+
+
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
@@ -608,9 +612,10 @@ def build_parser():
                     help="folder of the FLOAT run's diff L files, same pairs: "
                          "adds float_*, delta_* (quant - float) and qerr_* "
                          "(|dq - df|) columns; --diffs is the quant run")
-    ap.add_argument("--diff-offset-float", type=float, default=None,
-                    help="--diffs-float's offset, as --diff-offset (default: "
-                         "the value of --diff-offset)")
+    ap.add_argument("--diff-offset-float", type=offset_arg, default=SAME_AS_DIFF_OFFSET,
+                    help="--diffs-float's offset, as --diff-offset, or 'none' "
+                         "for a plain |diff| float run (default: the value of "
+                         "--diff-offset)")
     ap.add_argument("--detector", choices=("canny", "sobel"), default="canny",
                     help="edge detector (default canny)")
     ap.add_argument("--sigma", type=float, default=1.0,
@@ -644,13 +649,15 @@ def check_args(ap, args):
         ap.error("--dilate must be >= 0")
     if args.diff_channel_tol < 0:
         ap.error("--diff-channel-tol must be >= 0")
-    if args.diffs_float is None and args.diff_offset_float is not None:
+    if args.diffs_float is None and args.diff_offset_float is not SAME_AS_DIFF_OFFSET:
         ap.error("--diff-offset-float needs --diffs-float")
 
 
 def float_offset(args):
-    """--diff-offset-float, or --diff-offset when it is not given."""
-    return args.diff_offset if args.diff_offset_float is None else args.diff_offset_float
+    """--diff-offset-float (None: no offset), or --diff-offset when not given."""
+    if args.diff_offset_float is SAME_AS_DIFF_OFFSET:
+        return args.diff_offset
+    return args.diff_offset_float
 
 
 def format_measures(row, prefix=""):

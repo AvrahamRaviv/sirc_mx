@@ -376,7 +376,7 @@ def test_jpg_diff_with_equal_channels_is_read_as_gray(tmp_path):
     cv2.imwrite(str(images / f"{B}.png"), step_image())
     # A constant JPEG decodes exactly, so the sum is known: 7 per pixel.
     cv2.imwrite(str(diffs / f"{AB}.jpg"), np.full((48, W, 3), 7, np.uint8))
-    raw = K.load_diff_raw(str(diffs / f"{AB}.jpg"))
+    raw = K.read_diff(str(diffs / f"{AB}.jpg")).values
     assert raw.shape == (48, W)
     code, rows = run_cli(tmp_path, images, diffs)
     assert code == 0
@@ -398,7 +398,7 @@ def test_diff_of_one_row_or_column_is_kept(tmp_path):
     for shape in ((1, W), (48, 1), (1, W, 1)):
         path = tmp_path / "d.npy"
         np.save(path, np.ones(shape))
-        assert K.load_diff_raw(str(path)).shape == shape[:2]
+        assert K.read_diff(str(path)).values.shape == shape[:2]
 
 
 def test_3_channel_diff_within_tolerance_takes_channel_0(tmp_path):
@@ -407,7 +407,7 @@ def test_3_channel_diff_within_tolerance_takes_channel_0(tmp_path):
     diff[..., 1] = 12                                       # +2: JPEG-like noise
     diff[..., 2] = 9
     cv2.imwrite(str(path), diff)
-    raw = K.load_diff_raw(str(path), channel_tol=3)
+    raw = K.read_diff(str(path), channel_tol=3).values
     assert np.array_equal(raw, np.full((8, 8), 10.0))       # channel 0 (B), not luma
 
 
@@ -792,7 +792,7 @@ def test_compare_pairs_real_diff_names_and_says_the_float_pairing(tmp_path, caps
     assert code == 0 and set(rows) == {AB, "TOTAL"}
     assert f(rows[AB], "qerr_sum_abs_diff_on_edges") == 2 * 4 * 48
     assert "pairing: from <A>_<B>_diff_L names" in out
-    assert "pairing in --diffs-float: from <A>_<B>_diff_L names" in out
+    assert "pairing in --diffs-float: from <A>_<B>_diff_L names\n" in out   # its edges: none
 
 
 def test_runs_of_another_shape_are_an_error_naming_the_pair(tmp_path, capsys):
@@ -859,7 +859,10 @@ def test_compare_row_and_total_by_hand():
     assert row["diff_kind"] == "signed"
     other = K.compare_row("q", np.ones((2, 2), bool), run_diff([[1, 1], [1, 1]], signed=False),
                           run_diff([[0, 0], [0, 0]]))
-    assert other["diff_kind"] == "abs"
+    assert other["diff_kind"] == "abs"                          # quant plain
+    float_plain = K.compare_row("r", mask, run_diff([[1, 1], [1, 1]]),
+                                run_diff([[0, 0], [0, 0]], signed=False))
+    assert float_plain["diff_kind"] == "abs"                    # float plain
     total = K.compare_total_row([row, other])
     assert total["edge_pixels"] == 2 + 4
     assert total["qerr_sum_abs_diff_on_edges"] == 6 + 4
@@ -867,3 +870,34 @@ def test_compare_row_and_total_by_hand():
     assert total["float_mean_abs_diff_on_edges"] == 2 / 6
     assert total["delta_mean_abs_diff_on_edges"] == (6 + 4) / 6 - 2 / 6
     assert total["diff_kind"] == "mixed"
+
+
+def test_compare_image_of_another_size_than_both_diffs_is_a_named_error(tmp_path, capsys):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())                 # 48x64
+    np.save(diffs / "a.npy", np.zeros((40, W), np.float32))
+    np.save(floats / "a.npy", np.zeros((40, W), np.float32))
+    code, rows = run_compare(tmp_path, images, diffs, floats)
+    assert code == 2 and rows is None
+    assert "error: a: image a.png is 48x64 but diff a.npy is 40x64" in capsys.readouterr().err
+
+
+def test_diff_offset_float_none_reads_a_plain_float_run_against_a_signed_quant(tmp_path,
+                                                                             capsys):
+    # The reviewer's case: quant png signed with offset 128 (+3 on the band),
+    # float png a plain |diff| (1 on the band). With none the float run gets no
+    # offset: its KPI is the stored 1, diff_kind abs, and the run warns.
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    offset_png(diffs / "a.png", 128, 3)
+    cv2.imwrite(str(floats / "a.png"), band_diff(value=1.0).astype(np.uint8))
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2",
+                             "--diff-offset", "128", "--diff-offset-float", "none")
+    out = capsys.readouterr()
+    assert code == 0
+    r = rows["a"]
+    assert f(r, "sum_abs_diff_all") == 3 * 4 * 48
+    assert f(r, "float_sum_abs_diff_all") == 1 * 4 * 48
+    assert r["diff_kind"] == "abs"
+    assert "warning: 1 of 1 pair(s) hold a plain |diff| file" in out.err
+    assert "| --diff-offset-float none\n" in out.out

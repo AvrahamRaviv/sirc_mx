@@ -638,8 +638,9 @@ it); the rest of the suite does not need it.
   own error cancelled. For a plain |diff| file (the DOF tool's files today),
   `diff_kind` is `abs` and the run warns: `qerr_*` is then not that difference,
   and only `delta_*` means something (TOTAL: `signed`, `abs` or `mixed`).
-  `--diff-offset-float` is the float run's offset (default: `--diff-offset`); a
-  `.npy` never gets one. Formats may differ per folder (png vs npy); a pair whose
+  `--diff-offset-float` is the float run's offset (default: `--diff-offset`), or
+  `none` for a plain |diff| float run against a signed quant one; a `.npy` never
+  gets one. Formats may differ per folder (png vs npy); a pair whose
   two files differ in shape, or in stored dtype when both are images or both
   `.npy` (8 vs 16 bit is another scale), is an error naming the pair.
   The run prints a `float diff L as stored` line and three more TOTAL lines:
