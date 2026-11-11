@@ -901,3 +901,11 @@ def test_diff_offset_float_none_reads_a_plain_float_run_against_a_signed_quant(t
     assert r["diff_kind"] == "abs"
     assert "warning: 1 of 1 pair(s) hold a plain |diff| file" in out.err
     assert "| --diff-offset-float none\n" in out.out
+
+
+def test_a_bad_diff_offset_float_says_what_it_accepts(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        K.main(["--images", str(tmp_path), "--diffs", str(tmp_path), "--diffs-float",
+                str(tmp_path), "--out", str(tmp_path / "o.csv"), "--diff-offset-float", "abc"])
+    assert ("argument --diff-offset-float: expected a number or 'none', got 'abc'"
+            in capsys.readouterr().err)

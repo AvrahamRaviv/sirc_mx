@@ -574,7 +574,13 @@ def write_csv(path, rows, fields=CSV_FIELDS):
 
 def offset_arg(text):
     """An offset flag's value: a number, or 'none' for no offset."""
-    return None if text.lower() == "none" else float(text)
+    if text.lower() == "none":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a number or 'none', got {text!r}") from None
 
 
 def build_parser():
