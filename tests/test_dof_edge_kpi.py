@@ -903,9 +903,23 @@ def test_diff_offset_float_none_reads_a_plain_float_run_against_a_signed_quant(t
     assert "| --diff-offset-float none\n" in out.out
 
 
-def test_a_bad_diff_offset_float_says_what_it_accepts(tmp_path, capsys):
-    with pytest.raises(SystemExit):
+# 1e400 overflows to inf in float(). "=" keeps argparse from reading -inf as a flag.
+@pytest.mark.parametrize("flag", ["--diff-offset", "--diff-offset-float"])
+@pytest.mark.parametrize("value", ["abc", "nan", "NaN", "inf", "-inf", "Infinity", "1e400"])
+def test_a_bad_offset_is_refused_saying_what_it_accepts(tmp_path, capsys, flag, value):
+    with pytest.raises(SystemExit) as refused:
         K.main(["--images", str(tmp_path), "--diffs", str(tmp_path), "--diffs-float",
-                str(tmp_path), "--out", str(tmp_path / "o.csv"), "--diff-offset-float", "abc"])
-    assert ("argument --diff-offset-float: expected a number or 'none', got 'abc'"
+                str(tmp_path), "--out", str(tmp_path / "o.csv"), f"{flag}={value}"])
+    assert refused.value.code == 2
+    assert (f"argument {flag}: expected a finite number or 'none', got {value!r}"
             in capsys.readouterr().err)
+
+
+def test_diff_offset_none_is_no_offset(tmp_path, capsys):
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    cv2.imwrite(str(diffs / "a.png"), np.full((48, W), 7, np.uint8))
+    code, rows = run_cli(tmp_path, images, diffs, "--diff-offset", "None")
+    assert code == 0
+    assert float(rows["a"]["sum_abs_diff_all"]) == 7 * 48 * W
+    assert "| --diff-offset none\n" in capsys.readouterr().out

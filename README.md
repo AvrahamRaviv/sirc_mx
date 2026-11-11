@@ -609,7 +609,10 @@ it); the rest of the suite does not need it.
   and read the printed `diff L as stored: min, max, median` line: a plain |diff| has
   min 0 and a median near 0; a signed diff with an offset has its median near the
   offset (128 for 8 bit, 32768 for 16 bit) with values on both sides: rerun with
-  `--diff-offset 128` (or `32768`).
+  `--diff-offset 128` (or `32768`). `--diff-offset` and `--diff-offset-float` take
+  the same values: a finite number, or `none` (no offset; `--diff-offset`'s
+  default). Text, `nan` or `inf` is refused with a named error (exit 2): a nan or
+  inf offset would make every diff value nan or inf.
 - Edges: `--detector canny` (default; Gaussian blur `--sigma` 1.0, thresholds 0.66 /
   1.33 x the median per image, or fixed `--canny-low/--canny-high`), or `sobel`
   (gradient magnitude above `--sobel-percentile`, default 90) as a cross-check.

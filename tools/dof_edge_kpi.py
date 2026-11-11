@@ -67,7 +67,8 @@ error naming the largest channel difference (a colormap needs another rule);
 a color diff is never turned into luma.
 --diff-offset is subtracted from png/tif/jpg values first, for a signed diff
 stored with an offset (e.g. 128); abs() is taken after the offset. A .npy is
-already signed and never gets the offset.
+already signed and never gets the offset. Both offset flags take a finite
+number or "none" (no offset; --diff-offset's default); nan and inf are refused.
 
 Plain |diff| png or signed with an offset? Each run prints the stored values'
 min, max and median. A plain |diff| has min 0 and a median near 0. A signed
@@ -573,14 +574,22 @@ def write_csv(path, rows, fields=CSV_FIELDS):
 # ---------------------------------------------------------------- CLI
 
 def offset_arg(text):
-    """An offset flag's value: a number, or 'none' for no offset."""
+    """An offset flag's value: a finite number, or 'none' for no offset.
+
+    float() also reads 'nan' and 'inf'; an offset of either turns every diff
+    value into nan or inf, so the KPI would read nan as if it were measured.
+    """
     if text.lower() == "none":
         return None
+    refused = argparse.ArgumentTypeError(
+        f"expected a finite number or 'none', got {text!r}")
     try:
-        return float(text)
+        value = float(text)
     except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"expected a number or 'none', got {text!r}") from None
+        raise refused from None
+    if not math.isfinite(value):
+        raise refused
+    return value
 
 
 def build_parser():
@@ -609,10 +618,10 @@ def build_parser():
     ap.add_argument("--diff-channel-tol", type=float, default=DIFF_CHANNEL_TOL,
                     help="a 3-channel diff is gray if its channels differ by "
                          "at most this (default %(default)g, JPEG noise)")
-    ap.add_argument("--diff-offset", type=float, default=None,
+    ap.add_argument("--diff-offset", type=offset_arg, default=None,
                     help="subtracted from png/tif/jpg diff values before abs "
                          "(signed diff stored with an offset, e.g. 128 or "
-                         "32768); default none. The run prints the stored "
+                         "32768), or 'none'; default none. The run prints the stored "
                          "min/max/median to tell which one a file is")
     ap.add_argument("--diffs-float", default=None,
                     help="folder of the FLOAT run's diff L files, same pairs: "
