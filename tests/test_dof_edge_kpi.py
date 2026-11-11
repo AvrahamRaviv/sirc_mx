@@ -508,3 +508,362 @@ def test_canny_uses_the_l2_gradient():
     assert l2 < l1
     high = (l2 + l1) / 2
     assert not K.canny_mask(luma, 0, low=high, high=high).any()
+
+
+# ---------------------------------------------- no --diffs-float: unchanged
+# The output of e026830 (the tool before --diffs-float), run on these two
+# folders and pasted here: CSV bytes, stdout (the CSV path as <OUT>), stderr.
+PIN_HEADER = ("name,H,W,edge_pixels,edge_fraction,sum_abs_diff_on_edges,"
+              "mean_abs_diff_on_edges,sum_abs_diff_all,ratio_edge_to_all\r\n")
+PIN = {
+    "diff_name": (
+        PIN_HEADER
+        + f"{B}_{A}_diff_L,48,64,0,0.0,0.0,nan,21504.0,0.0\r\n"
+        + f"{AB},48,64,240,0.078125,576.0,2.4,576.0,1.0\r\n"
+        + "TOTAL,,,240,0.0390625,576.0,2.4,22080.0,0.02608695652173913\r\n",
+        "pairing: from <A>_<B>_diff_L names, edges on the first frame (A, --ref-frame first)\n"
+        "2 pairs -> <OUT>\n"
+        "note: 1 frame(s) in --images named by no diff, not measured: 0115_IMX874_Front_143\n"
+        "diff L as stored: min 0, max 7, median of per-file medians 3.5 | --diff-offset none\n"
+        "TOTAL | edge_pixels 240 (3.9062%) | sum |dL| on edges 576 | mean on edges 2.4 "
+        "| sum |dL| all 22080 | edge/all 0.0261\n",
+        f"note: {B}_{A}_diff_L: no edge pixels, its mean is NaN\n"),
+    "same_stem_offset": (
+        PIN_HEADER
+        + "a,48,64,384,0.125,768.0,2.0,2112.0,0.36363636363636365\r\n"
+        + "b,24,64,192,0.125,144.0,0.75,144.0,1.0\r\n"
+        + "TOTAL,,,576,0.125,912.0,1.5833333333333333,2256.0,0.40425531914893614\r\n",
+        "2 pairs -> <OUT>\n"
+        "diff L as stored: min -1.5, max 131, median of per-file medians 64 | --diff-offset 128\n"
+        "TOTAL | edge_pixels 576 (12.5000%) | sum |dL| on edges 912 | mean on edges 1.58333 "
+        "| sum |dL| all 2256 | edge/all 0.4043\n",
+        ""),
+}
+
+
+def pin_folder(tmp_path, scenario):
+    images, diffs = make_dirs(tmp_path)
+    if scenario == "diff_name":
+        cv2.imwrite(str(images / f"{A}.png"), step_image())
+        cv2.imwrite(str(images / f"{B}.png"), np.full((48, W), 90, np.uint8))
+        cv2.imwrite(str(images / "0115_IMX874_Front_143.png"), step_image())
+        np.save(diffs / f"{AB}.npy", band_diff())
+        cv2.imwrite(str(diffs / f"{B}_{A}_diff_L.png"), np.full((48, W, 3), 7, np.uint8))
+        return images, diffs, ["--dilate", "2"]
+    cv2.imwrite(str(images / "a.png"), step_image())
+    cv2.imwrite(str(images / "b.png"), step_image(24))
+    stored = np.full((48, W), 128, np.uint8)
+    stored[:, 30:32], stored[:, 32:34], stored[:, :4] = 123, 131, 121
+    cv2.imwrite(str(diffs / "a.png"), stored)
+    np.save(diffs / "b.npy", band_diff(24, -1.5))
+    return images, diffs, ["--detector", "sobel", "--diff-offset", "128"]
+
+
+@pytest.mark.parametrize("scenario", sorted(PIN))
+def test_without_diffs_float_the_output_is_byte_identical_to_e026830(tmp_path, capsys,
+                                                                   scenario):
+    images, diffs, extra = pin_folder(tmp_path, scenario)
+    capsys.readouterr()
+    code, _ = run_cli(tmp_path, images, diffs, *extra)
+    out = capsys.readouterr()
+    csv_text, stdout, stderr = PIN[scenario]
+    assert code == 0
+    assert (tmp_path / "kpi.csv").read_bytes() == csv_text.encode()
+    assert out.out.replace(str(tmp_path / "kpi.csv"), "<OUT>") == stdout
+    assert out.err == stderr
+
+
+# ---------------------------------------------- --diffs-float: float vs quant
+COMPARE_HEADER = [
+    "name", "H", "W", "edge_pixels", "edge_fraction",
+    "sum_abs_diff_on_edges", "mean_abs_diff_on_edges", "sum_abs_diff_all", "ratio_edge_to_all",
+    "float_sum_abs_diff_on_edges", "float_mean_abs_diff_on_edges",
+    "float_sum_abs_diff_all", "float_ratio_edge_to_all",
+    "delta_sum_abs_diff_on_edges", "delta_mean_abs_diff_on_edges",
+    "delta_sum_abs_diff_all", "delta_ratio_edge_to_all",
+    "qerr_sum_abs_diff_on_edges", "qerr_mean_abs_diff_on_edges",
+    "qerr_sum_abs_diff_all", "qerr_ratio_edge_to_all",
+    "diff_kind"]
+
+
+def compare_dirs(tmp_path):
+    images, diffs = make_dirs(tmp_path)
+    floats = tmp_path / "floats"
+    floats.mkdir()
+    return images, diffs, floats
+
+
+def run_compare(tmp_path, images, diffs, floats, *extra):
+    return run_cli(tmp_path, images, diffs, "--diffs-float", str(floats), *extra)
+
+
+def f(row, field):
+    return float(row[field])
+
+
+def test_compare_csv_has_the_compare_columns_in_order(tmp_path):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff())
+    np.save(floats / "a.npy", band_diff())
+    code, _ = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    assert code == 0
+    with open(tmp_path / "kpi.csv", newline="") as fh:
+        assert next(csv.reader(fh)) == COMPARE_HEADER
+
+
+def test_compare_cancels_the_float_error_the_two_runs_share(tmp_path):
+    # Band (240 px, diff on its 4 inner columns): quant +3, float +1. Away from
+    # edges both runs -2 on columns 0..10: the float model's own error.
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    quant, flt = band_diff(value=3.0), band_diff(value=1.0)
+    quant[:, :11] = flt[:, :11] = -2.0
+    np.save(diffs / "a.npy", quant)
+    np.save(floats / "a.npy", flt)
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    assert code == 0
+    r = rows["a"]
+    assert int(r["edge_pixels"]) == 240
+    assert f(r, "sum_abs_diff_on_edges") == 3 * 4 * 48                  # 576
+    assert f(r, "sum_abs_diff_all") == 576 + 2 * 11 * 48                # 1632
+    assert f(r, "float_sum_abs_diff_on_edges") == 1 * 4 * 48            # 192
+    assert f(r, "float_sum_abs_diff_all") == 192 + 2 * 11 * 48          # 1248
+    assert f(r, "float_mean_abs_diff_on_edges") == pytest.approx(192 / 240)
+    assert f(r, "delta_sum_abs_diff_on_edges") == 576 - 192
+    assert f(r, "delta_mean_abs_diff_on_edges") == pytest.approx((576 - 192) / 240)
+    assert f(r, "delta_sum_abs_diff_all") == 1632 - 1248
+    assert f(r, "qerr_sum_abs_diff_on_edges") == 2 * 4 * 48             # |3 - 1|
+    assert f(r, "qerr_sum_abs_diff_all") == 2 * 4 * 48                  # -2 cancels
+    assert f(r, "qerr_ratio_edge_to_all") == 1.0
+    assert r["diff_kind"] == "signed"
+
+
+def test_qerr_sees_a_sign_flip_the_delta_cannot(tmp_path):
+    # Same size, opposite sign: |dq| and |df| agree, dq - df = 6 on the band.
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff(value=3.0))
+    np.save(floats / "a.npy", band_diff(value=-3.0))
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    assert code == 0
+    assert f(rows["a"], "delta_sum_abs_diff_on_edges") == 0.0
+    assert f(rows["a"], "qerr_sum_abs_diff_on_edges") == 6 * 4 * 48
+
+
+def test_compare_total_is_built_from_summed_counts(tmp_path):
+    # big: 240 edge px, quant 3 float 1; small: 120 edge px, quant 1 float 0.
+    # qerr sums 384 + 96 = 480 over 360 px: mean 4/3, not the average of the
+    # two means (1.6 + 0.8) / 2 = 1.2.
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "big.png"), step_image(48))
+    cv2.imwrite(str(images / "small.png"), step_image(24))
+    np.save(diffs / "big.npy", band_diff(48, 3.0))
+    np.save(floats / "big.npy", band_diff(48, 1.0))
+    np.save(diffs / "small.npy", band_diff(24, 1.0))
+    np.save(floats / "small.npy", band_diff(24, 0.0))
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    assert code == 0
+    t = rows["TOTAL"]
+    assert int(t["edge_pixels"]) == 360
+    assert f(t, "sum_abs_diff_on_edges") == 576 + 96
+    assert f(t, "float_sum_abs_diff_on_edges") == 192 + 0
+    assert f(t, "float_mean_abs_diff_on_edges") == pytest.approx(192 / 360)
+    assert f(t, "delta_sum_abs_diff_on_edges") == 672 - 192
+    assert f(t, "delta_mean_abs_diff_on_edges") == pytest.approx((672 - 192) / 360)
+    assert f(t, "qerr_sum_abs_diff_on_edges") == 384 + 96
+    assert f(t, "qerr_mean_abs_diff_on_edges") == pytest.approx(480 / 360)
+    assert f(t, "qerr_sum_abs_diff_all") == 480
+    assert t["diff_kind"] == "signed"
+
+
+def offset_png(path, offset, band_value, dtype=np.uint8):
+    stored = np.full((48, W), offset, dtype)
+    stored[:, BAND] = offset + band_value
+    cv2.imwrite(str(path), stored)
+
+
+@pytest.mark.parametrize("float_file, extra, float_offset_shown", [
+    ("npy", (), "128"),                                  # npy: never offset
+    ("png128", (), "128"),                               # default: --diff-offset
+    ("png100", ("--diff-offset-float", "100"), "100"),   # its own offset
+])
+def test_each_run_takes_its_own_offset_and_format(tmp_path, capsys, float_file, extra,
+                                                  float_offset_shown):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    offset_png(diffs / "a.png", 128, 3)                  # quant: +3 on the band
+    if float_file == "npy":
+        np.save(floats / "a.npy", band_diff(value=1.0))
+    else:
+        offset_png(floats / "a.png", int(float_file[3:]), 1)   # float: +1
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2",
+                             "--diff-offset", "128", *extra)
+    assert code == 0
+    r = rows["a"]
+    assert f(r, "sum_abs_diff_all") == 3 * 4 * 48
+    assert f(r, "float_sum_abs_diff_all") == 1 * 4 * 48
+    assert f(r, "qerr_sum_abs_diff_all") == 2 * 4 * 48
+    assert r["diff_kind"] == "signed"
+    out = capsys.readouterr().out
+    assert f"| --diff-offset-float {float_offset_shown}\n" in out
+    assert "\nfloat diff L as stored: " in out
+
+
+def test_plain_abs_diffs_are_compared_with_a_warning_and_said_in_the_csv(tmp_path, capsys):
+    # The DOF tool's own files: plain |diff| png, no offset. a: both plain;
+    # b: both .npy (signed). Only delta is the meaningful column for a.
+    images, diffs, floats = compare_dirs(tmp_path)
+    for stem in ("a", "b"):
+        cv2.imwrite(str(images / f"{stem}.png"), step_image())
+    cv2.imwrite(str(diffs / "a.png"), band_diff(value=3.0).astype(np.uint8))
+    cv2.imwrite(str(floats / "a.png"), band_diff(value=1.0).astype(np.uint8))
+    np.save(diffs / "b.npy", band_diff(value=3.0))
+    np.save(floats / "b.npy", band_diff(value=1.0))
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    out = capsys.readouterr()
+    assert code == 0
+    assert rows["a"]["diff_kind"] == "abs" and rows["b"]["diff_kind"] == "signed"
+    assert rows["TOTAL"]["diff_kind"] == "mixed"
+    assert f(rows["a"], "delta_sum_abs_diff_on_edges") == 2 * 4 * 48
+    assert ("warning: 1 of 2 pair(s) hold a plain |diff| file" in out.err
+            and "only the delta_* columns are meaningful" in out.err)
+    assert "\nTOTAL |dq - df| (mixed) | " in out.out
+
+
+def test_all_signed_runs_print_no_abs_warning(tmp_path, capsys):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff(value=3.0))
+    np.save(floats / "a.npy", band_diff(value=1.0))
+    code, _ = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    out = capsys.readouterr()
+    assert code == 0 and "plain |diff|" not in out.err
+    lines = out.out.splitlines()
+    assert lines[-4].startswith("TOTAL | edge_pixels 240")
+    assert lines[-3] == ("TOTAL float | sum |dL| on edges 192 | mean on edges 0.8 "
+                         "| sum |dL| all 192 | edge/all 1.0000")
+    assert lines[-2] == ("TOTAL delta quant - float | sum |dL| on edges 384 | "
+                         "mean on edges 1.6 | sum |dL| all 384 | edge/all 0.0000")
+    assert lines[-1] == ("TOTAL |dq - df| (signed) | sum |dL| on edges 384 | "
+                         "mean on edges 1.6 | sum |dL| all 384 | edge/all 1.0000")
+
+
+def test_a_pair_in_one_run_only_is_an_error_unless_allowed(tmp_path, capsys):
+    images, diffs, floats = compare_dirs(tmp_path)
+    for stem in ("a", "b", "c"):
+        cv2.imwrite(str(images / f"{stem}.png"), step_image())
+        np.save(diffs / f"{stem}.npy", band_diff())
+    np.save(floats / "a.npy", band_diff(value=1.0))
+    np.save(floats / "b.npy", band_diff(value=1.0))
+    # c has no float diff: same-stem pairing of --diffs-float lists it as an
+    # image without a diff there; it is in --diffs only.
+    code, rows = run_compare(tmp_path, images, diffs, floats)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert "image without a diff in --diffs-float: c" in err
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--allow-unpaired")
+    out = capsys.readouterr()
+    assert code == 0 and set(rows) == {"a", "b", "TOTAL"}
+    assert "pair only in --diffs: c" in out.err
+    assert "note: 1 pair(s) in one run only, skipped in both: c" in out.out
+
+
+def test_a_float_pair_missing_from_quant_is_named(tmp_path, capsys):
+    images, diffs = diff_name_folder(tmp_path)
+    floats = tmp_path / "floats"
+    floats.mkdir()
+    np.save(floats / f"{AB}.npy", band_diff(value=1.0))
+    np.save(floats / f"{B}_{A}_diff_L.npy", band_diff(value=1.0))
+    code, rows = run_compare(tmp_path, images, diffs, floats)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert f"pair only in --diffs-float: {B}_{A}_diff_L" in err
+    assert "0 pair(s) only in --diffs and 1 only in --diffs-float" in err
+
+
+def test_compare_pairs_real_diff_names_and_says_the_float_pairing(tmp_path, capsys):
+    images, diffs = diff_name_folder(tmp_path)
+    floats = tmp_path / "floats"
+    floats.mkdir()
+    np.save(floats / f"{AB}.npy", band_diff(value=1.0))
+    code, rows = run_compare(tmp_path, images, diffs, floats, "--dilate", "2")
+    out = capsys.readouterr().out
+    assert code == 0 and set(rows) == {AB, "TOTAL"}
+    assert f(rows[AB], "qerr_sum_abs_diff_on_edges") == 2 * 4 * 48
+    assert "pairing: from <A>_<B>_diff_L names" in out
+    assert "pairing in --diffs-float: from <A>_<B>_diff_L names" in out
+
+
+def test_runs_of_another_shape_are_an_error_naming_the_pair(tmp_path, capsys):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff())
+    np.save(floats / "a.npy", np.zeros((40, W), np.float32))
+    code, rows = run_compare(tmp_path, images, diffs, floats)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert "a: --diffs a.npy is 48x64 but --diffs-float a.npy is 40x64" in err
+
+
+@pytest.mark.parametrize("make_float, message", [
+    (lambda p: cv2.imwrite(str(p / "a.png"), np.zeros((48, W), np.uint16)),
+     "a: --diffs a.png is uint8 but --diffs-float a.png is uint16"),
+    (lambda p: np.save(p / "a.npy", np.zeros((48, W), np.float64)), None),   # npy vs png: fine
+])
+def test_runs_stored_in_two_bit_depths_are_an_error(tmp_path, capsys, make_float, message):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    cv2.imwrite(str(diffs / "a.png"), np.zeros((48, W), np.uint8))
+    make_float(floats)
+    code, _ = run_compare(tmp_path, images, diffs, floats)
+    if message is None:
+        assert code == 0
+    else:
+        assert code == 2 and message in capsys.readouterr().err
+
+
+def test_npy_runs_of_two_dtypes_are_an_error(tmp_path, capsys):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff().astype(np.float32))
+    np.save(floats / "a.npy", band_diff().astype(np.float64))
+    code, _ = run_compare(tmp_path, images, diffs, floats)
+    assert code == 2
+    assert "is float32 but --diffs-float a.npy is float64" in capsys.readouterr().err
+
+
+def test_diff_offset_float_without_diffs_float_is_refused(tmp_path):
+    with pytest.raises(SystemExit):
+        K.main(["--images", str(tmp_path), "--diffs", str(tmp_path),
+                "--out", str(tmp_path / "o.csv"), "--diff-offset-float", "128"])
+
+
+def run_diff(values, signed=True):
+    values = np.array(values, np.float64)
+    return K.RunDiff("x.npy", values, signed, values.dtype, False)
+
+
+def test_compare_row_and_total_by_hand():
+    # Band = the left column. quant [[2, 1], [-4, 0]], float [[1, 1], [1, 3]].
+    mask = np.array([[True, False], [True, False]])
+    row = K.compare_row("p", mask, run_diff([[2, 1], [-4, 0]]), run_diff([[1, 1], [1, 3]]))
+    assert (row["sum_abs_diff_on_edges"], row["sum_abs_diff_all"]) == (6, 7)
+    assert (row["float_sum_abs_diff_on_edges"], row["float_sum_abs_diff_all"]) == (2, 6)
+    assert row["delta_sum_abs_diff_on_edges"] == 6 - 2
+    assert row["delta_mean_abs_diff_on_edges"] == 6 / 2 - 2 / 2
+    # dq - df = [[1, 0], [-5, -3]]: on the band |1| + |-5| = 6, all 9
+    # (|dq| - |df| would give 1 + 3 = 4 there: the sign counts).
+    assert (row["qerr_sum_abs_diff_on_edges"], row["qerr_sum_abs_diff_all"]) == (6, 9)
+    assert row["qerr_ratio_edge_to_all"] == 6 / 9
+    assert row["diff_kind"] == "signed"
+    other = K.compare_row("q", np.ones((2, 2), bool), run_diff([[1, 1], [1, 1]], signed=False),
+                          run_diff([[0, 0], [0, 0]]))
+    assert other["diff_kind"] == "abs"
+    total = K.compare_total_row([row, other])
+    assert total["edge_pixels"] == 2 + 4
+    assert total["qerr_sum_abs_diff_on_edges"] == 6 + 4
+    assert total["qerr_mean_abs_diff_on_edges"] == 10 / 6       # not (3 + 1) / 2
+    assert total["float_mean_abs_diff_on_edges"] == 2 / 6
+    assert total["delta_mean_abs_diff_on_edges"] == (6 + 4) / 6 - 2 / 6
+    assert total["diff_kind"] == "mixed"

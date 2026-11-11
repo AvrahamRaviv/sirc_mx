@@ -619,10 +619,41 @@ it); the rest of the suite does not need it.
   sum_abs_diff_on_edges, mean_abs_diff_on_edges, sum_abs_diff_all,
   ratio_edge_to_all`), then a TOTAL row from the summed counts (means recomputed,
   never averaged). A frame with no edge pixels has mean `nan` and still counts.
+- Float vs quant, opt-in: `--diffs-float FLOAT_DIR` adds the float model's diff L
+  folder (same frames); `--diffs` stays the run under test (quant). Without it, the
+  CSV and the printed lines are exactly as before (a test pins them byte for byte).
+  ```bash
+  python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs QUANT_DIR --diffs-float FLOAT_DIR --out kpi.csv
+  ```
+  Both folders go through the same loader and pairing, and must hold the same pairs:
+  a pair in one run only is listed and is an error, or with `--allow-unpaired` it
+  is skipped in both and counted in a note. Edges are found once per pair on the
+  reference frame, and the same band is used for both runs. Each row adds
+  `float_*` (the float run's KPI on that band), `delta_*` (quant - float of each
+  measure: what quantization adds over float) and `qerr_*` (the KPI of
+  |dq - df|), then `diff_kind`. The TOTAL row builds every column from the summed
+  counts. diff L = warped - reference and the reference is the same in both runs,
+  so for signed diffs (`.npy`, or png/tif/jpg with an offset) dq - df =
+  warped_quant - warped_float: the quantization error alone, with the float model's
+  own error cancelled. For a plain |diff| file (the DOF tool's files today),
+  `diff_kind` is `abs` and the run warns: `qerr_*` is then not that difference,
+  and only `delta_*` means something (TOTAL: `signed`, `abs` or `mixed`).
+  `--diff-offset-float` is the float run's offset (default: `--diff-offset`); a
+  `.npy` never gets one. Formats may differ per folder (png vs npy); a pair whose
+  two files differ in shape, or in stored dtype when both are images or both
+  `.npy` (8 vs 16 bit is another scale), is an error naming the pair.
+  The run prints a `float diff L as stored` line and three more TOTAL lines:
+  `TOTAL float`, `TOTAL delta quant - float` and `TOTAL |dq - df| (<diff_kind>)`.
 - Decision: OpenCV (`opencv-python-headless`, optional `eval` extra) for the edges
   and the image IO: the mainstream library, one dependency for both. Rejected:
   scikit-image, a second large dependency for the same job. The library does not
   import it.
+- Decision (2026-11-11, owner: compare two output folders, backward compatible):
+  float vs quant is a second folder in the same run, measured on one band, with
+  both the delta and |dq - df|. Rejected: running the tool twice and subtracting
+  the CSVs (two bands if the settings differ, and no |dq - df|); delta only (a
+  sign flip or a moved error of the same size cancels in it); |dq - df| only (it
+  is meaningless for the plain |diff| files the DOF tool writes today).
 
 ---
 
