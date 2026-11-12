@@ -1,7 +1,7 @@
 # DOF inference experiments: configs to make HW grids from
 
 One config per experiment. Each makes its static HW grids once, offline; inference then reads them from
-the config and never calibrates. Every change reuses the keys of an existing DOF config, named below.
+the config and never calibrates. Every change reuses the keys of an existing config, named below.
 
 | file | what it changes, from which config | grids written to `mx_config_grids.json` |
 |---|---|---|
@@ -29,12 +29,13 @@ What the closest config does against the NPE HW, owner decisions 2026-11-12.
 
 | item | this config | HW | state |
 |---|---|---|---|
-| mantissa round | `nearest` (lib default; no `mant_round` key) | nearest (HW agreed, 2026-11-12) | already matched |
+| mantissa round | `nearest` (lib default; no `mant_round` key) | nearest (HW agreed 2026-11-02); the HW emulator still truncates (`configs/README.md`), so a bit-exact run against it differs here | already matched |
 | exponent base | static `e_base_a` / `e_base_w` from the grids, 4-bit register (`in_exp_bits: 4`) | static, 4 bits | already matched |
 | exponent register anchor | `in_exp_anchor: "min"` | min non-zero block exponent | fixed here |
 | PLA | `pla: "infer"`, `pla_bias: "bins"`: the activation folded into the PCU multiply, per-bin scale and bias | PCU PLA, bin form | fixed here |
 | bias / output round + static shift | `bias_round: "half_up"`, `out_round: "nearest"`, `out_margin_bits: 1`, `static_shift_bits: 7` | half up, nearest, 7-bit signed static shift | fixed here |
 | first-layer input | `in_mode: "int"`: per-tensor int8, scale `in_scale` in the grids | int8 input, no block exponent | fixed here |
+| first-layer bias | the bias rounds on the lib's first-layer accumulator grid, finer than HW's: bit-exact only without bias; with a bias a per-channel offset up to 2^-16 is left (`configs/README.md`, "HW-exact (M1-M8)") | bias on HW's accumulator grid | left open |
 | warp ref + grid | int8 ref, calibrated scale per call site; Q8.8 grid | int8 ref, Q8.8 grid | already matched |
 | warp output | int8, calibrated arbitrary-real scale per call site | int8 | fixed here |
 | model output | `out_quant` Q8.8 | Q8.8 | fixed here |
