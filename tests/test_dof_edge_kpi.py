@@ -9,6 +9,7 @@ import csv
 import math
 import os
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -1096,31 +1097,52 @@ def test_band_at_a_lower_size_keeps_a_cell_any_frame_pixel_of_which_is_on_it():
     assert np.array_equal(K.band_at(mask, (8, 8)), mask)
 
 
-def test_half_size_flow_and_its_total(tmp_path):
-    # Flow at 1/2: 24 x 32. EPE 5 on cells 15..16 (frame columns 30..33); the
-    # band (5 frame columns in 29..34) covers 3 cells. Two equal pairs: the
-    # TOTAL sums the counts.
+def test_the_total_of_two_different_pairs_is_built_from_summed_counts(tmp_path):
+    # Default flow size, 1/4 of each frame; the band (5 frame columns in
+    # 29..34) is cells 7..8 of each row. AB: frame 48 x 64, flow 12 x 16, band
+    # 24 cells, EPE 5 on all of them (sum 120) and 2 on cells 0..1 (off the
+    # band), float |flow| 1. CD: frame 24 x 64, flow 6 x 16, band 12 cells, EPE
+    # 0.75 on cell 7 only (6 cells, sum 4.5), float |flow| 3.
+    # TOTAL on the band: 124.5 over 36 cells, mean 3.4583 (the average of the
+    # two means, (5 + 0.375) / 2 = 2.6875, is wrong); > 0.5: 30 of 36 (not
+    # (1 + 0.5) / 2); > 1: 24 of 36 (not 0.5); EPE / |flow| = 124.5 / (24 + 36).
     images, diffs, mv, mvf = mv_dirs(tmp_path)
-    cv2.imwrite(str(images / "0115_IMX874_Front_143.png"), step_image())
-    np.save(diffs / f"0115_IMX874_Front_143_{A}_diff_L.npy", band_diff())
-    flt = np.zeros((24, 32, 2))
-    quant = flt.copy()
-    quant[:, 15:17] = (3, 4)
-    for stem in (f"{A}_{B}", f"0115_IMX874_Front_143_{A}"):
+    c, d = "0115_IMX874_Front_150", "0115_IMX874_Front_151"
+    cv2.imwrite(str(images / f"{c}.png"), step_image(24))
+    cv2.imwrite(str(images / f"{d}.png"), np.full((24, W), 90, np.uint8))
+    np.save(diffs / f"{c}_{d}_diff_L.npy", band_diff(24))
+    for stem, h, mag in ((f"{A}_{B}", 12, 1.0), (f"{c}_{d}", 6, 3.0)):
+        flt = np.zeros((h, 16, 2))
+        flt[..., 0] = mag
+        quant = flt.copy()
+        if h == 12:
+            quant[:, 7:9] += (3, 4)                             # EPE 5
+            quant[:, 0:2, 1] += 2                               # EPE 2
+        else:
+            quant[:, 7, 1] += 0.75                              # EPE 0.75
         write_dof(mv / f"{stem}.dof", quant, "float32")
         write_dof(mvf / f"{stem}.dof", flt, "float32")
-    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--dilate", "2", "--mv-dtype",
-                        "float32", "--mv-shape", "24", "32", "--mv-unit-res", "full")
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--dilate", "2",
+                        "--mv-dtype", "float32", "--mv-scale", "1")
     assert code == 0
-    assert int(rows[AB]["mv_edge_pixels"]) == 3 * 24
-    assert f(rows[AB], "mv_epe_sum_on_edges") == 5 * 2 * 24
+    assert int(rows[AB]["mv_edge_pixels"]) == 24
+    assert f(rows[AB], "mv_epe_sum_on_edges") == 120
+    assert int(rows[f"{c}_{d}_diff_L"]["mv_edge_pixels"]) == 12
+    assert f(rows[f"{c}_{d}_diff_L"], "mv_epe_sum_on_edges") == 4.5
     t = rows["TOTAL"]
-    assert t["mv_H"] == "" and int(t["mv_edge_pixels"]) == 2 * 72
-    assert int(t["mv_pixels"]) == 2 * 24 * 32
-    assert f(t, "mv_epe_sum_on_edges") == 2 * 240
-    assert f(t, "mv_epe_mean_on_edges") == 480 / 144
-    assert f(t, "mv_frac_epe_over_1px_on_edges") == 2 * 48 / 144
-    assert math.isnan(f(t, "mv_rel_epe_on_edges"))           # float flow all zero
+    assert t["mv_H"] == "" and t["mv_W"] == ""
+    assert int(t["mv_edge_pixels"]) == 36 and int(t["mv_pixels"]) == 12 * 16 + 6 * 16
+    assert f(t, "mv_epe_sum_on_edges") == 124.5
+    assert f(t, "mv_epe_mean_on_edges") == pytest.approx(124.5 / 36)
+    assert int(t["mv_n_epe_over_0.5px_on_edges"]) == 30
+    assert f(t, "mv_frac_epe_over_0.5px_on_edges") == pytest.approx(30 / 36)
+    assert f(t, "mv_frac_epe_over_1px_on_edges") == pytest.approx(24 / 36)
+    assert f(t, "mv_float_mag_mean_on_edges") == pytest.approx((24 * 1 + 12 * 3) / 36)
+    assert f(t, "mv_rel_epe_on_edges") == pytest.approx(124.5 / 60)
+    assert f(t, "mv_epe_sum_all") == 120 + 2 * 24 + 4.5
+    assert f(t, "mv_epe_mean_all") == pytest.approx(172.5 / 288)
+    assert f(t, "mv_frac_epe_over_1px_all") == pytest.approx(48 / 288)
+    assert f(t, "mv_rel_epe_all") == pytest.approx(172.5 / (192 * 1 + 96 * 3))
 
 
 def test_wrong_size_is_refused_with_the_sizes_that_would_match(tmp_path, capsys):
@@ -1161,13 +1183,15 @@ def test_an_mv_folder_without_dof_files_is_an_error(tmp_path, capsys):
     assert f"--mv: no .dof file in {mv}" in capsys.readouterr().err
 
 
-def test_nan_in_a_flow_is_refused(tmp_path, capsys):
+@pytest.mark.parametrize("dtype, bad", [("float32", np.nan), ("float32", np.inf),
+                                        ("float32", -np.inf), ("float16", np.inf)])
+def test_nan_or_inf_in_a_flow_is_refused(tmp_path, capsys, dtype, bad):
     images, diffs, mv, mvf = mv_dirs(tmp_path)
     flow = np.zeros((12, 16, 2))
-    write_dof(mvf / f"{A}_{B}.dof", flow, "float32")
-    flow[3, 4, 1] = np.nan
-    write_dof(mv / f"{A}_{B}.dof", flow, "float32")
-    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-dtype", "float32")
+    write_dof(mvf / f"{A}_{B}.dof", flow, dtype)
+    flow[3, 4, 1] = bad
+    write_dof(mv / f"{A}_{B}.dof", flow, dtype)
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-dtype", dtype)
     assert code == 2 and rows is None
     assert (f"{A}_{B}.dof: 1 motion vector value(s) are NaN or inf"
             in capsys.readouterr().err)
@@ -1212,6 +1236,23 @@ def test_unmatched_mv_files_and_pairs_are_listed_and_an_error_unless_allowed(tmp
     assert code == 0 and set(rows) == {AB, "TOTAL"}            # skipped in every measure
     assert (f"note: 1 pair(s) without both mv files, skipped: "
             f"0115_IMX874_Front_143_{A}_diff_L") in out
+
+
+def test_stray_mv_files_alone_are_an_error_unless_allowed(tmp_path, capsys):
+    # Every pair has both files; only a stray file and a file of a pair with
+    # no diff are left over: they alone must stop the run.
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flow = np.zeros((12, 16, 2))
+    for folder in (mv, mvf):
+        write_dof(folder / f"{A}_{B}.dof", flow)
+    write_dof(mv / "zzz.dof", flow)
+    write_dof(mv / f"{B}_{A}.dof", flow)
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert "2 mv file(s) match no diff pair and 0 pair(s) miss an mv file" in err
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--allow-unpaired")
+    assert code == 0 and set(rows) == {AB, "TOTAL"}
 
 
 def test_a_name_suffix_is_read_and_printed_and_two_namings_are_refused(tmp_path, capsys):
@@ -1300,11 +1341,29 @@ def test_bad_mv_flags_are_refused(tmp_path, capsys, argv, message):
     assert message in capsys.readouterr().err
 
 
-def test_diffs_and_out_stay_required_without_the_probe(tmp_path, capsys):
+@pytest.mark.parametrize("argv, missing", [
+    ([], "--images, --diffs, --out"),                  # as argparse said before --mv
+    (["--images", "x"], "--diffs, --out"),
+    (["--mv", "x", "--mv-probe"], "--images"),         # the probe needs the frames only
+])
+def test_required_flags_are_named_together(tmp_path, capsys, argv, missing):
     with pytest.raises(SystemExit) as refused:
-        K.main(["--images", str(tmp_path)])
+        K.main(argv)
     assert refused.value.code == 2
-    assert "the following arguments are required: --diffs, --out" in capsys.readouterr().err
+    assert f"the following arguments are required: {missing}\n" in capsys.readouterr().err
+
+
+def test_probe_counts_a_nan_candidate_without_numpy_warnings(tmp_path, capsys):
+    # int16 0x7C01 everywhere: read as float16 every value is a signalling NaN,
+    # whose cast to float64 is what makes numpy warn "invalid value".
+    images, _, mv, _ = mv_dirs(tmp_path)
+    write_dof(mv / f"{A}_{B}.dof", np.full((12, 16, 2), 0x7C01))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        code = K.main(["--images", str(images), "--mv", str(mv), "--mv-probe"])
+    out = capsys.readouterr()
+    assert code == 0 and out.err == ""
+    assert "float16 12x16 header 0: 384 non-finite value(s)" in out.out
 
 
 def test_probe_prints_what_fits_and_writes_nothing(tmp_path, capsys):

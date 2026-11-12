@@ -612,10 +612,11 @@ it); the rest of the suite does not need it.
   `--diff-offset 128` (or `32768`). `--diff-offset` and `--diff-offset-float` take
   the same values: a finite number, or `none` (no offset; `--diff-offset`'s
   default). Text, `nan` or `inf` is refused with a named error (exit 2): a nan or
-  inf offset would make every diff value nan or inf. A value that starts with `-`
-  must be written with `=`: `--diff-offset=<v>` (and `--diff-offset-float=<v>`);
-  argparse reads `--diff-offset -inf` (with a space) as a missing value and
-  refuses it with "expected one argument".
+  inf offset would make every diff value nan or inf. A negative value in a form
+  argparse does not take for a number, such as `-1e2` (or `-inf`, refused anyway),
+  must be written with `=`: `--diff-offset=-1e2` (and `--diff-offset-float=...`);
+  with a space argparse reads it as a flag and refuses it with "expected one
+  argument". `--diff-offset -128` works with a space.
 - Edges: `--detector canny` (default; Gaussian blur `--sigma` 1.0, thresholds 0.66 /
   1.33 x the median per image, or fixed `--canny-low/--canny-high`), or `sobel`
   (gradient magnitude above `--sobel-percentile`, default 90) as a cross-check.

@@ -761,11 +761,14 @@ def mv_data_bytes(shape, dtype):
 
 
 def read_mv_values(path, dtype, header_bytes):
-    """Every value after the header, as float64 (nothing checked yet)."""
+    """Every value after the header, as float64 (nothing checked yet: read_mv
+    refuses NaN/inf by name, the probe counts them, so numpy's own warning on
+    casting one is only noise)."""
     with open(path, "rb") as f:
         f.seek(header_bytes)
         raw = f.read()
-    return np.frombuffer(raw, np.dtype(dtype).newbyteorder("<")).astype(np.float64)
+    with np.errstate(invalid="ignore"):
+        return np.frombuffer(raw, np.dtype(dtype).newbyteorder("<")).astype(np.float64)
 
 
 def to_planes(values, shape, layout):
@@ -1018,11 +1021,12 @@ def int_at_least(minimum):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--images", required=True,
+    ap.add_argument("--images",
                     help="folder of every input frame (both A and B in "
                          "diff-name pairing); edges are found on the "
-                         "reference. Y8 inputs (1 channel) preferred")
-    # Required unless --mv-probe (check_args): the probe reads one mv file only.
+                         "reference. Y8 inputs (1 channel) preferred (required)")
+    # Required, --diffs and --out unless --mv-probe: checked in check_mv_args, so
+    # that a missing set is named as argparse names it, all together.
     ap.add_argument("--diffs", help="folder of diff L files (required)")
     ap.add_argument("--out", help="CSV to write (required)")
     ap.add_argument("--allow-unpaired", action="store_true",
@@ -1149,14 +1153,15 @@ def check_mv_args(ap, args):
     orphans = [f"--{f.replace('_', '-')}" for f in MV_FORMAT_FLAGS if getattr(args, f) is not None]
     orphans += ["--mv-probe"] if args.mv_probe else []
     orphans += ["--mv-float"] if args.mv_float is not None else []
+    required = (("--images", args.images),) + (() if args.mv_probe else (
+        ("--diffs", args.diffs), ("--out", args.out)))
+    missing = [flag for flag, value in required if value is None]
+    if missing:                                   # argparse's own words for it
+        ap.error(f"the following arguments are required: {', '.join(missing)}")
     if args.mv is None and orphans:
         ap.error(f"{orphans[0]} needs --mv")
     if args.mv_probe:
         return
-    missing = [flag for flag, value in (("--diffs", args.diffs), ("--out", args.out))
-               if value is None]
-    if missing:                                   # argparse's own words for it
-        ap.error(f"the following arguments are required: {', '.join(missing)}")
     if args.mv is not None and args.mv_float is None:
         ap.error("--mv needs --mv-float: the endpoint error compares two runs")
 
