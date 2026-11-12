@@ -9,6 +9,9 @@ grouped ConvTranspose2d, the shared warp called at two pyramid levels):
   * quant() with data writes mx_config_grids.json holding a grid for every
     layer of every kind the experiment puts on the HW path, the warp's static
     scales when the warp is on, and the shared-exponent bases with se4;
+    with the HW switches (se4_warp_convT_hw), also the PLA fold, the static
+    shift, the first layer's int input scale, the warp output scale per call
+    site and the model output on the Q8.8 grid;
   * that grids file then loads and runs with no data (inference never
     calibrates).
 The expected layers per config are declared here from configs/infer_dof/
@@ -59,14 +62,27 @@ WARP_GRID = {"total_bits": 16, "frac_bits": 8, "signed": True,
              "round": "half_away", "saturate": True}
 # Where the README says the warp and convT entries come from.
 SOURCE = os.path.join(_ROOT, "configs", "mx_config_dof_run_win_cal_convT.json")
+# Where the README says the HW switches come from: the lib's HW-exact DOF run
+# config, and the warp output from the NPE sim config.
+HW_SOURCE = os.path.join(_ROOT, "configs", "mx_config_dof_run_hw_exact.json")
+NPE_SOURCE = os.path.join(_ROOT, "configs", "mx_config_npe_e4.json")
+HW_XBLOCK = ["pla", "pla_bias", "bias_round", "out_round", "out_margin_bits",
+             "in_exp_anchor", "static_shift_bits"]
+FIRST = "model.feature_pyramid_extractor.convs.0.0.0"   # group input_layer
+PLA_FOLDED = CONVS    # each directly followed by its activation in a Sequential
+PLA_KEYS = ["pla_frac", "pla_m_pos", "pla_m_neg",
+            "pla_bin_bounds", "pla_bin_scales", "pla_bin_biases"]
+OUT_FRAC = 8          # model output Q8.8
 
-# Config -> (parent, convT on, warp on, 4-bit SE register on): README.md.
+# Config -> (parent, convT on, warp on, 4-bit SE register on, HW switches on):
+# README.md.
 EXPECTED = {
-    "base":           (None,  False, False, False),
-    "se4":            ("base", False, False, True),
-    "se4_warp":       ("se4",  False, True,  True),
-    "se4_convT":      ("se4",  True,  False, True),
-    "se4_warp_convT": ("se4",  True,  True,  True),
+    "base":              (None,  False, False, False, False),
+    "se4":               ("base", False, False, True,  False),
+    "se4_warp":          ("se4",  False, True,  True,  False),
+    "se4_convT":         ("se4",  True,  False, True,  False),
+    "se4_warp_convT":    ("se4",  True,  True,  True,  False),
+    "se4_warp_convT_hw": ("se4_warp_convT", True, True, True, True),
 }
 
 
@@ -193,6 +209,60 @@ def _source_entries(names):
     return src, [by_name[n] for n in names]
 
 
+def _entry(cfg, name):
+    return next(l for l in cfg["layers"] if _name(l) == name)
+
+
+def _out_quant_entries(cfg):
+    return [l for l in cfg["layers"]
+            if isinstance(l, dict) and l.get("kind") == "out_quant"]
+
+
+def _without_hw(cfg):
+    """`cfg` with the HW switches taken out: their xblock keys, the
+    input_layer group (the first layer back to a plain name), the warp output
+    and the model out_quant entry."""
+    c = copy.deepcopy(cfg)
+    for k in HW_XBLOCK:
+        del c["mx_specs"]["xblock_accum"][k]
+    del c["groups"]["input_layer"]
+    layers = []
+    for l in c["layers"]:
+        if _name(l) == FIRST:
+            l = FIRST
+        elif _name(l) == WARP:
+            del l["output"]
+        elif l in _out_quant_entries(c):
+            continue
+        layers.append(l)
+    c["layers"] = layers
+    return c
+
+
+def _check_hw_keys_from_their_sources(cfg):
+    """Each HW switch added holds the value of the config it is taken from."""
+    with open(HW_SOURCE) as f:
+        hw = json.load(f)
+    with open(NPE_SOURCE) as f:
+        npe = json.load(f)
+    xb, hxb = cfg["mx_specs"]["xblock_accum"], hw["mx_specs"]["xblock_accum"]
+    assert {k: xb[k] for k in HW_XBLOCK} == {k: hxb[k] for k in HW_XBLOCK}
+    # Owner 2026-11-12: nearest mantissa (HW agreed), overflow left open (clamp).
+    for k in ("mant_round", "overflow", "overflow_saturate"):
+        assert k not in xb, f"{k}: must stay the lib default"
+    # input_layer = this config's global specs + hw_exact's int input keys.
+    want = {k: v for k, v in cfg["mx_specs"].items() if k != "xblock_accum"}
+    hin = hw["groups"]["input_layer"]["xblock_accum"]
+    want["xblock_accum"] = dict(xb, in_mode=hin["in_mode"],
+                                in_int_scale=hin["in_int_scale"])
+    assert want["xblock_accum"]["in_mode"] == "int"
+    assert cfg["groups"]["input_layer"] == want
+    assert _entry(cfg, FIRST) == _entry(hw, FIRST)
+    assert _entry(cfg, WARP)["output"] == _entry(npe, WARP)["output"]
+    assert _out_quant_entries(cfg) == _out_quant_entries(hw)
+    assert _out_quant_entries(cfg)[0]["frac_bits"] == OUT_FRAC
+
+
 def _without(cfg, layers=(), xblock=(), top=()):
     c = copy.deepcopy(cfg)
     c["layers"] = [l for l in c["layers"]
@@ -207,9 +277,12 @@ def _without(cfg, layers=(), xblock=(), top=()):
 @pytest.mark.parametrize("name", [n for n, e in EXPECTED.items() if e[0]])
 def test_config_is_its_parent_plus_the_named_change(name):
     """Remove the named change and the parent is what is left, key for key."""
-    parent, convT, warp, se4 = EXPECTED[name]
+    parent, convT, warp, se4, hw = EXPECTED[name]
     cfg, par = _load(name), _load(parent)
-    p_convT, p_warp, p_se4 = EXPECTED[parent][1:]
+    p_convT, p_warp, p_se4, p_hw = EXPECTED[parent][1:]
+    if hw and not p_hw:
+        _check_hw_keys_from_their_sources(cfg)
+        cfg = _without_hw(cfg)
     xb = cfg["mx_specs"]["xblock_accum"]
     rm_layers, rm_xblock, rm_top = [], [], []
     if se4 and not p_se4:
@@ -239,7 +312,7 @@ def test_config_is_its_parent_plus_the_named_change(name):
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
 def test_quant_writes_grids_for_every_hw_layer_then_infers_from_them(name, tmp_path):
-    _, convT, warp, se4 = EXPECTED[name]
+    _, convT, warp, se4, hw = EXPECTED[name]
     tmp = str(tmp_path)
     model = _quant(_load(name), tmp, _data())
 
@@ -267,6 +340,13 @@ def test_quant_writes_grids_for_every_hw_layer_then_infers_from_them(name, tmp_p
         assert isinstance(g["e_layer_min"], int) and isinstance(g["e_qa_out"], int), n
         has_bases = "e_base_a" in g and "e_base_w" in g
         assert has_bases == se4, f"{name}: {n} shared-exponent bases {g}"
+        assert ("static_shift" in g) == hw, f"{name}: {n} static_shift {g}"
+        folded = hw and n in PLA_FOLDED
+        assert [k for k in PLA_KEYS if k in g] == (PLA_KEYS if folded else []), \
+            f"{name}: {n} PLA grid {sorted(g)}"
+        assert ("in_scale" in g) == (hw and n == FIRST), f"{name}: {n} in_scale"
+    if hw:
+        assert grids[FIRST]["in_scale"] > 0
 
     entry = [l for l in out["layers"] if isinstance(l, dict) and l["name"] == WARP]
     if warp:
@@ -274,6 +354,13 @@ def test_quant_writes_grids_for_every_hw_layer_then_infers_from_them(name, tmp_p
         assert isinstance(ref, list) and len(ref) == WARP_SITES, \
             f"{name}: warp ref scales not written per call site: {ref}"
         assert all(s["scale"] > 0 and "calibrate" not in s for s in ref)
+        if hw:
+            outs = entry[0]["output"]["fxp"]
+            assert isinstance(outs, list) and len(outs) == WARP_SITES, \
+                f"{name}: warp output scales not written per call site: {outs}"
+            assert all(s["scale"] > 0 and "calibrate" not in s for s in outs)
+        else:
+            assert "output" not in entry[0]
     else:
         assert not entry
 
@@ -288,3 +375,8 @@ def test_quant_writes_grids_for_every_hw_layer_then_infers_from_them(name, tmp_p
     with torch.no_grad():
         y = _fwd(q, _data(1)[0])
     assert torch.isfinite(y).all()
+    if hw:
+        assert dict(q.named_modules())[FIRST].in_scale == grids[FIRST]["in_scale"]
+        steps = y * 2 ** OUT_FRAC
+        assert torch.equal(steps, steps.round()), "model output not on Q8.8"
+    assert hasattr(q.model, "_mx_out_quant") == hw
