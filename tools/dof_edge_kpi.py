@@ -1148,8 +1148,8 @@ def check_args(ap, args):
 
 
 def check_mv_args(ap, args):
-    """Every mv flag needs --mv; a run (not the probe) needs --diffs, --out
-    and both mv folders."""
+    """--images is always needed, --diffs and --out unless --mv-probe; every
+    mv flag needs --mv, and a run (not the probe) both mv folders."""
     orphans = [f"--{f.replace('_', '-')}" for f in MV_FORMAT_FLAGS if getattr(args, f) is not None]
     orphans += ["--mv-probe"] if args.mv_probe else []
     orphans += ["--mv-float"] if args.mv_float is not None else []
