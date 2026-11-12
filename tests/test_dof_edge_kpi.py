@@ -1097,6 +1097,23 @@ def test_band_at_a_lower_size_keeps_a_cell_any_frame_pixel_of_which_is_on_it():
     assert np.array_equal(K.band_at(mask, (8, 8)), mask)
 
 
+def test_a_half_size_flow_given_by_mv_shape(tmp_path):
+    # Flow at 1/2: 24 x 32. EPE 5 on cells 15..16 (frame columns 30..33); the
+    # band (5 frame columns in 29..34) covers 3 cells of each row.
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flt = np.zeros((24, 32, 2))
+    quant = flt.copy()
+    quant[:, 15:17] = (3, 4)
+    write_dof(mv / f"{A}_{B}.dof", quant, "float32")
+    write_dof(mvf / f"{A}_{B}.dof", flt, "float32")
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--dilate", "2", "--mv-dtype",
+                        "float32", "--mv-shape", "24", "32", "--mv-unit-res", "full")
+    assert code == 0
+    assert (int(rows[AB]["mv_H"]), int(rows[AB]["mv_W"])) == (24, 32)
+    assert int(rows[AB]["mv_edge_pixels"]) == 3 * 24
+    assert f(rows[AB], "mv_epe_sum_on_edges") == f(rows[AB], "mv_epe_sum_all") == 5 * 2 * 24
+
+
 def test_the_total_of_two_different_pairs_is_built_from_summed_counts(tmp_path):
     # Default flow size, 1/4 of each frame; the band (5 frame columns in
     # 29..34) is cells 7..8 of each row. AB: frame 48 x 64, flow 12 x 16, band
