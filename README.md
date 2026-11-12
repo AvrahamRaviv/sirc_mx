@@ -571,6 +571,17 @@ pixels of the reference frame A, widens them into a band, and sums |diff L| over
 
 ```bash
 pip install opencv-python-headless        # or: pip install '.[eval]'
+python tools/dof_edge_kpi.py --images FRAMES_DIR --quant-out QUANT_OUT --float-out FLOAT_OUT --out kpi.csv
+```
+
+`QUANT_OUT` and `FLOAT_OUT` are the DOF infer output folders of the quant and the
+float run. Each holds `vis_diff/` (the diff L) and `mv/` (the `.dof` motion
+vectors), so `--quant-out` stands for `--diffs QUANT_OUT/vis_diff --mv QUANT_OUT/mv`
+and `--float-out` for `--diffs-float FLOAT_OUT/vis_diff --mv-float FLOAT_OUT/mv`
+(both below). The folders are set once after parsing; everything else runs as
+with those four flags, which still work on their own (one run, one folder):
+
+```bash
 python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs DIFF_DIR --out kpi.csv
 ```
 
@@ -578,6 +589,16 @@ Without OpenCV, `tests/test_dof_edge_kpi.py` is skipped with the reason "OpenCV
 missing: pip install '.[eval]' to run the DOF edge KPI tests" (`pytest -rs` shows
 it); the rest of the suite does not need it.
 
+- Output folders. The run prints the folders used, one line each (`folder
+  --diffs: QUANT_OUT/vis_diff (from --quant-out)`). A root and a flag it sets
+  (`--quant-out` with `--diffs` or `--mv`, `--float-out` with `--diffs-float` or
+  `--mv-float`) are an error, and so is `--float-out` without `--quant-out`; a
+  root without `vis_diff/` is an error naming the full path. `mv/` in both roots
+  is used; in neither, the diff L compare runs alone and the run says motion
+  vectors were skipped; in one only, it is an error naming the root without it.
+  `--quant-out` alone is the single-run KPI on its `vis_diff/` (motion vectors
+  need two runs: the run says they are not used). `--mv-probe` with `--quant-out`
+  probes `QUANT_OUT/mv`. `--out` is still required.
 - `--images` holds every input frame, both A and B; edges are found on Y of the
   reference A. Preferred: the network's Y8 inputs (e.g. `Y8_LME_576x1024_PNG/`,
   one channel, already luma).
@@ -632,6 +653,7 @@ it); the rest of the suite does not need it.
   ```bash
   python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs QUANT_DIR --diffs-float FLOAT_DIR --out kpi.csv
   ```
+  (`--quant-out` / `--float-out` give both folders, and the `mv/` ones, at once.)
   Both folders go through the same loader and pairing, and must hold the same pairs:
   a pair in one run only is listed and is an error, or with `--allow-unpaired` it
   is skipped in both and counted in a note. Edges are found once per pair on the
@@ -655,17 +677,18 @@ it); the rest of the suite does not need it.
 - Motion vectors, opt-in: the most direct measure of what quantization does to
   DOF (no JPEG noise, no warp, no lost sign). DOF infer writes, per run,
   `<output_folder>/` with `flow_pyr/`, `mv/` (the `.dof` files), `vis/`,
-  `vis_diff/` (the diff L) and `vis_flow/`. Give both runs' `mv/` folders:
-  `--mv` (quant) and `--mv-float` (float), always together. First probe one file
-  (reads the first `--mv` file only, prints the sizes that fit and the values of
-  each candidate, writes nothing; no `--diffs`/`--out` needed):
+  `vis_diff/` (the diff L) and `vis_flow/`. `--quant-out` / `--float-out` give
+  both runs' `mv/` folders; one by one they are `--mv` (quant) and `--mv-float`
+  (float), always together. First probe one file (reads the first `--mv` file
+  only, prints the sizes that fit and the values of each candidate, writes
+  nothing; no `--diffs`/`--out` needed):
   ```bash
-  python tools/dof_edge_kpi.py --images FRAMES_DIR --mv QUANT_OUT/mv --mv-probe
-  python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs QUANT_OUT/vis_diff \
-      --mv QUANT_OUT/mv --mv-float FLOAT_OUT/mv --out kpi.csv
+  python tools/dof_edge_kpi.py --images FRAMES_DIR --quant-out QUANT_OUT --mv-probe
+  python tools/dof_edge_kpi.py --images FRAMES_DIR --quant-out QUANT_OUT --float-out FLOAT_OUT --out kpi.csv
   ```
   The probe's `step` is the mean jump between horizontal neighbours: small for a
-  real flow, large when interleaved data is read as planes. Names: `<A>_<B>.dof`
+  real flow, large when interleaved data is read as planes. An int16 candidate's
+  values are also printed divided by `--mv-scale` (256 by default: pixels). Names: `<A>_<B>.dof`
   (measured 2026-11-12: `0001_IMX874_Front_001_0001_IMX874_Front_000.dof`, the
   diff's common name) or `<A>_<B>_<suffix>.dof`, split as the diff names are, so
   each file belongs to the diff pair `<A>_<B>_diff_L` (same-stem pairing:
@@ -681,13 +704,17 @@ it); the rest of the suite does not need it.
   144 x 256 x 2 x int16 for a 576 x 1024 frame, planar):
   `--mv-dtype int16` (little-endian), `--mv-layout 2hw` (one plane, then the
   other; `hw2` = interleaved; EPE does not depend on which plane is u),
-  `--mv-header-bytes 0`, `--mv-shape` 1/4 of the reference frame. Not known yet:
-  the fixed-point scale and the unit. `--mv-scale S` (pixels = value / S, e.g.
-  16 for 4 fraction bits) defaults to 1, i.e. raw units: the run then warns that
-  EPE and the > 0.5 / > 1 thresholds are in raw units, not pixels.
-  `--mv-unit-res quarter|full` (default `quarter`; `quarter` needs a 1/4 flow)
-  names the grid the vectors' pixels are on, and so the EPE's: a label, nothing
-  is rescaled. A NaN or inf value is an error naming the file. Each run prints
+  `--mv-header-bytes 0`, `--mv-shape` 1/4 of the reference frame. The values,
+  in the owner's words (2026-11-12): "16 bit, 8 int 8 fractions", i.e. Q8.8,
+  so `--mv-scale` defaults to 256 (pixels = value / 256); in quarter-size pixels
+  (the 144 x 256 grid they are stored on), so `--mv-unit-res` defaults to
+  `quarter` and the > 0.5 / > 1 px thresholds are quarter-res pixels; plane 0 = x
+  (horizontal), plane 1 = y: assumed ("idk, lets try A"), and EPE does not depend
+  on it (the probe labels its planes x and y as this assumption). Override:
+  `--mv-scale S` (pixels = value / S; `--mv-scale 1` reads raw units, and the run
+  then warns that EPE and the thresholds are not pixels), `--mv-unit-res full`
+  for vectors in frame pixels (a label, nothing is rescaled; `quarter` needs a
+  1/4 flow). A NaN or inf value is an error naming the file. Each run prints
   the flags used (`mv as read: ...`) and two TOTAL lines (`TOTAL mv EPE on_edges`
   and `all`).
   Per pair and in TOTAL (sums and counts summed, means recomputed): EPE =
@@ -720,6 +747,19 @@ it); the rest of the suite does not need it.
   upsampling the flow to the frame (invents vectors the network never output);
   a pixel-unit default scale (the fixed point is not known: raw units, warned,
   plus the unit-free `mv_rel_epe_*`).
+  Follow-up (2026-11-12, owner): the format is Q8.8 in quarter-res pixels, so
+  the default `--mv-scale` is 256 (plane 0 = x, assumed). Rejected: keeping the
+  raw default (the owner gave the format).
+- Decision (2026-11-12, owner: two arguments, the quant and the float output
+  folders, as their diff and mv are under the same root): `--quant-out` /
+  `--float-out` are resolved once, right after parsing, into `--diffs`,
+  `--diffs-float`, `--mv` and `--mv-float`; nothing past that changes, and
+  without them the output is byte-identical to v1.95 (pinned). The subfolder
+  names are DOF infer's, in one place (`RUN_DIFF_SUBDIR`, `RUN_MV_SUBDIR`).
+  Rejected: dropping the four flags (folders outside an infer output would need
+  copying); letting a root and one of its flags both name a folder (which one
+  wins is a guess); a one-sided `mv/` read as "skip" (one run's vectors have
+  nothing to compare with, and a missing folder would pass unseen).
 
 ---
 

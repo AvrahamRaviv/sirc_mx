@@ -5,7 +5,21 @@ written by the DOF owner's tool. Errors near edges are the most sensitive to
 motion and the ones quantization hurts most, so the KPI is: find the edge
 pixels of the image, widen them into a band, and sum |diff L| over that band.
 
+    python tools/dof_edge_kpi.py --images FRAMES_DIR --quant-out QUANT_OUT
+                                 --float-out FLOAT_OUT --out kpi.csv
+
+--quant-out / --float-out are DOF infer output folders: each stands for its
+run's vis_diff/ (--diffs, --diffs-float) and mv/ (--mv, --mv-float), set once
+after parsing; everything else runs as with those flags, each of which also
+works on its own:
+
     python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs DIFF_DIR --out kpi.csv
+
+A root and a flag it sets, given together, are an error, and so is --float-out
+without --quant-out. --quant-out alone is the single-run KPI on its vis_diff/
+(no mv compare: it needs two runs). mv/ in both roots is used, in neither is
+skipped, in one only is an error; --mv-probe with --quant-out probes its mv/.
+The run prints the folders used, one line each.
 
 --images holds every input frame (in diff-name pairing both A and B); edges
 are found on the reference one. Best: the network's Y8 inputs (one channel,
@@ -100,8 +114,9 @@ against the file size exactly; a mismatch prints the sizes that would fit.
 Defaults are DOF infer's files as measured on one (2026-11-12): --mv-dtype
 int16 (little-endian), --mv-layout 2hw (planar: one plane, then the other),
 --mv-header-bytes 0, --mv-shape 1/4 of the reference frame. --mv-scale
-(pixels = value / scale) defaults to 1: raw units, with a warning, since the
-fixed-point scale is not known yet. --mv-unit-res quarter|full names the grid
+(pixels = value / scale) defaults to 256: Q8.8, the owner's word (2026-11-12);
+--mv-scale 1 reads raw units, with a warning. Plane 0 is taken as x (owner,
+assumed; EPE does not depend on it). --mv-unit-res quarter|full names the grid
 the vectors' pixels are on (a label; nothing is rescaled). A flow smaller than
 the frame by an integer k gets the band reduced to it: a cell is on the band
 when any frame pixel of its k x k block is. --mv-probe reads the first --mv
@@ -150,11 +165,18 @@ MV_DTYPES = ("float32", "float16", "int16", "int32", "float64")
 MV_LAYOUTS = ("hw2", "2hw")       # H x W x (u, v) interleaved, or the u plane then v
 MV_RESOLUTIONS = (1, 2, 4, 8)     # frame size divided by these: the sizes a check offers
 MV_DEFAULT_FACTOR = 4             # DOF infer's mv: 1/4 of the frame (owner's probe, 2026-11-12)
+MV_DEFAULT_SCALE = 256.0         # Q8.8 int16: 8 integer, 8 fraction bits (owner, 2026-11-12)
 MV_UNIT_RES = {"quarter": 4, "full": 1}   # the grid the vectors' pixels are on: its factor
 MV_HEADER_HINT = 4096             # a size this much above the data is offered as a header
 MV_EPE_THRESHOLDS = (0.5, 1.0)    # px: the fraction of pixels with EPE above each
 FLO_MAGIC = b"PIEH"               # Middlebury .flo: float 202021.25, then int32 W, H
 MV_REGIONS = {"on_edges": "mv_edge_pixels", "all": "mv_pixels"}   # region: its pixel count
+
+# A DOF infer output folder (--quant-out, --float-out): the subfolders the KPI reads.
+RUN_DIFF_SUBDIR = "vis_diff"      # the diff L files
+RUN_MV_SUBDIR = "mv"              # the .dof files
+# (root, its diff L folder, its mv folder): the argparse dests a root stands for.
+RUN_ROOTS = (("quant_out", "diffs", "mv"), ("float_out", "diffs_float", "mv_float"))
 
 
 def mv_over(threshold):
@@ -749,8 +771,7 @@ class MvFormat(NamedTuple):
     dtype: str              # one of MV_DTYPES, little-endian
     layout: str             # one of MV_LAYOUTS
     header_bytes: int       # skipped at the start of the file
-    scale: float            # pixels = stored value / scale
-    scale_given: bool       # False: scale 1, the values are raw units
+    scale: float            # pixels = stored value / scale; 1: raw units
     shape: tuple            # (H, W) of the flow, or None: frame / MV_DEFAULT_FACTOR
     unit_res: str           # the grid of the vectors' pixels: a MV_UNIT_RES key
 
@@ -878,9 +899,11 @@ def plane_stats(plane):
             f"{float(np.median(finite)):.6g} step {step.mean() if step.size else math.nan:.6g}")
 
 
-def probe_lines(path, frame_shape, header_bytes):
+def probe_lines(path, frame_shape, header_bytes, scale=MV_DEFAULT_SCALE):
     """The --mv-probe report of one file: the size table, then the values
-    (as stored, before --mv-scale) of each candidate whose size fits."""
+    (as stored, before --mv-scale) of each candidate whose size fits, and an
+    int16 candidate's also divided by `scale` (pixels, when scale is not 1).
+    Plane 0 is labelled x: the owner's assumption (2026-11-12)."""
     size = os.path.getsize(path)
     lines = [f"mv probe: {path}, {size} bytes",
              *mv_size_table(path, size, frame_shape, header_bytes)]
@@ -895,8 +918,13 @@ def probe_lines(path, frame_shape, header_bytes):
                      f"{bad} non-finite value(s), as stored (before --mv-scale)")
         for layout in MV_LAYOUTS:
             flow = to_planes(values, c.shape, layout)
-            lines.append(f"  {layout}: u {plane_stats(flow[..., 0])} | "
-                         f"v {plane_stats(flow[..., 1])}")
+            lines.append(f"  {layout}: x {plane_stats(flow[..., 0])} | "
+                         f"y {plane_stats(flow[..., 1])}")
+            if c.dtype == "int16" and scale != 1:
+                lines.append(f"  {layout} / {scale:g} (px): x {plane_stats(flow[..., 0] / scale)}"
+                             f" | y {plane_stats(flow[..., 1] / scale)}")
+    lines.append("x = plane 0 (or channel 0 in hw2), y = plane 1: assumed (owner, "
+                 "2026-11-12); EPE does not depend on it")
     lines.append("probe only: nothing measured, nothing written. The right "
                  "candidate has plausible pixel values and the smaller step.")
     return lines
@@ -1076,8 +1104,23 @@ def build_parser():
                     help="widen edges by N pixels each side, 0 = the line only (default 1)")
     ap.add_argument("--save-masks", default=None,
                     help="folder to write each edge mask as <stem>.png (0/255)")
+    add_run_root_args(ap)
     add_mv_args(ap)
     return ap
+
+
+def add_run_root_args(ap):
+    """The DOF infer output folders: each stands for its run's two folder flags."""
+    roots = ap.add_argument_group(
+        f"DOF infer output folders (each holds {RUN_DIFF_SUBDIR}/ and {RUN_MV_SUBDIR}/)")
+    roots.add_argument("--quant-out", default=None,
+                       help=f"the QUANT run's output folder: --diffs is its "
+                            f"{RUN_DIFF_SUBDIR}/, --mv its {RUN_MV_SUBDIR}/ (used with "
+                            f"--float-out, or probed by --mv-probe)")
+    roots.add_argument("--float-out", default=None,
+                       help=f"the FLOAT run's output folder (needs --quant-out): "
+                            f"--diffs-float is its {RUN_DIFF_SUBDIR}/, --mv-float its "
+                            f"{RUN_MV_SUBDIR}/")
 
 
 def add_mv_args(ap):
@@ -1101,8 +1144,8 @@ def add_mv_args(ap):
     mv.add_argument("--mv-header-bytes", type=int_at_least(0), default=None,
                     help="bytes skipped at the start of each file (default 0)")
     mv.add_argument("--mv-scale", type=scale_arg, default=None,
-                    help="pixels = stored value / this, e.g. 16 for 4 fraction "
-                         "bits of fixed point (default 1: raw units, with a warning)")
+                    help="pixels = stored value / this (default 256: Q8.8, owner "
+                         "2026-11-12; 1 = raw units, with a warning)")
     mv.add_argument("--mv-shape", type=int_at_least(1), nargs=2, metavar=("H", "W"),
                     default=None,
                     help="flow size (default: 1/4 of the reference frame); the "
@@ -1120,13 +1163,78 @@ MV_FORMAT_FLAGS = ("mv_dtype", "mv_layout", "mv_header_bytes", "mv_scale", "mv_s
 def mv_format(args):
     """The MvFormat of the --mv-* flags, defaults filled in: DOF infer's
     files as the owner's probe measured them (2026-11-12): int16, planar,
-    no header, 1/4 of the frame. Scale and unit are not known: raw, quarter."""
+    no header, 1/4 of the frame; Q8.8 (scale 256) in quarter-res pixels (owner)."""
     return MvFormat(args.mv_dtype or "int16", args.mv_layout or "2hw",
                     args.mv_header_bytes or 0,
-                    1.0 if args.mv_scale is None else args.mv_scale,
-                    args.mv_scale is not None,
+                    MV_DEFAULT_SCALE if args.mv_scale is None else args.mv_scale,
                     tuple(args.mv_shape) if args.mv_shape else None,
                     args.mv_unit_res or "quarter")
+
+
+def flag_name(dest):
+    """The command-line flag of an argparse dest: diffs_float -> --diffs-float."""
+    return "--" + dest.replace("_", "-")
+
+
+def resolve_run_roots(ap, args):
+    """--quant-out / --float-out set the folder flags they stand for, in place,
+    once, before every other check: the run then goes exactly as with those
+    flags. Returns the lines that say the folders used (none without a root).
+    A refusal is argparse's: a named error, exit 2."""
+    if args.quant_out is None:
+        if args.float_out is not None:
+            ap.error("--float-out needs --quant-out: the float run is compared with "
+                     "the quant run")
+        return []
+    roots = [names for names in RUN_ROOTS if getattr(args, names[0]) is not None]
+    for root, *dests in roots:
+        given = [flag_name(d) for d in dests if getattr(args, d) is not None]
+        if given:
+            ap.error(f"{flag_name(root)} and {given[0]} name one folder twice: "
+                     f"{flag_name(root)} sets {' and '.join(map(flag_name, dests))}")
+    lines = []
+    if not args.mv_probe:                     # the probe reads the frames and mv/ only
+        for root, diffs_dest, _ in roots:
+            lines.append(use_root_folder(ap, args, root, diffs_dest, RUN_DIFF_SUBDIR))
+    return lines + resolve_root_mv(ap, args, roots)
+
+
+def root_folder(args, root, subdir):
+    """The path of `subdir` in the root folder given as `root` (a dest)."""
+    return os.path.join(getattr(args, root), subdir)
+
+
+def use_root_folder(ap, args, root, dest, subdir):
+    """Set `dest` to the root's `subdir`, refused when it is no folder; the
+    line saying so."""
+    path = root_folder(args, root, subdir)
+    if not os.path.isdir(path):
+        ap.error(f"{flag_name(root)}: {os.path.abspath(path)} is not a folder (a DOF "
+                 f"infer output folder holds {RUN_DIFF_SUBDIR}/ and {RUN_MV_SUBDIR}/)")
+    setattr(args, dest, path)
+    return f"folder {flag_name(dest)}: {path} (from {flag_name(root)})"
+
+
+def resolve_root_mv(ap, args, roots):
+    """The roots' mv/ folders: used when both roots hold one, skipped (said)
+    when neither does, an error naming the root without it otherwise. The
+    probe reads --quant-out's alone; one root alone has no mv compare (said)."""
+    if args.mv_probe:
+        return [use_root_folder(ap, args, "quant_out", "mv", RUN_MV_SUBDIR)]
+    if len(roots) == 1:
+        return [f"note: motion vectors not used: they compare two runs, and "
+                f"--quant-out is the only run (give --float-out)"]
+    present = [os.path.isdir(root_folder(args, root, RUN_MV_SUBDIR)) for root, *_ in roots]
+    if not any(present):
+        return [f"note: no {RUN_MV_SUBDIR}/ folder in --quant-out or --float-out: "
+                f"motion vectors skipped, diff L compared only"]
+    if not all(present):
+        without, other = roots[present.index(False)][0], roots[present.index(True)][0]
+        ap.error(f"{flag_name(without)}: {os.path.abspath(root_folder(args, without, RUN_MV_SUBDIR))}"
+                 f" is not a folder, but {flag_name(other)} holds {RUN_MV_SUBDIR}/: the "
+                 f"motion vectors compare both runs (give both {RUN_MV_SUBDIR}/ or neither)")
+    return [use_root_folder(ap, args, root, mv_dest, RUN_MV_SUBDIR)
+            for root, _, mv_dest in roots]
 
 
 def check_args(ap, args):
@@ -1159,7 +1267,9 @@ def check_mv_args(ap, args):
     if missing:                                   # argparse's own words for it
         ap.error(f"the following arguments are required: {', '.join(missing)}")
     if args.mv is None and orphans:
-        ap.error(f"{orphans[0]} needs --mv")
+        roots = (f" (with --quant-out: {RUN_MV_SUBDIR}/ in both --quant-out and --float-out)"
+                 if args.quant_out is not None else "")
+        ap.error(f"{orphans[0]} needs --mv{roots}")
     if args.mv_probe:
         return
     if args.mv is not None and args.mv_float is None:
@@ -1246,17 +1356,17 @@ def mv_format_line(fmt, suffixes):
 
 
 def mv_scale_warning(fmt):
-    """The warning when --mv-scale is not given, else None."""
-    if fmt.scale_given:
+    """The warning when --mv-scale is 1 (raw units), else None."""
+    if fmt.scale != 1:
         return None
-    return ("warning: no --mv-scale: EPE is in the raw stored units (fixed point?), "
-            "not pixels, so the > 0.5 px and > 1 px columns are not in pixels "
-            "either; mv_rel_epe_* is unit-free. Give --mv-scale (e.g. 2^fraction bits)")
+    return ("warning: --mv-scale 1: EPE is in the raw stored units, not pixels, so "
+            "the > 0.5 px and > 1 px columns are not in pixels either; mv_rel_epe_* "
+            "is unit-free. The default is 256 (Q8.8)")
 
 
 def format_mv_total(row, fmt):
     """The TOTAL lines of the mv measures, one per region."""
-    unit = "px" if fmt.scale_given else "raw units"
+    unit = "raw units" if fmt.scale == 1 else "px"
     lines = []
     for region, pixels in MV_REGIONS.items():
         over = " | ".join(f"> {t:g} {unit} {row[f'{mv_over(t)[1]}_{region}']:.4%}"
@@ -1307,7 +1417,7 @@ def run_probe(args):
         raise KpiError(f"--mv: no {'/'.join(MV_EXTS)} file in {args.mv}")
     stem = sorted(files)[0]
     for line in probe_lines(files[stem], probe_frame_shape(stem, args),
-                            mv_format(args).header_bytes):
+                            mv_format(args).header_bytes, mv_format(args).scale):
         print(line)
 
 
@@ -1346,7 +1456,10 @@ def run(args):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
+    folder_lines = resolve_run_roots(ap, args)
     check_args(ap, args)
+    for line in folder_lines:
+        print(line)
     try:
         run(args)
     except KpiError as e:
