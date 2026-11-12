@@ -1025,8 +1025,8 @@ def build_parser():
                     help="folder of every input frame (both A and B in "
                          "diff-name pairing); edges are found on the "
                          "reference. Y8 inputs (1 channel) preferred (required)")
-    # Required, --diffs and --out unless --mv-probe: checked in check_mv_args, so
-    # that a missing set is named as argparse names it, all together.
+    # --images is always required; --diffs and --out unless --mv-probe: checked in
+    # check_mv_args, so that a missing set is named as argparse names it, all together.
     ap.add_argument("--diffs", help="folder of diff L files (required)")
     ap.add_argument("--out", help="CSV to write (required)")
     ap.add_argument("--allow-unpaired", action="store_true",
