@@ -49,7 +49,7 @@ def make_dirs(tmp_path):
 def run_cli(tmp_path, images, diffs, *extra):
     out = tmp_path / "kpi.csv"
     code = K.main(["--images", str(images), "--diffs", str(diffs),
-                   "--out", str(out), *extra])
+                   "--out", str(out), "--verbose", *extra])
     rows = None
     if out.exists():
         with open(out, newline="") as f:
@@ -1539,7 +1539,7 @@ def run_main(tmp_path, out_name, *argv):
     out = tmp_path / out_name
     stdout, stderr = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        code = K.main([*argv, "--out", str(out)])
+        code = K.main([*argv, "--out", str(out), "--verbose"])
     return (code, out.read_bytes() if out.exists() else None,
             stdout.getvalue().replace(str(out), "<OUT>"), stderr.getvalue())
 
@@ -1662,6 +1662,13 @@ def test_a_root_without_vis_diff_is_an_error_with_the_full_path(tmp_path, capsys
      "--float-out and --mv-float name one folder twice"),
     (["--float-out", "f"], "--float-out needs --quant-out"),
     (["--diffs", "d", "--float-out", "f"], "--float-out needs --quant-out"),
+    (["--quant-out", "q", "--diffs-float", "d"],
+     "--diffs-float with --quant-out: give the float run as --float-out "
+     "(it sets --diffs-float and --mv-float)"),
+    (["--quant-out", "q", "--mv-float", "m"],
+     "--mv-float with --quant-out: give the float run as --float-out"),
+    (["--quant-out", "q", "--float-out", "f", "--mv-probe"],
+     "--mv-probe reads one folder, --quant-out's mv/: drop --float-out"),
 ])
 def test_a_root_and_a_flag_it_sets_or_a_float_root_alone_are_refused(tmp_path, capsys, argv,
                                                                      message):
@@ -1709,3 +1716,120 @@ def test_an_mv_flag_with_roots_and_no_mv_folder_says_where_mv_comes_from(tmp_pat
     assert refused.value.code == 2
     assert ("--mv-scale needs --mv (with --quant-out: mv/ in both --quant-out and --float-out)"
             in capsys.readouterr().err)
+
+
+# ------------------------------------- the screen: the short table (L45, owner 2026-11-12)
+def run_table(tmp_path, out_name, *argv):
+    """K.main without --verbose: (exit code, CSV bytes, stdout, stderr, the
+    summary CSV's rows as (name, value, unit))."""
+    out = tmp_path / out_name
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = K.main([*argv, "--out", str(out)])
+    summary = tmp_path / (out.stem + "_summary.csv")
+    with open(summary, newline="") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["name", "value", "unit"]
+    return code, out.read_bytes(), stdout.getvalue(), stderr.getvalue(), rows[1:], summary
+
+
+def table(title, rows, out, summary):
+    width = max(len(name) for name, _ in [("metric", ""), *rows]) + 2
+    return "".join([f"{title}\n", f"{'metric':<{width}}value\n",
+                    *(f"{name:<{width}}{value}\n" for name, value in rows),
+                    f"details: {out} (per pair), {summary} (all totals)\n"])
+
+
+def test_the_screen_is_the_short_table_of_the_three_headline_values(tmp_path):
+    images = frames(tmp_path)
+    q, fl = both_roots(tmp_path)
+    code, _, stdout, stderr, _, summary = run_table(
+        tmp_path, "kpi.csv", "--images", str(images), "--quant-out", str(q),
+        "--float-out", str(fl), "--dilate", "2")
+    assert code == 0 and stderr == ""
+    # By hand from the definitions on pin_flows (Q8.8): on the band, float |flow| 4
+    # and EPE |(3, 4)| = 5 on every cell: 5 / 4 and all of them over 1 px; diff L on
+    # the same band |3| quant and |-1| float: (3 - 1) / 1.
+    assert stdout == table("DOF KPI  (1 pairs, quant vs float)",
+                           [("motion error / float motion (edges)", "125.00 %"),
+                            ("pixels with motion error > 1 px (edges)", "100.00 %"),
+                            ("added image error vs float (edges)", "+200.00 %")],
+                           tmp_path / "kpi.csv", summary)
+
+
+def test_a_row_whose_input_is_missing_is_left_out(tmp_path):
+    images = frames(tmp_path)
+    q, fl = both_roots(tmp_path, with_mv=False)
+    code, _, stdout, _, _, summary = run_table(
+        tmp_path, "kpi.csv", "--images", str(images), "--quant-out", str(q),
+        "--float-out", str(fl), "--dilate", "2")
+    assert code == 0
+    assert stdout == table("DOF KPI  (1 pairs, quant vs float)",
+                           [("added image error vs float (edges)", "+200.00 %")],
+                           tmp_path / "kpi.csv", summary)
+    # The single run: the band is 5 columns (--dilate 2) x 48 rows, |3| on 4 of them.
+    code, _, stdout, _, _, summary = run_table(
+        tmp_path, "one.csv", "--images", str(images), "--quant-out", str(q), "--dilate", "2")
+    assert code == 0
+    assert stdout == table("DOF KPI  (1 pairs, single run)",
+                           [("mean |diff L| on edges", f"{3 * 4 * 48 / (5 * 48):.6g} L")],
+                           tmp_path / "one.csv", summary)
+
+
+def test_the_summary_csv_holds_every_total_and_the_log_lines_and_verbose_the_old_log(tmp_path):
+    images = frames(tmp_path)
+    q, fl = both_roots(tmp_path)
+    argv = ("--images", str(images), "--quant-out", str(q), "--float-out", str(fl),
+            "--dilate", "2")
+    code, per_pair, _, _, summary_rows, _ = run_table(tmp_path, "kpi.csv", *argv)
+    old = run_main(tmp_path, "kpi.csv", *argv)                      # --verbose
+    assert code == old[0] == 0
+    assert per_pair == old[1]                                        # per-pair CSV unchanged
+    total = list(csv.DictReader(io.StringIO(per_pair.decode())))[-1]
+    assert total["name"] == "TOTAL"
+    values = {name: value for name, value, _ in summary_rows if name != "log"}
+    expected = {k: v for k, v in total.items() if k not in ("name", "H", "W", "mv_H", "mv_W")}
+    assert len(expected) == 39 and values == expected               # 19 diff L + 20 mv
+    units = {name: unit for name, _, unit in summary_rows}
+    assert (units["mv_epe_mean_on_edges"], units["mv_rel_epe_on_edges"],
+            units["edge_pixels"], units["sum_abs_diff_on_edges"]) == (
+        "px (quarter grid)", "fraction", "count", "L")
+    log = [value for name, value, _ in summary_rows if name == "log"]
+    old_lines = old[2].replace("<OUT>", str(tmp_path / "kpi.csv")).splitlines()
+    assert log == [line for line in old_lines if not line.startswith("TOTAL")]
+    assert any(line.startswith("TOTAL") for line in old_lines)
+    assert old[2].startswith(folder_line("--diffs", q, "vis_diff", "--quant-out"))
+
+
+def test_a_plain_diff_warning_is_one_short_line_on_the_screen(tmp_path):
+    images, diffs, floats = compare_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    cv2.imwrite(str(diffs / "a.png"), band_diff(value=3.0).astype(np.uint8))
+    cv2.imwrite(str(floats / "a.png"), band_diff(value=1.0).astype(np.uint8))
+    code, _, stdout, stderr, _, _ = run_table(
+        tmp_path, "kpi.csv", "--images", str(images), "--diffs", str(diffs),
+        "--diffs-float", str(floats), "--dilate", "2")
+    assert code == 0
+    assert stderr == ("warning: 1 of 1 pair(s) hold a plain |diff| file: |dq - df| is "
+                      "not meaningful there (see --verbose)\n")
+    assert stdout.startswith("DOF KPI  (1 pairs, quant vs float)\n")
+
+
+def test_the_motion_rows_count_over_1_px_on_the_band_only(tmp_path):
+    images = frames(tmp_path)
+    flt = np.zeros((12, 16, 2))
+    flt[..., 0] = 4
+    quant = flt.copy()
+    quant[:, 7, 0] += 0.75            # band cell 7: EPE 0.75 (> 0.5 px, not > 1 px)
+    quant[:, 8, 1] += 3               # band cell 8: EPE 3
+    quant[:, 0:2, 1] += 9             # off the band: never counted
+    q = infer_out(tmp_path, "quant_out", 3.0, quant * 256)
+    fl = infer_out(tmp_path, "float_out", -1.0, flt * 256)
+    code, _, stdout, _, _, summary = run_table(
+        tmp_path, "kpi.csv", "--images", str(images), "--quant-out", str(q),
+        "--float-out", str(fl), "--dilate", "2")
+    assert code == 0
+    # By hand: mean EPE on the band (0.75 + 3) / 2 over float |flow| 4; half the band > 1 px.
+    assert stdout.splitlines()[2:4] == [
+        f"{'motion error / float motion (edges)':<41}{100 * (0.75 + 3) / 2 / 4:.2f} %",
+        f"{'pixels with motion error > 1 px (edges)':<41}50.00 %"]

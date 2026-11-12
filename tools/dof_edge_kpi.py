@@ -19,7 +19,11 @@ A root and a flag it sets, given together, are an error, and so is --float-out
 without --quant-out. --quant-out alone is the single-run KPI on its vis_diff/
 (no mv compare: it needs two runs). mv/ in both roots is used, in neither is
 skipped, in one only is an error; --mv-probe with --quant-out probes its mv/.
-The run prints the folders used, one line each.
+The folders used are logged, one line each.
+
+The screen shows a short table of up to three numbers for the whole run (owner,
+2026-11-12); every TOTAL value and the log lines go to <out stem>_summary.csv,
+and --verbose prints the full log instead, as before.
 
 --images holds every input frame (in diff-name pairing both A and B); edges
 are found on the reference one. Best: the network's Y8 inputs (one channel,
@@ -126,7 +130,9 @@ Needs OpenCV: pip install opencv-python-headless (or `pip install '.[eval]'`).
 """
 
 import argparse
+import contextlib
 import csv
+import io
 import math
 import os
 import sys
@@ -899,7 +905,7 @@ def plane_stats(plane):
             f"{float(np.median(finite)):.6g} step {step.mean() if step.size else math.nan:.6g}")
 
 
-def probe_lines(path, frame_shape, header_bytes, scale=MV_DEFAULT_SCALE):
+def probe_lines(path, frame_shape, header_bytes, scale):
     """The --mv-probe report of one file: the size table, then the values
     (as stored, before --mv-scale) of each candidate whose size fits, and an
     int16 candidate's also divided by `scale` (pixels, when scale is not 1).
@@ -1104,6 +1110,9 @@ def build_parser():
                     help="widen edges by N pixels each side, 0 = the line only (default 1)")
     ap.add_argument("--save-masks", default=None,
                     help="folder to write each edge mask as <stem>.png (0/255)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print the full log (folders, formats, every TOTAL line) "
+                         "instead of the short table")
     add_run_root_args(ap)
     add_mv_args(ap)
     return ap
@@ -1192,11 +1201,28 @@ def resolve_run_roots(ap, args):
         if given:
             ap.error(f"{flag_name(root)} and {given[0]} name one folder twice: "
                      f"{flag_name(root)} sets {' and '.join(map(flag_name, dests))}")
+    check_float_root(ap, args)
     lines = []
     if not args.mv_probe:                     # the probe reads the frames and mv/ only
         for root, diffs_dest, _ in roots:
             lines.append(use_root_folder(ap, args, root, diffs_dest, RUN_DIFF_SUBDIR))
     return lines + resolve_root_mv(ap, args, roots)
+
+
+def check_float_root(ap, args):
+    """With --quant-out, the float run is given as --float-out alone: its
+    folder flags would mix the two ways of naming a run, and the probe reads
+    one folder (--quant-out's mv/), so --float-out has no use there."""
+    float_root, *float_dests = RUN_ROOTS[1]
+    if args.float_out is None:
+        given = [flag_name(d) for d in float_dests if getattr(args, d) is not None]
+        if given:
+            ap.error(f"{given[0]} with --quant-out: give the float run as "
+                     f"{flag_name(float_root)} (it sets "
+                     f"{' and '.join(map(flag_name, float_dests))})")
+    elif args.mv_probe:
+        ap.error(f"--mv-probe reads one folder, --quant-out's {RUN_MV_SUBDIR}/: "
+                 f"drop {flag_name(float_root)}")
 
 
 def root_folder(args, root, subdir):
@@ -1302,9 +1328,23 @@ def format_compare_total(row):
             f"TOTAL |dq - df| ({row['diff_kind']}) | {format_measures(row, QERR)}"]
 
 
+def plain_diff_pairs(rows):
+    """How many pairs hold a plain |diff| (diff_kind abs)."""
+    return sum(r["diff_kind"] == "abs" for r in rows)
+
+
+def abs_warning_short(rows):
+    """abs_warning in one short line (the table's screen), else None."""
+    plain = plain_diff_pairs(rows)
+    if not plain:
+        return None
+    return (f"warning: {plain} of {len(rows)} pair(s) hold a plain |diff| file: "
+            f"|dq - df| is not meaningful there (see --verbose)")
+
+
 def abs_warning(rows):
     """The warning when a pair holds a plain |diff|, else None."""
-    plain = sum(r["diff_kind"] == "abs" for r in rows)
+    plain = plain_diff_pairs(rows)
     if not plain:
         return None
     return (f"warning: {plain} of {len(rows)} pair(s) hold a plain |diff| "
@@ -1394,6 +1434,67 @@ def summary_lines(rows, total, notes, ranges, args, mv=None):
     return lines + (format_mv_total(total, mv_format(args)) if mv is not None else [])
 
 
+def headline_rows(total, compare, mv, fmt):
+    """The table's (metric, value) rows: the mv rows with --mv, the diff L row
+    relative to float with --diffs-float, else the single run's mean."""
+    if not compare:
+        return [("mean |diff L| on edges", f"{total['mean_abs_diff_on_edges']:.6g} L")]
+    rows = []
+    if mv is not None:
+        unit = "raw unit" if fmt.scale == 1 else "px"
+        rows += [("motion error / float motion (edges)",
+                  f"{100 * total['mv_rel_epe_on_edges']:.2f} %"),
+                 (f"pixels with motion error > 1 {unit} (edges)",
+                  f"{100 * total[mv_over(1.0)[1] + '_on_edges']:.2f} %")]
+    added = _ratio(total["mean_abs_diff_on_edges"] - total[FLOAT + "mean_abs_diff_on_edges"],
+                   total[FLOAT + "mean_abs_diff_on_edges"])
+    return rows + [("added image error vs float (edges)", f"{100 * added:+.2f} %")]
+
+
+def table_lines(rows, total, args, mv, summary_path):
+    """The short screen log: a title, the aligned headline table, where the
+    details are."""
+    compare = args.diffs_float is not None
+    body = [("metric", "value"), *headline_rows(total, compare, mv, mv_format(args))]
+    width = max(len(name) for name, _ in body) + 2
+    kind = "quant vs float" if compare else "single run"
+    return ([f"DOF KPI  ({len(rows)} pairs, {kind})"]
+            + [f"{name:<{width}}{value}" for name, value in body]
+            + [f"details: {args.out} (per pair), {summary_path} (all totals)"])
+
+
+def summary_csv_path(out):
+    """<out stem>_summary.csv, next to --out."""
+    return os.path.splitext(out)[0] + "_summary.csv"
+
+
+def field_unit(field, fmt):
+    """The unit of a TOTAL field in the summary CSV."""
+    if field.endswith("pixels") or field.startswith("mv_n_"):
+        return "count"
+    if (field.startswith("mv_frac_") or field.startswith("mv_rel_")
+            or field.endswith(("edge_fraction", "ratio_edge_to_all"))):
+        return "fraction"
+    if field.startswith(("mv_epe_", "mv_float_mag_")):
+        return "raw units" if fmt.scale == 1 else f"px ({fmt.unit_res} grid)"
+    if field == "diff_kind":
+        return ""
+    return "L"
+
+
+def write_summary_csv(path, total, fields, log_lines, fmt):
+    """Every TOTAL value (name, value, unit), then the log lines the short
+    screen leaves out (folders, formats, pairing notes) as name "log"."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(("name", "value", "unit"))
+        for field in fields:
+            if field not in ("name", "H", "W", "mv_H", "mv_W"):   # no TOTAL value
+                writer.writerow((field, total[field], field_unit(field, fmt)))
+        for line in log_lines:
+            writer.writerow(("log", line, ""))
+
+
 def probe_frame_shape(stem, args):
     """(H, W) of the reference frame the mv file `stem` names: tried as the
     DOF names <A>_<B>[_<suffix>] unless --pair-same-stem."""
@@ -1421,13 +1522,23 @@ def run_probe(args):
         print(line)
 
 
-def run(args):
+def run(args, folder_lines=()):
     if cv2 is None:
         raise KpiError("OpenCV is missing: pip install opencv-python-headless")
+    if args.mv_probe or args.verbose:             # the probe always says its folder
+        for line in folder_lines:
+            print(line)
     if args.mv_probe:
         return run_probe(args)
     compare = args.diffs_float is not None
-    pairs, notes, mv = pair_runs(args)
+    pairing_out = io.StringIO()               # pair_runs prints the pairing lines: kept for the summary
+    try:
+        with contextlib.redirect_stdout(pairing_out):
+            pairs, notes, mv = pair_runs(args)
+    finally:                                  # --verbose: printed, even before an error
+        pairing_lines = pairing_out.getvalue().splitlines()
+        for line in pairing_lines if args.verbose else ():
+            print(line)
     if args.save_masks:
         os.makedirs(args.save_masks, exist_ok=True)
     ranges = (RawRange(), RawRange("float diff L", "--diff-offset-float"))
@@ -1444,11 +1555,17 @@ def run(args):
         total.update(mv_total(rows))
         fields += MV_FIELDS
     write_csv(args.out, rows + [total], fields)
-    warnings = [abs_warning(rows) if compare else None,
+    log = summary_lines(rows, total, notes, ranges, args, mv)
+    summary_path = summary_csv_path(args.out)
+    write_summary_csv(summary_path, total, fields,
+                      [*folder_lines, *pairing_lines,
+                       *(line for line in log if not line.startswith("TOTAL"))],
+                      mv_format(args))
+    warnings = [(abs_warning if args.verbose else abs_warning_short)(rows) if compare else None,
                 mv_scale_warning(mv_format(args)) if mv else None]
     for warning in filter(None, warnings):
         print(warning, file=sys.stderr)
-    for line in summary_lines(rows, total, notes, ranges, args, mv):
+    for line in log if args.verbose else table_lines(rows, total, args, mv, summary_path):
         print(line)
     return total
 
@@ -1458,10 +1575,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     folder_lines = resolve_run_roots(ap, args)
     check_args(ap, args)
-    for line in folder_lines:
-        print(line)
     try:
-        run(args)
+        run(args, folder_lines)
     except KpiError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

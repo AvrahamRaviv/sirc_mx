@@ -585,6 +585,32 @@ with those four flags, which still work on their own (one run, one folder):
 python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs DIFF_DIR --out kpi.csv
 ```
 
+The screen shows one short table (owner, 2026-11-12: the fewest numbers that
+matter for the whole dataset), and only warnings and errors besides:
+
+```
+DOF KPI  (374 pairs, quant vs float)
+metric                                   value
+motion error / float motion (edges)      2.31 %
+pixels with motion error > 1 px (edges)  0.26 %
+added image error vs float (edges)       +0.10 %
+details: kpi.csv (per pair), kpi_summary.csv (all totals)
+```
+
+- motion error / float motion: the mean EPE over the mean float |flow| on the edge
+  band (`mv_rel_epe_on_edges`), in %.
+- pixels with motion error > 1 px: the share of edge-band flow pixels with EPE > 1 px
+  on the quarter grid (`mv_frac_epe_over_1px_on_edges`), in %.
+- added image error vs float: (mean |diff L| on edges, quant - float) / float, in signed %.
+
+A row whose input is missing is left out: without motion vectors the two motion rows;
+a single run (no float) has one row, `mean |diff L| on edges`. A plain |diff| input
+warns in one short line. Every TOTAL value goes to `<out stem>_summary.csv` next to
+`--out` (one row each: `name,value,unit`), followed by the log lines the screen leaves
+out (folders, pairing, `diff L as stored`, `mv as read`, notes) as rows named `log`;
+the per-pair CSV is as before. `--verbose` prints the full log instead of the table,
+exactly as before: every "prints" below is that log (and the summary CSV's `log` rows).
+
 Without OpenCV, `tests/test_dof_edge_kpi.py` is skipped with the reason "OpenCV
 missing: pip install '.[eval]' to run the DOF edge KPI tests" (`pytest -rs` shows
 it); the rest of the suite does not need it.
@@ -592,13 +618,15 @@ it); the rest of the suite does not need it.
 - Output folders. The run prints the folders used, one line each (`folder
   --diffs: QUANT_OUT/vis_diff (from --quant-out)`). A root and a flag it sets
   (`--quant-out` with `--diffs` or `--mv`, `--float-out` with `--diffs-float` or
-  `--mv-float`) are an error, and so is `--float-out` without `--quant-out`; a
-  root without `vis_diff/` is an error naming the full path. `mv/` in both roots
+  `--mv-float`) are an error, and so is `--float-out` without `--quant-out`, or
+  `--diffs-float` / `--mv-float` with `--quant-out` (give the float run as
+  `--float-out`); a root without `vis_diff/` is an error naming the full path. `mv/` in both roots
   is used; in neither, the diff L compare runs alone and the run says motion
   vectors were skipped; in one only, it is an error naming the root without it.
   `--quant-out` alone is the single-run KPI on its `vis_diff/` (motion vectors
   need two runs: the run says they are not used). `--mv-probe` with `--quant-out`
-  probes `QUANT_OUT/mv`. `--out` is still required.
+  probes `QUANT_OUT/mv`; it reads one folder, so `--float-out` with it is an
+  error. `--out` is still required.
 - `--images` holds every input frame, both A and B; edges are found on Y of the
   reference A. Preferred: the network's Y8 inputs (e.g. `Y8_LME_576x1024_PNG/`,
   one channel, already luma).
