@@ -87,6 +87,26 @@ Edge detectors:
                   second classic detector to cross-check Canny.
 --dilate N widens each edge into a (2N+1)x(2N+1) square band ("near edges").
 
+Motion vectors (opt-in): --mv QUANT_MV_DIR --mv-float FLOAT_MV_DIR, DOF
+infer's <output_folder>/mv/ of each run (.dof files, named <A>_<B>.dof or
+<A>_<B>_<suffix>.dof: the diff's pair, split as the diff names are). Per pair
+and in TOTAL, on the same band and on all pixels: endpoint error
+EPE = sqrt((uq - uf)^2 + (vq - vf)^2), its sum and mean, the fraction of
+pixels with EPE > 0.5 and > 1, the float flow's mean |flow| and the unit-free
+EPE / |flow| (sum over sum). A pair needs both mv files (else an error, or
+with --allow-unpaired skipped in every measure).
+The .dof layout is flags (read_mv, the one place to change it), checked
+against the file size exactly; a mismatch prints the sizes that would fit.
+Defaults are DOF infer's files as measured on one (2026-11-12): --mv-dtype
+int16 (little-endian), --mv-layout 2hw (planar: one plane, then the other),
+--mv-header-bytes 0, --mv-shape 1/4 of the reference frame. --mv-scale
+(pixels = value / scale) defaults to 1: raw units, with a warning, since the
+fixed-point scale is not known yet. --mv-unit-res quarter|full names the grid
+the vectors' pixels are on (a label; nothing is rescaled). A flow smaller than
+the frame by an integer k gets the band reduced to it: a cell is on the band
+when any frame pixel of its k x k block is. --mv-probe reads the first --mv
+file only and prints what fits and its values; it writes nothing.
+
 Needs OpenCV: pip install opencv-python-headless (or `pip install '.[eval]'`).
 """
 
@@ -122,6 +142,43 @@ CSV_FIELDS = MASK_FIELDS + DIFF_FIELDS
 FLOAT, DELTA, QERR = "float_", "delta_", "qerr_"
 COMPARE_FIELDS = (CSV_FIELDS + tuple(p + f for p in (FLOAT, DELTA, QERR)
                                      for f in DIFF_FIELDS) + ("diff_kind",))
+
+# Motion vectors (.dof): the layout is not known here, so every part of it is a
+# flag, checked against the file size. Little-endian, as x86 and ARM write.
+MV_EXTS = (".dof",)
+MV_DTYPES = ("float32", "float16", "int16", "int32", "float64")
+MV_LAYOUTS = ("hw2", "2hw")       # H x W x (u, v) interleaved, or the u plane then v
+MV_RESOLUTIONS = (1, 2, 4, 8)     # frame size divided by these: the sizes a check offers
+MV_DEFAULT_FACTOR = 4             # DOF infer's mv: 1/4 of the frame (owner's probe, 2026-11-12)
+MV_UNIT_RES = {"quarter": 4, "full": 1}   # the grid the vectors' pixels are on: its factor
+MV_HEADER_HINT = 4096             # a size this much above the data is offered as a header
+MV_EPE_THRESHOLDS = (0.5, 1.0)    # px: the fraction of pixels with EPE above each
+FLO_MAGIC = b"PIEH"               # Middlebury .flo: float 202021.25, then int32 W, H
+MV_REGIONS = {"on_edges": "mv_edge_pixels", "all": "mv_pixels"}   # region: its pixel count
+
+
+def mv_over(threshold):
+    """The count and fraction field names of EPE > threshold, per region."""
+    return f"mv_n_epe_over_{threshold:g}px", f"mv_frac_epe_over_{threshold:g}px"
+
+
+def mv_region_fields(region):
+    """The CSV fields of one region: sums and counts, each with its mean."""
+    over = [f"{name}_{region}" for t in MV_EPE_THRESHOLDS for name in mv_over(t)]
+    return (f"mv_epe_sum_{region}", f"mv_epe_mean_{region}", *over,
+            f"mv_float_mag_sum_{region}", f"mv_float_mag_mean_{region}",
+            f"mv_rel_epe_{region}")
+
+
+def mv_region_sums(region):
+    """The fields of mv_region_fields a TOTAL sums (the rest are means of them)."""
+    return (f"mv_epe_sum_{region}", *[f"{mv_over(t)[0]}_{region}" for t in MV_EPE_THRESHOLDS],
+            f"mv_float_mag_sum_{region}")
+
+
+MV_FIELDS = (("mv_H", "mv_W", *MV_REGIONS.values())
+             + tuple(f for region in MV_REGIONS for f in mv_region_fields(region)))
+MV_SUMMED = (*MV_REGIONS.values(), *[f for region in MV_REGIONS for f in mv_region_sums(region)])
 
 
 class KpiError(ValueError):
@@ -259,15 +316,31 @@ def _stems(folder, exts, label):
     return found
 
 
+class Pairing(NamedTuple):
+    """One run's pairs, and what was used to pair them (the mv files pair the same way)."""
+    pairs: list             # [(name, image_path, diff_path)] sorted by name
+    notes: list             # note lines for the run summary
+    images: dict            # {stem: path} of --images
+    from_diff_name: bool    # the mode used: <A>_<B>_diff_L names, or same stem
+
+
 def pair_files(images_dir, diffs_dir, allow_unpaired=False,
                from_diff_name=None, ref_frame="first", diffs_label="diffs"):
-    """([(name, image_path, diff_path)] sorted by name, [note lines]).
+    """([(name, image_path, diff_path)] sorted by name, [note lines]): the
+    pairs and notes of pair_folder."""
+    pairing = pair_folder(_stems(images_dir, IMAGE_EXTS, "images"), images_dir, diffs_dir,
+                          allow_unpaired, from_diff_name, ref_frame, diffs_label)
+    return pairing.pairs, pairing.notes
+
+
+def pair_folder(images, images_dir, diffs_dir, allow_unpaired=False,
+                from_diff_name=None, ref_frame="first", diffs_label="diffs"):
+    """The Pairing of one diff folder with the listed images ({stem: path}).
     Unpaired files are listed.
 
     from_diff_name: True / False forces a mode; None picks diff-name pairing
     when every diff stem ends in _diff_L. diffs_label: the folder's flag
     without its dashes, for messages ("diffs-float" for the float run)."""
-    images = _stems(images_dir, IMAGE_EXTS, "images")
     diffs = _stems(diffs_dir, DIFF_EXTS, diffs_label)
     # The quant run's messages read as they always have; another run names its flag.
     where = "" if diffs_label == "diffs" else f" in --{diffs_label}"
@@ -285,7 +358,7 @@ def pair_files(images_dir, diffs_dir, allow_unpaired=False,
         pairs, notes = pair_same_stem(images, diffs, allow_unpaired, where), []
     if not pairs:
         raise KpiError(f"no (image, diff) pairs in {images_dir} and {diffs_dir}")
-    return pairs, notes
+    return Pairing(pairs, notes, images, from_diff_name)
 
 
 def listed_note(what, names):
@@ -311,14 +384,29 @@ def use_diff_name_pairing(diffs, diffs_label="diffs"):
     return bool(named)
 
 
+def stem_prefixes(name, stems):
+    """[(stem, rest)] for every stem in `stems` that `name` is, or starts
+    with followed by "_": "a_b_c" with stems {a, a_b} gives
+    [("a", "b_c"), ("a_b", "c")]; rest is "" when name is the stem."""
+    ends = [i for i, ch in enumerate(name) if ch == "_"] + [len(name)]
+    return [(name[:i], name[i + 1:]) for i in ends if name[:i] in stems]
+
+
+def name_splits(core, image_stems, with_suffix=False):
+    """[(A, B, suffix)]: every way `core` is '<A>_<B>' (with_suffix: or
+    '<A>_<B>_<suffix>'), A and B image stems; suffix "" when there is none."""
+    return [(a, b, suffix) for a, rest in stem_prefixes(core, image_stems)
+            for b, suffix in stem_prefixes(rest, image_stems)
+            if with_suffix or not suffix]
+
+
 def split_diff_name(stem, image_stems):
     """(A, B) of '<A>_<B>_diff_L' where both are image stems; None if none
     (or the name does not end in _diff_L)."""
     if not stem.endswith(DIFF_NAME_SUFFIX):
         return None
     core = stem[:-len(DIFF_NAME_SUFFIX)]
-    splits = [(core[:i], core[i + 1:]) for i, ch in enumerate(core)
-              if ch == "_" and core[:i] in image_stems and core[i + 1:] in image_stems]
+    splits = [(a, b) for a, b, _ in name_splits(core, image_stems)]
     if len(splits) > 1:
         raise KpiError(f"diff {stem!r}: ambiguous, several splits name two "
                        f"images: {', '.join(f'{a} + {b}' for a, b in splits)}")
@@ -387,6 +475,93 @@ def match_runs(quant_pairs, float_pairs, allow_unpaired):
         raise KpiError("no pair is in both --diffs and --diffs-float")
     return ([(name, *quant[name], flt[name]) for name in both],
             only_quant + only_float)
+
+
+class MvName(NamedTuple):
+    pair: str               # the name of the diff L pair it belongs to
+    frames: tuple           # (A, B), or (stem,) in same-stem pairing
+    suffix: str             # what follows the pair's stem(s) after "_", or ""
+
+
+def split_mv_name(stem, images, from_diff_name):
+    """The MvName of a .dof stem: '<A>_<B>' or '<A>_<B>_<suffix>' (A, B image
+    stems, the diff L names' split) for diff-name pairing, '<stem>' or
+    '<stem>_<suffix>' for same-stem pairing; None if it names no pair. Several
+    readings are an error, never a guess."""
+    if from_diff_name:
+        names = [MvName(f"{a}_{b}{DIFF_NAME_SUFFIX}", (a, b), suffix)
+                 for a, b, suffix in name_splits(stem, images, with_suffix=True)]
+    else:
+        names = [MvName(s, (s,), suffix) for s, suffix in stem_prefixes(stem, images)]
+    if len(names) > 1:
+        raise KpiError(f"mv file {stem!r}: ambiguous, it reads as the pair of "
+                       f"{' or '.join(' + '.join(n.frames) for n in names)}")
+    return names[0] if names else None
+
+
+def index_mv(folder, label, images, from_diff_name):
+    """({pair name: path}, [stems naming no pair], suffix) of one mv folder.
+    Two files of one pair, or two suffixes in one folder, are an error: one
+    infer run writes one naming, and a second suffix may be a misread name."""
+    files = _stems(folder, MV_EXTS, label)
+    if not files:
+        raise KpiError(f"--{label}: no {'/'.join(MV_EXTS)} file in {folder}")
+    by_pair, unnamed, suffixes = {}, [], set()
+    for stem, path in sorted(files.items()):
+        name = split_mv_name(stem, images, from_diff_name)
+        if name is None:
+            unnamed.append(stem)
+            continue
+        if name.pair in by_pair:
+            raise KpiError(f"--{label}: two mv files for the pair {name.pair}: "
+                           f"{os.path.basename(by_pair[name.pair])} and "
+                           f"{os.path.basename(path)}")
+        by_pair[name.pair] = path
+        suffixes.add(name.suffix)
+    if len(suffixes) > 1:
+        raise KpiError(f"--{label}: the mv file names end in "
+                       f"{len(suffixes)} suffixes "
+                       f"({', '.join(repr(s) for s in sorted(suffixes))}); "
+                       f"one folder holds one naming")
+    return by_pair, unnamed, suffixes.pop() if suffixes else ""
+
+
+class MvFiles(NamedTuple):
+    """The mv files matched to the diff pairs."""
+    paths: dict             # {pair name: (quant mv path, float mv path)}
+    suffixes: tuple         # (--mv's, --mv-float's) name suffix, printed
+
+
+def match_mv(pairs, pairing, quant_dir, float_dir, allow_unpaired):
+    """(pairs that have both mv files, MvFiles, [names skipped]). An mv file
+    naming no pair or a pair with no diff, and a pair missing an mv file, are
+    listed and an error unless allow_unpaired (then the pair is skipped in
+    every measure, so all TOTALs are over the same pairs)."""
+    names = {p[0] for p in pairs}
+    runs, unmatched, missing = [], 0, set()
+    for label, folder in (("mv", quant_dir), ("mv-float", float_dir)):
+        by_pair, unnamed, suffix = index_mv(folder, label, pairing.images,
+                                            pairing.from_diff_name)
+        no_diff = sorted(os.path.basename(by_pair[n]) for n in set(by_pair) - names)
+        no_mv = sorted(names - set(by_pair))
+        for what, listed in ((f"mv file in --{label} naming no pair", unnamed),
+                             (f"mv file in --{label} of a pair with no diff", no_diff),
+                             (f"pair without an mv file in --{label}", no_mv)):
+            for name in listed:
+                print(f"{what}: {name}", file=sys.stderr)
+        unmatched += len(unnamed) + len(no_diff)
+        missing.update(no_mv)
+        runs.append((by_pair, suffix))
+    if (unmatched or missing) and not allow_unpaired:
+        raise KpiError(f"{unmatched} mv file(s) match no diff pair and {len(missing)} "
+                       f"pair(s) miss an mv file (listed above); pass "
+                       f"--allow-unpaired to skip them")
+    kept = [p for p in pairs if p[0] not in missing]
+    if not kept:
+        raise KpiError("no pair has both its --mv and its --mv-float file")
+    (quant, quant_suffix), (flt, float_suffix) = runs
+    paths = {p[0]: (quant[p[0]], flt[p[0]]) for p in kept}
+    return kept, MvFiles(paths, (quant_suffix, float_suffix)), sorted(missing)
 
 
 # ---------------------------------------------------------------- edges
@@ -545,23 +720,244 @@ def reference_mask(stem, luma, args):
     return mask
 
 
-def measure_pair(stem, image_path, diff_path, args, ranges):
-    """kpi_row of one pair; ranges[0] is the run's RawRange."""
+def measure_pair(stem, image_path, diff_path, args, ranges, mv_paths=None):
+    """kpi_row of one pair; ranges[0] is the run's RawRange. mv_paths: the
+    pair's (quant, float) mv files, measured on the same band."""
     luma = load_luma(image_path)
     diff = read_run_diff(diff_path, args.diff_offset, args.diff_channel_tol, ranges[0])
     check_shape(stem, image_path, luma, diff)
     mask = reference_mask(stem, luma, args)
-    return kpi_row(stem, mask, np.abs(diff.values))
+    return with_mv(kpi_row(stem, mask, np.abs(diff.values)), mask, mv_paths, args)
 
 
-def measure_compare(stem, image_path, quant_path, float_path, args, ranges):
-    """compare_row of one pair; ranges: the (quant, float) RawRange."""
+def measure_compare(stem, image_path, quant_path, float_path, args, ranges, mv_paths=None):
+    """compare_row of one pair; ranges: the (quant, float) RawRange. mv_paths:
+    as in measure_pair."""
     luma = load_luma(image_path)
     quant = read_run_diff(quant_path, args.diff_offset, args.diff_channel_tol, ranges[0])
     check_shape(stem, image_path, luma, quant)
     flt = read_run_diff(float_path, float_offset(args), args.diff_channel_tol, ranges[1])
     check_runs_match(stem, quant, flt)
-    return compare_row(stem, reference_mask(stem, luma, args), quant, flt)
+    mask = reference_mask(stem, luma, args)
+    return with_mv(compare_row(stem, mask, quant, flt), mask, mv_paths, args)
+
+
+# ---------------------------------------------------------------- motion vectors
+
+class MvFormat(NamedTuple):
+    """How a .dof file is stored: the --mv-* flags, defaults resolved."""
+    dtype: str              # one of MV_DTYPES, little-endian
+    layout: str             # one of MV_LAYOUTS
+    header_bytes: int       # skipped at the start of the file
+    scale: float            # pixels = stored value / scale
+    scale_given: bool       # False: scale 1, the values are raw units
+    shape: tuple            # (H, W) of the flow, or None: frame / MV_DEFAULT_FACTOR
+    unit_res: str           # the grid of the vectors' pixels: a MV_UNIT_RES key
+
+
+def mv_data_bytes(shape, dtype):
+    """Bytes of an (H, W) flow of two values per pixel in `dtype`."""
+    return shape[0] * shape[1] * 2 * np.dtype(dtype).itemsize
+
+
+def read_mv_values(path, dtype, header_bytes):
+    """Every value after the header, as float64 (nothing checked yet)."""
+    with open(path, "rb") as f:
+        f.seek(header_bytes)
+        raw = f.read()
+    return np.frombuffer(raw, np.dtype(dtype).newbyteorder("<")).astype(np.float64)
+
+
+def to_planes(values, shape, layout):
+    """(H, W, 2) u, v from the flat values in `layout`."""
+    h, w = shape
+    if layout == "hw2":
+        return values.reshape(h, w, 2)
+    return values.reshape(2, h, w).transpose(1, 2, 0)
+
+
+def flow_factor(shape, frame_shape):
+    """k when the flow is the frame divided by one integer k (k = 1: full size).
+    Anything else is refused: the band is reduced by whole k x k blocks."""
+    (h, w), (fh, fw) = shape, frame_shape
+    if fh % h or fw % w or fh // h != fw // w:
+        raise KpiError(f"mv shape {h}x{w} is not the frame {fh}x{fw} divided by one "
+                       f"integer (1, 2, 4, ...); check --mv-shape")
+    return fh // h
+
+
+def check_unit_res(factor, unit_res):
+    """--mv-unit-res quarter is only true of a flow at 1/4 of the frame."""
+    if unit_res == "quarter" and factor != MV_UNIT_RES["quarter"]:
+        raise KpiError(f"--mv-unit-res quarter, but the flow is 1/{factor} of the "
+                       f"frame: give --mv-unit-res full, or the right --mv-shape")
+
+
+def read_mv(path, fmt, frame_shape):
+    """One .dof file as (H, W, 2) float64 u, v in pixels. The one place that
+    reads the format: a new layout or a real header goes here."""
+    shape = fmt.shape or (frame_shape[0] // MV_DEFAULT_FACTOR,
+                          frame_shape[1] // MV_DEFAULT_FACTOR)
+    if not fmt.shape and (frame_shape[0] % MV_DEFAULT_FACTOR
+                          or frame_shape[1] % MV_DEFAULT_FACTOR):
+        raise KpiError(f"{path}: the frame {frame_shape[0]}x{frame_shape[1]} is not "
+                       f"divisible by {MV_DEFAULT_FACTOR}, the default flow size; "
+                       f"give --mv-shape")
+    check_unit_res(flow_factor(shape, frame_shape), fmt.unit_res)
+    size = os.path.getsize(path)
+    need = fmt.header_bytes + mv_data_bytes(shape, fmt.dtype)
+    if size != need:
+        raise KpiError("\n".join([
+            f"{path}: {size} bytes, but --mv-dtype {fmt.dtype} at {shape[0]}x{shape[1]} "
+            f"with --mv-header-bytes {fmt.header_bytes} needs {need} (header + H x W x 2 "
+            f"x {np.dtype(fmt.dtype).itemsize}). Sizes that would match "
+            f"(--mv-layout does not change the size; run --mv-probe to see the values):",
+            *mv_size_table(path, size, frame_shape, fmt.header_bytes)]))
+    flow = to_planes(read_mv_values(path, fmt.dtype, fmt.header_bytes),
+                     shape, fmt.layout) / fmt.scale
+    bad = int((~np.isfinite(flow)).sum())
+    if bad:
+        raise KpiError(f"{path}: {bad} motion vector value(s) are NaN or inf "
+                       f"(as read with --mv-dtype {fmt.dtype}, --mv-scale {fmt.scale:g})")
+    return flow
+
+
+class MvCandidate(NamedTuple):
+    dtype: str
+    factor: int             # frame / factor
+    shape: tuple
+    header: int             # the header that makes the size match (may be < 0)
+
+
+def mv_candidates(size, frame_shape):
+    """Every common dtype at the frame size / 1, 2, 4, 8 (when it divides)."""
+    fh, fw = frame_shape
+    return [MvCandidate(dtype, k, (fh // k, fw // k),
+                        size - mv_data_bytes((fh // k, fw // k), dtype))
+            for k in MV_RESOLUTIONS if not fh % k and not fw % k
+            for dtype in MV_DTYPES]
+
+
+def mv_fits(candidate, header_bytes):
+    """'yes' when it matches with the given header, a header hint, or ''."""
+    if candidate.header == header_bytes:
+        return "yes"
+    if 0 <= candidate.header <= MV_HEADER_HINT:
+        return f"with --mv-header-bytes {candidate.header}"
+    return ""
+
+
+def mv_size_table(path, size, frame_shape, header_bytes):
+    """The lines that show which flags would fit a file of `size` bytes."""
+    lines = [f"  {'dtype':8} {'size':6} {'shape':10} {'data bytes':>10}  fits "
+             f"(frame {frame_shape[0]}x{frame_shape[1]}, --mv-header-bytes {header_bytes})"]
+    for c in mv_candidates(size, frame_shape):
+        lines.append(f"  {c.dtype:8} {'1/' + str(c.factor):6} "
+                     f"{f'{c.shape[0]}x{c.shape[1]}':10} {size - c.header:>10}  "
+                     f"{mv_fits(c, header_bytes) or '-'}")
+    with open(path, "rb") as f:
+        if f.read(len(FLO_MAGIC)) == FLO_MAGIC:
+            lines.append(f"  note: the file starts with {FLO_MAGIC.decode()}, as a "
+                         f"Middlebury .flo does (12-byte header, float32, hw2)")
+    return lines
+
+
+def plane_stats(plane):
+    """min / max / median of the finite values, and the mean step between
+    horizontal neighbours: small for a real flow, large when interleaved
+    (hw2) data is read as planes (u, v, u, ... in one plane)."""
+    finite = plane[np.isfinite(plane)]
+    if not finite.size:
+        return "no finite value"
+    step = np.abs(np.diff(plane, axis=1))
+    step = step[np.isfinite(step)]
+    return (f"min {finite.min():.6g} max {finite.max():.6g} median "
+            f"{float(np.median(finite)):.6g} step {step.mean() if step.size else math.nan:.6g}")
+
+
+def probe_lines(path, frame_shape, header_bytes):
+    """The --mv-probe report of one file: the size table, then the values
+    (as stored, before --mv-scale) of each candidate whose size fits."""
+    size = os.path.getsize(path)
+    lines = [f"mv probe: {path}, {size} bytes",
+             *mv_size_table(path, size, frame_shape, header_bytes)]
+    fitting = [c for c in mv_candidates(size, frame_shape) if mv_fits(c, header_bytes)]
+    if not fitting:
+        lines.append("no candidate fits: the file is none of these; give "
+                     "--mv-shape or --mv-header-bytes")
+    for c in fitting:
+        values = read_mv_values(path, c.dtype, c.header)
+        bad = int((~np.isfinite(values)).sum())
+        lines.append(f"{c.dtype} {c.shape[0]}x{c.shape[1]} header {c.header}: "
+                     f"{bad} non-finite value(s), as stored (before --mv-scale)")
+        for layout in MV_LAYOUTS:
+            flow = to_planes(values, c.shape, layout)
+            lines.append(f"  {layout}: u {plane_stats(flow[..., 0])} | "
+                         f"v {plane_stats(flow[..., 1])}")
+    lines.append("probe only: nothing measured, nothing written. The right "
+                 "candidate has plausible pixel values and the smaller step.")
+    return lines
+
+
+def band_at(mask, shape):
+    """The band at the flow's size: a flow pixel is on it when any frame
+    pixel of its k x k block is. Nearest-neighbour sampling would keep one
+    pixel per block and drop most of a thin band at 1/4 or 1/8 size."""
+    k = flow_factor(shape, mask.shape)
+    h, w = shape
+    return mask.reshape(h, k, w, k).any(axis=(1, 3))
+
+
+def mv_sums(band, epe, float_mag):
+    """The sums and counts of every region, and the flow's size."""
+    h, w = epe.shape
+    row = {"mv_H": h, "mv_W": w, "mv_edge_pixels": int(band.sum()), "mv_pixels": h * w}
+    for region, sel in (("on_edges", band), ("all", np.ones_like(band))):
+        row[f"mv_epe_sum_{region}"] = float(epe[sel].sum())
+        row[f"mv_float_mag_sum_{region}"] = float(float_mag[sel].sum())
+        for t in MV_EPE_THRESHOLDS:
+            row[f"{mv_over(t)[0]}_{region}"] = int((epe[sel] > t).sum())
+    return row
+
+
+def mv_means(row):
+    """Each region's means and fractions from its sums and pixel count, in
+    place: the same rule for a pair and for the TOTAL."""
+    for region, pixels in MV_REGIONS.items():
+        n = row[pixels]
+        row[f"mv_epe_mean_{region}"] = _ratio(row[f"mv_epe_sum_{region}"], n)
+        row[f"mv_float_mag_mean_{region}"] = _ratio(row[f"mv_float_mag_sum_{region}"], n)
+        # Unit-free: the same at any --mv-scale and on either grid.
+        row[f"mv_rel_epe_{region}"] = _ratio(row[f"mv_epe_sum_{region}"],
+                                             row[f"mv_float_mag_sum_{region}"])
+        for t in MV_EPE_THRESHOLDS:
+            count, frac = mv_over(t)
+            row[f"{frac}_{region}"] = _ratio(row[f"{count}_{region}"], n)
+    return row
+
+
+def mv_measures(mask, quant_path, float_path, fmt):
+    """The MV_FIELDS of one pair: endpoint error EPE = |quant - float| of
+    the (u, v) vectors, per pixel, on the band and on all pixels."""
+    quant = read_mv(quant_path, fmt, mask.shape)
+    flt = read_mv(float_path, fmt, mask.shape)
+    epe = np.hypot(quant[..., 0] - flt[..., 0], quant[..., 1] - flt[..., 1])
+    band = band_at(mask, epe.shape)
+    return mv_means(mv_sums(band, epe, np.hypot(flt[..., 0], flt[..., 1])))
+
+
+def mv_total(rows):
+    """The mv fields of the TOTAL row: every sum and count summed, the means
+    recomputed from them (never averaged)."""
+    total = {f: sum(r[f] for r in rows) for f in MV_SUMMED}
+    return {"mv_H": "", "mv_W": "", **mv_means(total)}
+
+
+def with_mv(row, mask, mv_paths, args):
+    """The row, with the mv measures when --mv is given."""
+    if mv_paths is not None:
+        row.update(mv_measures(mask, *mv_paths, mv_format(args)))
+    return row
 
 
 def write_csv(path, rows, fields=CSV_FIELDS):
@@ -573,16 +969,13 @@ def write_csv(path, rows, fields=CSV_FIELDS):
 
 # ---------------------------------------------------------------- CLI
 
-def offset_arg(text):
-    """An offset flag's value: a finite number, or 'none' for no offset.
+def finite_number(text, expected):
+    """float(text) when finite, else argparse's refusal saying `expected`.
 
-    float() also reads 'nan' and 'inf'; an offset of either turns every diff
-    value into nan or inf, so the KPI would read nan as if it were measured.
+    float() also reads 'nan' and 'inf'; an offset or a scale of either turns
+    every value into nan or inf, so the KPI would read nan as if measured.
     """
-    if text.lower() == "none":
-        return None
-    refused = argparse.ArgumentTypeError(
-        f"expected a finite number or 'none', got {text!r}")
+    refused = argparse.ArgumentTypeError(f"expected {expected}, got {text!r}")
     try:
         value = float(text)
     except ValueError:
@@ -592,6 +985,36 @@ def offset_arg(text):
     return value
 
 
+def offset_arg(text):
+    """An offset flag's value: a finite number, or 'none' for no offset."""
+    if text.lower() == "none":
+        return None
+    return finite_number(text, "a finite number or 'none'")
+
+
+def scale_arg(text):
+    """--mv-scale: a finite number other than 0 (the values are divided by it)."""
+    expected = "a finite number other than 0"
+    value = finite_number(text, expected)
+    if value == 0:
+        raise argparse.ArgumentTypeError(f"expected {expected}, got {text!r}")
+    return value
+
+
+def int_at_least(minimum):
+    """An argparse type: an integer >= minimum."""
+    def parse(text):
+        try:
+            value = int(text)
+        except ValueError:
+            value = None
+        if value is None or value < minimum:
+            raise argparse.ArgumentTypeError(
+                f"expected an integer >= {minimum}, got {text!r}")
+        return value
+    return parse
+
+
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
@@ -599,8 +1022,9 @@ def build_parser():
                     help="folder of every input frame (both A and B in "
                          "diff-name pairing); edges are found on the "
                          "reference. Y8 inputs (1 channel) preferred")
-    ap.add_argument("--diffs", required=True, help="folder of diff L files")
-    ap.add_argument("--out", required=True, help="CSV to write")
+    # Required unless --mv-probe (check_args): the probe reads one mv file only.
+    ap.add_argument("--diffs", help="folder of diff L files (required)")
+    ap.add_argument("--out", help="CSV to write (required)")
     ap.add_argument("--allow-unpaired", action="store_true",
                     help="skip (still list) files with no partner instead of failing")
     mode = ap.add_mutually_exclusive_group()
@@ -648,7 +1072,57 @@ def build_parser():
                     help="widen edges by N pixels each side, 0 = the line only (default 1)")
     ap.add_argument("--save-masks", default=None,
                     help="folder to write each edge mask as <stem>.png (0/255)")
+    add_mv_args(ap)
     return ap
+
+
+def add_mv_args(ap):
+    """The motion-vector flags. The format flags default to None, so that
+    check_args can tell them given; mv_format resolves the defaults."""
+    mv = ap.add_argument_group("motion vectors (opt-in; DOF infer's mv/ folders, .dof files)")
+    mv.add_argument("--mv", default=None,
+                    help="folder of the QUANT run's .dof files, named <A>_<B>.dof "
+                         "or <A>_<B>_<suffix>.dof (the diff's pair): adds the "
+                         "mv_* columns, endpoint error vs --mv-float")
+    mv.add_argument("--mv-float", default=None,
+                    help="folder of the FLOAT run's .dof files, same pairs (with --mv)")
+    mv.add_argument("--mv-probe", action="store_true",
+                    help="read the first --mv file only, print the sizes that fit "
+                         "and the values of each; writes nothing (no --diffs/--out)")
+    mv.add_argument("--mv-dtype", choices=MV_DTYPES, default=None,
+                    help="stored value type, little-endian (default int16)")
+    mv.add_argument("--mv-layout", choices=MV_LAYOUTS, default=None,
+                    help="2hw: one plane, then the other (default; EPE does not "
+                         "depend on which is u); hw2: H x W x (u, v) interleaved")
+    mv.add_argument("--mv-header-bytes", type=int_at_least(0), default=None,
+                    help="bytes skipped at the start of each file (default 0)")
+    mv.add_argument("--mv-scale", type=scale_arg, default=None,
+                    help="pixels = stored value / this, e.g. 16 for 4 fraction "
+                         "bits of fixed point (default 1: raw units, with a warning)")
+    mv.add_argument("--mv-shape", type=int_at_least(1), nargs=2, metavar=("H", "W"),
+                    default=None,
+                    help="flow size (default: 1/4 of the reference frame); the "
+                         "frame divided by an integer k: the band is reduced to it")
+    mv.add_argument("--mv-unit-res", choices=tuple(MV_UNIT_RES), default=None,
+                    help="the grid the vectors' pixels are on, and so the EPE's: "
+                         "quarter (default; the flow must be 1/4 of the frame) or "
+                         "full (frame pixels). A label: nothing is rescaled")
+
+
+MV_FORMAT_FLAGS = ("mv_dtype", "mv_layout", "mv_header_bytes", "mv_scale", "mv_shape",
+                   "mv_unit_res")
+
+
+def mv_format(args):
+    """The MvFormat of the --mv-* flags, defaults filled in: DOF infer's
+    files as the owner's probe measured them (2026-11-12): int16, planar,
+    no header, 1/4 of the frame. Scale and unit are not known: raw, quarter."""
+    return MvFormat(args.mv_dtype or "int16", args.mv_layout or "2hw",
+                    args.mv_header_bytes or 0,
+                    1.0 if args.mv_scale is None else args.mv_scale,
+                    args.mv_scale is not None,
+                    tuple(args.mv_shape) if args.mv_shape else None,
+                    args.mv_unit_res or "quarter")
 
 
 def check_args(ap, args):
@@ -666,6 +1140,25 @@ def check_args(ap, args):
         ap.error("--diff-channel-tol must be >= 0")
     if args.diffs_float is None and args.diff_offset_float is not SAME_AS_DIFF_OFFSET:
         ap.error("--diff-offset-float needs --diffs-float")
+    check_mv_args(ap, args)
+
+
+def check_mv_args(ap, args):
+    """Every mv flag needs --mv; a run (not the probe) needs --diffs, --out
+    and both mv folders."""
+    orphans = [f"--{f.replace('_', '-')}" for f in MV_FORMAT_FLAGS if getattr(args, f) is not None]
+    orphans += ["--mv-probe"] if args.mv_probe else []
+    orphans += ["--mv-float"] if args.mv_float is not None else []
+    if args.mv is None and orphans:
+        ap.error(f"{orphans[0]} needs --mv")
+    if args.mv_probe:
+        return
+    missing = [flag for flag, value in (("--diffs", args.diffs), ("--out", args.out))
+               if value is None]
+    if missing:                                   # argparse's own words for it
+        ap.error(f"the following arguments are required: {', '.join(missing)}")
+    if args.mv is not None and args.mv_float is None:
+        ap.error("--mv needs --mv-float: the endpoint error compares two runs")
 
 
 def float_offset(args):
@@ -705,55 +1198,142 @@ def abs_warning(rows):
             f"warped_float, only the delta_* columns are meaningful")
 
 
+class RunPairs(NamedTuple):
+    pairs: list             # (name, image, diff), or with --diffs-float (name, image, quant, float)
+    notes: list             # note lines for the run summary
+    mv: object              # MvFiles with --mv, else None
+
+
 def pair_runs(args):
-    """(pairs, notes): (name, image, diff) per pair, or with --diffs-float
-    (name, image, quant diff, float diff) of the pairs in both runs."""
-    pairs, notes = pair_files(args.images, args.diffs, args.allow_unpaired,
-                              args.from_diff_name, args.ref_frame)
-    if args.diffs_float is None:
-        return pairs, notes
-    # The float run's frames-named-by-no-diff note adds nothing: its frames are
-    # the quant run's, or those of pairs in one run only, which match_runs lists.
-    float_pairs, _ = pair_files(args.images, args.diffs_float, args.allow_unpaired,
-                                args.from_diff_name, args.ref_frame, "diffs-float")
-    pairs, one_run_only = match_runs(pairs, float_pairs, args.allow_unpaired)
-    if one_run_only:
-        notes.append(listed_note("pair(s) in one run only, skipped in both",
-                                 one_run_only))
-    return pairs, notes
+    """The RunPairs: every pair of --diffs, or with --diffs-float the pairs
+    in both runs, and with --mv only those with both mv files."""
+    pairing = pair_folder(_stems(args.images, IMAGE_EXTS, "images"), args.images,
+                          args.diffs, args.allow_unpaired, args.from_diff_name,
+                          args.ref_frame)
+    pairs, notes = pairing.pairs, pairing.notes
+    if args.diffs_float is not None:
+        # The float run's frames-named-by-no-diff note adds nothing: its frames are
+        # the quant run's, or those of pairs in one run only, which match_runs lists.
+        float_pairs, _ = pair_files(args.images, args.diffs_float, args.allow_unpaired,
+                                    args.from_diff_name, args.ref_frame, "diffs-float")
+        pairs, one_run_only = match_runs(pairs, float_pairs, args.allow_unpaired)
+        if one_run_only:
+            notes.append(listed_note("pair(s) in one run only, skipped in both",
+                                     one_run_only))
+    if args.mv is None:
+        return RunPairs(pairs, notes, None)
+    pairs, mv, skipped = match_mv(pairs, pairing, args.mv, args.mv_float,
+                                  args.allow_unpaired)
+    if skipped:
+        notes.append(listed_note("pair(s) without both mv files, skipped", skipped))
+    return RunPairs(pairs, notes, mv)
 
 
-def summary_lines(rows, total, notes, ranges, args):
-    """The run summary printed to stdout, compare lines only with --diffs-float."""
+def mv_format_line(fmt, suffixes):
+    """The mv flags used, printed on every --mv run like the offset lines."""
+    shape = (f"{fmt.shape[0]}x{fmt.shape[1]}" if fmt.shape
+             else f"1/{MV_DEFAULT_FACTOR} of the reference frame")
+    names = " and ".join(sorted({f"<A>_<B>{s and '_' + s}.dof" for s in suffixes}))
+    return (f"mv as read: --mv-dtype {fmt.dtype} (little-endian) | --mv-layout "
+            f"{fmt.layout} | --mv-header-bytes {fmt.header_bytes} | --mv-scale "
+            f"{fmt.scale:g} | --mv-shape {shape} | --mv-unit-res {fmt.unit_res} | "
+            f"files {names}")
+
+
+def mv_scale_warning(fmt):
+    """The warning when --mv-scale is not given, else None."""
+    if fmt.scale_given:
+        return None
+    return ("warning: no --mv-scale: EPE is in the raw stored units (fixed point?), "
+            "not pixels, so the > 0.5 px and > 1 px columns are not in pixels "
+            "either; mv_rel_epe_* is unit-free. Give --mv-scale (e.g. 2^fraction bits)")
+
+
+def format_mv_total(row, fmt):
+    """The TOTAL lines of the mv measures, one per region."""
+    unit = "px" if fmt.scale_given else "raw units"
+    lines = []
+    for region, pixels in MV_REGIONS.items():
+        over = " | ".join(f"> {t:g} {unit} {row[f'{mv_over(t)[1]}_{region}']:.4%}"
+                          for t in MV_EPE_THRESHOLDS)
+        lines.append(f"TOTAL mv EPE {region} ({fmt.unit_res} grid) | pixels {row[pixels]} | "
+                     f"sum {row[f'mv_epe_sum_{region}']:.6g} | mean "
+                     f"{row[f'mv_epe_mean_{region}']:.6g} {unit} | {over} | float |flow| "
+                     f"mean {row[f'mv_float_mag_mean_{region}']:.6g} {unit} | "
+                     f"EPE / |flow| {row[f'mv_rel_epe_{region}']:.4f}")
+    return lines
+
+
+def summary_lines(rows, total, notes, ranges, args, mv=None):
+    """The run summary printed to stdout, compare lines only with --diffs-float,
+    mv lines only with --mv (mv: the MvFiles)."""
     compare = args.diffs_float is not None
     lines = [f"{len(rows)} pairs -> {args.out}", *notes,
              ranges[0].line(args.diff_offset)]
     if compare:
         lines.append(ranges[1].line(float_offset(args)))
+    if mv is not None:
+        lines.append(mv_format_line(mv_format(args), mv.suffixes))
     lines.append(format_total(total))
-    return lines + (format_compare_total(total) if compare else [])
+    lines += format_compare_total(total) if compare else []
+    return lines + (format_mv_total(total, mv_format(args)) if mv is not None else [])
+
+
+def probe_frame_shape(stem, args):
+    """(H, W) of the reference frame the mv file `stem` names: tried as the
+    DOF names <A>_<B>[_<suffix>] unless --pair-same-stem."""
+    images = _stems(args.images, IMAGE_EXTS, "images")
+    name = None
+    for from_diff_name in ((False,) if args.from_diff_name is False else (True, False)):
+        name = split_mv_name(stem, images, from_diff_name)
+        if name is not None:
+            break
+    if name is None:
+        raise KpiError(f"--mv-probe: {stem} names no frame in --images, so the "
+                       f"frame size is not known")
+    ref = name.frames[0] if args.ref_frame == "first" else name.frames[-1]
+    return _imread(images[ref]).shape[:2]
+
+
+def run_probe(args):
+    """--mv-probe: what the first --mv file can be, printed; nothing written."""
+    files = _stems(args.mv, MV_EXTS, "mv")
+    if not files:
+        raise KpiError(f"--mv: no {'/'.join(MV_EXTS)} file in {args.mv}")
+    stem = sorted(files)[0]
+    for line in probe_lines(files[stem], probe_frame_shape(stem, args),
+                            mv_format(args).header_bytes):
+        print(line)
 
 
 def run(args):
     if cv2 is None:
         raise KpiError("OpenCV is missing: pip install opencv-python-headless")
+    if args.mv_probe:
+        return run_probe(args)
     compare = args.diffs_float is not None
-    pairs, notes = pair_runs(args)
+    pairs, notes, mv = pair_runs(args)
     if args.save_masks:
         os.makedirs(args.save_masks, exist_ok=True)
     ranges = (RawRange(), RawRange("float diff L", "--diff-offset-float"))
     measure = measure_compare if compare else measure_pair
-    rows = [measure(*pair, args, ranges) for pair in pairs]
+    rows = [measure(*pair, args, ranges, mv.paths[pair[0]] if mv else None)
+            for pair in pairs]
     for r in rows:
         if r["edge_pixels"] == 0:
             print(f"note: {r['name']}: no edge pixels, its mean is NaN",
                   file=sys.stderr)
     total = (compare_total_row if compare else total_row)(rows)
-    write_csv(args.out, rows + [total], COMPARE_FIELDS if compare else CSV_FIELDS)
-    warning = abs_warning(rows) if compare else None
-    if warning:
+    fields = COMPARE_FIELDS if compare else CSV_FIELDS
+    if mv:
+        total.update(mv_total(rows))
+        fields += MV_FIELDS
+    write_csv(args.out, rows + [total], fields)
+    warnings = [abs_warning(rows) if compare else None,
+                mv_scale_warning(mv_format(args)) if mv else None]
+    for warning in filter(None, warnings):
         print(warning, file=sys.stderr)
-    for line in summary_lines(rows, total, notes, ranges, args):
+    for line in summary_lines(rows, total, notes, ranges, args, mv):
         print(line)
     return total
 

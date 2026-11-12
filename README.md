@@ -612,7 +612,10 @@ it); the rest of the suite does not need it.
   `--diff-offset 128` (or `32768`). `--diff-offset` and `--diff-offset-float` take
   the same values: a finite number, or `none` (no offset; `--diff-offset`'s
   default). Text, `nan` or `inf` is refused with a named error (exit 2): a nan or
-  inf offset would make every diff value nan or inf.
+  inf offset would make every diff value nan or inf. A value that starts with `-`
+  must be written with `=`: `--diff-offset=<v>` (and `--diff-offset-float=<v>`);
+  argparse reads `--diff-offset -inf` (with a space) as a missing value and
+  refuses it with "expected one argument".
 - Edges: `--detector canny` (default; Gaussian blur `--sigma` 1.0, thresholds 0.66 /
   1.33 x the median per image, or fixed `--canny-low/--canny-high`), or `sobel`
   (gradient magnitude above `--sobel-percentile`, default 90) as a cross-check.
@@ -648,6 +651,54 @@ it); the rest of the suite does not need it.
   `.npy` (8 vs 16 bit is another scale), is an error naming the pair.
   The run prints a `float diff L as stored` line and three more TOTAL lines:
   `TOTAL float`, `TOTAL delta quant - float` and `TOTAL |dq - df| (<diff_kind>)`.
+- Motion vectors, opt-in: the most direct measure of what quantization does to
+  DOF (no JPEG noise, no warp, no lost sign). DOF infer writes, per run,
+  `<output_folder>/` with `flow_pyr/`, `mv/` (the `.dof` files), `vis/`,
+  `vis_diff/` (the diff L) and `vis_flow/`. Give both runs' `mv/` folders:
+  `--mv` (quant) and `--mv-float` (float), always together. First probe one file
+  (reads the first `--mv` file only, prints the sizes that fit and the values of
+  each candidate, writes nothing; no `--diffs`/`--out` needed):
+  ```bash
+  python tools/dof_edge_kpi.py --images FRAMES_DIR --mv QUANT_OUT/mv --mv-probe
+  python tools/dof_edge_kpi.py --images FRAMES_DIR --diffs QUANT_OUT/vis_diff \
+      --mv QUANT_OUT/mv --mv-float FLOAT_OUT/mv --out kpi.csv
+  ```
+  The probe's `step` is the mean jump between horizontal neighbours: small for a
+  real flow, large when interleaved data is read as planes. Names: `<A>_<B>.dof`
+  (measured 2026-11-12: `0001_IMX874_Front_001_0001_IMX874_Front_000.dof`, the
+  diff's common name) or `<A>_<B>_<suffix>.dof`, split as the diff names are, so
+  each file belongs to the diff pair `<A>_<B>_diff_L` (same-stem pairing:
+  `<stem>.dof` or `<stem>_<suffix>.dof`). An mv file naming no pair or a pair with
+  no diff, and a pair missing a file in either folder, are listed and an error
+  unless `--allow-unpaired`, which skips that pair in every measure (all TOTALs
+  stay over the same pairs). Two files of one pair, two suffixes in one folder,
+  or a name with two readings are errors. The format is flags, checked against
+  the file size exactly (a mismatch is an error printing the file size and the
+  sizes that would fit: float32/float16/int16/int32/float64 x 1, 1/2, 1/4, 1/8
+  of the frame, with a header offered when the file is a little larger). The
+  defaults are DOF infer's files as one was measured (2026-11-12: 147456 bytes =
+  144 x 256 x 2 x int16 for a 576 x 1024 frame, planar):
+  `--mv-dtype int16` (little-endian), `--mv-layout 2hw` (one plane, then the
+  other; `hw2` = interleaved; EPE does not depend on which plane is u),
+  `--mv-header-bytes 0`, `--mv-shape` 1/4 of the reference frame. Not known yet:
+  the fixed-point scale and the unit. `--mv-scale S` (pixels = value / S, e.g.
+  16 for 4 fraction bits) defaults to 1, i.e. raw units: the run then warns that
+  EPE and the > 0.5 / > 1 thresholds are in raw units, not pixels.
+  `--mv-unit-res quarter|full` (default `quarter`; `quarter` needs a 1/4 flow)
+  names the grid the vectors' pixels are on, and so the EPE's: a label, nothing
+  is rescaled. A NaN or inf value is an error naming the file. Each run prints
+  the flags used (`mv as read: ...`) and two TOTAL lines (`TOTAL mv EPE on_edges`
+  and `all`).
+  Per pair and in TOTAL (sums and counts summed, means recomputed): EPE =
+  sqrt((uq - uf)^2 + (vq - vf)^2) per pixel, on the band and on all pixels, as
+  `mv_epe_sum_*`, `mv_epe_mean_*`, `mv_n_epe_over_{0.5,1}px_*` and
+  `mv_frac_epe_over_{0.5,1}px_*` (EPE strictly above), `mv_float_mag_sum_*` /
+  `mv_float_mag_mean_*` (the float flow's |flow|, the scale to read EPE against)
+  and `mv_rel_epe_*` = sum EPE / sum |flow_float| (unit-free, right at any
+  scale), plus `mv_H, mv_W, mv_pixels, mv_edge_pixels`. The band is the diff L
+  band (found once per pair on the full-size reference frame); for a flow 1/k of
+  the frame (k an integer, else an error) it is reduced to the flow's grid: a
+  cell is on the band when any frame pixel of its k x k block is.
 - Decision: OpenCV (`opencv-python-headless`, optional `eval` extra) for the edges
   and the image IO: the mainstream library, one dependency for both. Rejected:
   scikit-image, a second large dependency for the same job. The library does not
@@ -658,6 +709,16 @@ it); the rest of the suite does not need it.
   the CSVs (two bands if the settings differ, and no |dq - df|); delta only (a
   sign flip or a moved error of the same size cancels in it); |dq - df| only (it
   is meaningless for the plain |diff| files the DOF tool writes today).
+- Decision (2026-11-12, owner: compare the quant and float motion vectors, EPE on
+  the band and all pixels, opt-in): `--mv`/`--mv-float` in the same run, on the
+  diff L band. The .dof layout is explicit flags with an exact size check and a
+  probe, defaults from the owner's measured file. A lower-resolution flow gets
+  the band reduced by "any pixel of the block". Rejected: guessing a layout into
+  the code (a wrong one reads as a plausible KPI); nearest-neighbour reduction of
+  the band (keeps one pixel per block: most of a 3-5 px band vanishes at 1/4);
+  upsampling the flow to the frame (invents vectors the network never output);
+  a pixel-unit default scale (the fixed point is not known: raw units, warned,
+  plus the unit-free `mv_rel_epe_*`).
 
 ---
 

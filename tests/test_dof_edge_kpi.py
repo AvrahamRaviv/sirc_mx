@@ -510,9 +510,20 @@ def test_canny_uses_the_l2_gradient():
     assert not K.canny_mask(luma, 0, low=high, high=high).any()
 
 
-# ---------------------------------------------- no --diffs-float: unchanged
-# The output of e026830 (the tool before --diffs-float), run on these two
-# folders and pasted here: CSV bytes, stdout (the CSV path as <OUT>), stderr.
+# ---------------------------------------------- no --diffs-float / --mv: unchanged
+# The output of e026830 (the tool before --diffs-float) on the first two
+# folders, and of e008706 (the tool before --mv) on "compare", run and pasted
+# here: CSV bytes, stdout (the CSV path as <OUT>), stderr.
+# The --diffs-float CSV header of e008706, written out (not COMPARE_HEADER, so
+# that a change there cannot move the pin with it).
+COMPARE_HEADER_E008706 = (
+    "name", "H", "W", "edge_pixels", "edge_fraction", "sum_abs_diff_on_edges",
+    "mean_abs_diff_on_edges", "sum_abs_diff_all", "ratio_edge_to_all",
+    "float_sum_abs_diff_on_edges", "float_mean_abs_diff_on_edges", "float_sum_abs_diff_all",
+    "float_ratio_edge_to_all", "delta_sum_abs_diff_on_edges", "delta_mean_abs_diff_on_edges",
+    "delta_sum_abs_diff_all", "delta_ratio_edge_to_all", "qerr_sum_abs_diff_on_edges",
+    "qerr_mean_abs_diff_on_edges", "qerr_sum_abs_diff_all", "qerr_ratio_edge_to_all",
+    "diff_kind")
 PIN_HEADER = ("name,H,W,edge_pixels,edge_fraction,sum_abs_diff_on_edges,"
               "mean_abs_diff_on_edges,sum_abs_diff_all,ratio_edge_to_all\r\n")
 PIN = {
@@ -538,6 +549,29 @@ PIN = {
         "TOTAL | edge_pixels 576 (12.5000%) | sum |dL| on edges 912 | mean on edges 1.58333 "
         "| sum |dL| all 2256 | edge/all 0.4043\n",
         ""),
+    "compare": (
+        ",".join(COMPARE_HEADER_E008706) + "\r\n"
+        + "a,48,64,240,0.078125,576.0,2.4,576.0,1.0,192.0,0.8,192.0,1.0,384.0,"
+          "1.5999999999999999,384.0,0.0,768.0,3.2,768.0,1.0,signed\r\n"
+        + "b,24,64,120,0.078125,288.0,2.4,432.0,0.6666666666666666,96.0,0.8,96.0,1.0,"
+          "192.0,1.5999999999999999,336.0,-0.33333333333333337,192.0,1.6,336.0,"
+          "0.5714285714285714,signed\r\n"
+        + "TOTAL,,,360,0.078125,864.0,2.4,1008.0,0.8571428571428571,288.0,0.8,288.0,1.0,"
+          "576.0,1.5999999999999999,720.0,-0.1428571428571429,960.0,2.6666666666666665,"
+          "1104.0,0.8695652173913043,signed\r\n",
+        "2 pairs -> <OUT>\n"
+        "diff L as stored: min 0, max 131, median of per-file medians 64 | --diff-offset 128\n"
+        "float diff L as stored: min -1, max 129, median of per-file medians 64 "
+        "| --diff-offset-float 128\n"
+        "TOTAL | edge_pixels 360 (7.8125%) | sum |dL| on edges 864 | mean on edges 2.4 "
+        "| sum |dL| all 1008 | edge/all 0.8571\n"
+        "TOTAL float | sum |dL| on edges 288 | mean on edges 0.8 | sum |dL| all 288 "
+        "| edge/all 1.0000\n"
+        "TOTAL delta quant - float | sum |dL| on edges 576 | mean on edges 1.6 "
+        "| sum |dL| all 720 | edge/all -0.1429\n"
+        "TOTAL |dq - df| (signed) | sum |dL| on edges 960 | mean on edges 2.66667 "
+        "| sum |dL| all 1104 | edge/all 0.8696\n",
+        ""),
 }
 
 
@@ -550,6 +584,21 @@ def pin_folder(tmp_path, scenario):
         np.save(diffs / f"{AB}.npy", band_diff())
         cv2.imwrite(str(diffs / f"{B}_{A}_diff_L.png"), np.full((48, W, 3), 7, np.uint8))
         return images, diffs, ["--dilate", "2"]
+    if scenario == "compare":
+        floats = tmp_path / "floats"
+        floats.mkdir()
+        cv2.imwrite(str(images / "a.png"), step_image())
+        cv2.imwrite(str(images / "b.png"), step_image(24))
+        np.save(diffs / "a.npy", band_diff(48, 3.0))
+        np.save(floats / "a.npy", band_diff(48, -1.0))
+        stored = np.full((24, W), 128, np.uint8)
+        stored[:, 30:34], stored[:, :3] = 131, 126
+        cv2.imwrite(str(diffs / "b.png"), stored)
+        stored = np.full((24, W), 128, np.uint8)
+        stored[:, 30:34] = 129
+        cv2.imwrite(str(floats / "b.png"), stored)
+        return images, diffs, ["--diffs-float", str(floats), "--dilate", "2",
+                               "--diff-offset", "128"]
     cv2.imwrite(str(images / "a.png"), step_image())
     cv2.imwrite(str(images / "b.png"), step_image(24))
     stored = np.full((48, W), 128, np.uint8)
@@ -560,8 +609,7 @@ def pin_folder(tmp_path, scenario):
 
 
 @pytest.mark.parametrize("scenario", sorted(PIN))
-def test_without_diffs_float_the_output_is_byte_identical_to_e026830(tmp_path, capsys,
-                                                                   scenario):
+def test_without_the_new_flags_the_output_is_byte_identical(tmp_path, capsys, scenario):
     images, diffs, extra = pin_folder(tmp_path, scenario)
     capsys.readouterr()
     code, _ = run_cli(tmp_path, images, diffs, *extra)
@@ -923,3 +971,358 @@ def test_diff_offset_none_is_no_offset(tmp_path, capsys):
     assert code == 0
     assert float(rows["a"]["sum_abs_diff_all"]) == 7 * 48 * W
     assert "| --diff-offset none\n" in capsys.readouterr().out
+
+
+# ---------------------------------------------- --mv: motion vectors
+# DOF infer's files, as the owner's probe measured one (2026-11-12): <A>_<B>.dof,
+# int16 little-endian, planar (u plane then v plane), no header, 1/4 of the frame.
+EPE_SCALE = {"int16": 4, "int32": 4, "float16": 1, "float32": 1, "float64": 1}
+
+
+def write_dof(path, flow, dtype="int16", layout="2hw", header=b""):
+    """flow (H, W, 2) in stored units, written as DOF infer would."""
+    data = flow.transpose(2, 0, 1) if layout == "2hw" else flow
+    with open(path, "wb") as fh:
+        fh.write(header)
+        fh.write(np.ascontiguousarray(data).astype(np.dtype(dtype).newbyteorder("<")).tobytes())
+
+
+def mv_dirs(tmp_path):
+    """The A/B step folder of diff_name_folder, and empty mv/ and mv_float/."""
+    images, diffs = diff_name_folder(tmp_path)
+    mv, mvf = tmp_path / "mv", tmp_path / "mv_float"
+    mv.mkdir()
+    mvf.mkdir()
+    return images, diffs, mv, mvf
+
+
+def run_mv(tmp_path, images, diffs, mv, mvf, *extra):
+    return run_cli(tmp_path, images, diffs, "--mv", str(mv), "--mv-float", str(mvf), *extra)
+
+
+def by_hand_flows(h=48, scale=1):
+    """float flow (1.5, -2) everywhere: |flow| 2.5. quant adds (3, 4) on
+    columns 30..33 (EPE 5, inside any 2-px band); off the band (0, 0.75) on
+    0..9, (1, 0) on 10..11, (0, 0.5) on 12..13 and (0.25, 0) on 50..63: EPE
+    0.75, exactly 1 and 0.5 (not above their thresholds) and 0.25. All exact
+    in every dtype: integer types store them x 4."""
+    flt = np.empty((h, W, 2))
+    flt[..., 0], flt[..., 1] = 1.5, -2.0
+    quant = flt.copy()
+    quant[:, BAND] += (3.0, 4.0)
+    quant[:, :10, 1] += 0.75
+    quant[:, 10:12, 0] += 1.0
+    quant[:, 12:14, 1] += 0.5
+    quant[:, 50:, 0] += 0.25
+    return quant * scale, flt * scale
+
+
+@pytest.mark.parametrize("layout", ["hw2", "2hw"])
+@pytest.mark.parametrize("dtype", sorted(EPE_SCALE))
+def test_epe_by_hand_in_every_dtype_and_layout(tmp_path, capsys, dtype, layout):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    quant, flt = by_hand_flows(scale=EPE_SCALE[dtype])
+    write_dof(mv / f"{A}_{B}.dof", quant, dtype, layout)
+    write_dof(mvf / f"{A}_{B}.dof", flt, dtype, layout)
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--dilate", "2",
+                        "--mv-dtype", dtype, "--mv-layout", layout, "--mv-shape", "48", "64",
+                        "--mv-unit-res", "full", "--mv-scale", str(EPE_SCALE[dtype]))
+    assert code == 0
+    r = rows[AB]
+    assert (int(r["mv_H"]), int(r["mv_W"]), int(r["mv_pixels"])) == (48, W, 48 * W)
+    assert int(r["mv_edge_pixels"]) == 240                      # the 5-column band
+    assert f(r, "mv_epe_sum_on_edges") == 5 * 4 * 48            # 960
+    assert f(r, "mv_epe_mean_on_edges") == 960 / 240
+    assert int(r["mv_n_epe_over_0.5px_on_edges"]) == 4 * 48
+    assert f(r, "mv_frac_epe_over_0.5px_on_edges") == 192 / 240
+    assert int(r["mv_n_epe_over_1px_on_edges"]) == 4 * 48
+    assert f(r, "mv_float_mag_sum_on_edges") == 2.5 * 240
+    assert f(r, "mv_float_mag_mean_on_edges") == 2.5
+    assert f(r, "mv_rel_epe_on_edges") == 960 / 600
+    all_sum = 960 + (0.75 * 10 + 1 * 2 + 0.5 * 2 + 0.25 * 14) * 48   # 1632
+    assert f(r, "mv_epe_sum_all") == all_sum
+    assert f(r, "mv_epe_mean_all") == pytest.approx(all_sum / (48 * W))
+    assert int(r["mv_n_epe_over_0.5px_all"]) == 192 + (10 + 2) * 48   # EPE 5, 0.75, 1
+    assert int(r["mv_n_epe_over_1px_all"]) == 192                     # EPE 5 only
+    assert f(r, "mv_rel_epe_all") == pytest.approx(all_sum / (2.5 * 48 * W))
+    assert "no --mv-scale" not in capsys.readouterr().err
+
+
+REAL_A, REAL_B = "0001_IMX874_Front_001", "0001_IMX874_Front_000"
+
+
+def test_the_real_file_shape_with_default_flags_reduces_the_band_to_the_quarter_grid(
+        tmp_path, capsys):
+    # 576 x 1024 frames, step at column 512; the flow 144 x 256 int16 planar,
+    # 147456 bytes like the owner's file. Band (--dilate 2) is 5 frame columns
+    # inside 509..514, so on the 1/4 grid columns 127 and 128 (509 // 4, 514 // 4):
+    # a cell is on the band when any of its 4 x 4 frame pixels is. EPE 50 raw
+    # on exactly those cells, 0 elsewhere.
+    images, diffs = make_dirs(tmp_path)
+    frame = np.full((576, 1024), 60, np.uint8)
+    frame[:, 512:] = 180
+    cv2.imwrite(str(images / f"{REAL_A}.png"), frame)
+    cv2.imwrite(str(images / f"{REAL_B}.png"), np.full((576, 1024), 90, np.uint8))
+    np.save(diffs / f"{REAL_A}_{REAL_B}_diff_L.npy", np.zeros((576, 1024), np.float32))
+    mv, mvf = tmp_path / "mv", tmp_path / "mv_float"
+    mv.mkdir()
+    mvf.mkdir()
+    flt = np.empty((144, 256, 2))
+    flt[..., 0], flt[..., 1] = 8, -4
+    quant = flt.copy()
+    quant[:, 127:129] += (30, 40)
+    write_dof(mv / f"{REAL_A}_{REAL_B}.dof", quant)
+    write_dof(mvf / f"{REAL_A}_{REAL_B}.dof", flt)
+    assert os.path.getsize(mv / f"{REAL_A}_{REAL_B}.dof") == 147456
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--dilate", "2")
+    out = capsys.readouterr()
+    assert code == 0
+    r = rows[f"{REAL_A}_{REAL_B}_diff_L"]
+    assert (int(r["mv_H"]), int(r["mv_W"])) == (144, 256)
+    assert int(r["mv_edge_pixels"]) == 2 * 144
+    assert f(r, "mv_epe_sum_on_edges") == f(r, "mv_epe_sum_all") == 50 * 2 * 144
+    assert f(r, "mv_rel_epe_on_edges") == pytest.approx(50 / math.hypot(8, 4))
+    assert ("mv as read: --mv-dtype int16 (little-endian) | --mv-layout 2hw | "
+            "--mv-header-bytes 0 | --mv-scale 1 | --mv-shape 1/4 of the reference frame "
+            "| --mv-unit-res quarter | files <A>_<B>.dof\n") in out.out
+    assert "TOTAL mv EPE on_edges (quarter grid) | pixels 288 | sum 14400 | mean 50 raw units" in out.out
+    assert "warning: no --mv-scale: EPE is in the raw stored units" in out.err
+
+
+def test_band_at_a_lower_size_keeps_a_cell_any_frame_pixel_of_which_is_on_it():
+    mask = np.zeros((8, 8), bool)
+    mask[5, 6] = True                       # in the 4 x 4 block (1, 1) only
+    assert np.array_equal(K.band_at(mask, (2, 2)), [[False, False], [False, True]])
+    assert np.array_equal(K.band_at(mask, (8, 8)), mask)
+
+
+def test_half_size_flow_and_its_total(tmp_path):
+    # Flow at 1/2: 24 x 32. EPE 5 on cells 15..16 (frame columns 30..33); the
+    # band (5 frame columns in 29..34) covers 3 cells. Two equal pairs: the
+    # TOTAL sums the counts.
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    cv2.imwrite(str(images / "0115_IMX874_Front_143.png"), step_image())
+    np.save(diffs / f"0115_IMX874_Front_143_{A}_diff_L.npy", band_diff())
+    flt = np.zeros((24, 32, 2))
+    quant = flt.copy()
+    quant[:, 15:17] = (3, 4)
+    for stem in (f"{A}_{B}", f"0115_IMX874_Front_143_{A}"):
+        write_dof(mv / f"{stem}.dof", quant, "float32")
+        write_dof(mvf / f"{stem}.dof", flt, "float32")
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--dilate", "2", "--mv-dtype",
+                        "float32", "--mv-shape", "24", "32", "--mv-unit-res", "full")
+    assert code == 0
+    assert int(rows[AB]["mv_edge_pixels"]) == 3 * 24
+    assert f(rows[AB], "mv_epe_sum_on_edges") == 5 * 2 * 24
+    t = rows["TOTAL"]
+    assert t["mv_H"] == "" and int(t["mv_edge_pixels"]) == 2 * 72
+    assert int(t["mv_pixels"]) == 2 * 24 * 32
+    assert f(t, "mv_epe_sum_on_edges") == 2 * 240
+    assert f(t, "mv_epe_mean_on_edges") == 480 / 144
+    assert f(t, "mv_frac_epe_over_1px_on_edges") == 2 * 48 / 144
+    assert math.isnan(f(t, "mv_rel_epe_on_edges"))           # float flow all zero
+
+
+def test_wrong_size_is_refused_with_the_sizes_that_would_match(tmp_path, capsys):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flow = np.zeros((12, 16, 2))                                  # 1/4, int16: 768 bytes
+    write_dof(mv / f"{A}_{B}.dof", flow)
+    write_dof(mvf / f"{A}_{B}.dof", flow)
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-dtype", "float32")
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert (f"{A}_{B}.dof: 768 bytes, but --mv-dtype float32 at 12x16 with "
+            f"--mv-header-bytes 0 needs 1536") in err
+    assert "  int16    1/4    12x16             768  yes\n" in err
+    assert "  float16  1/4    12x16             768  yes\n" in err
+    assert "  float32  1/2    24x32            6144  -\n" in err
+    assert "--mv-layout does not change the size" in err
+
+
+def test_a_header_is_offered_when_the_size_is_a_little_above_the_data(tmp_path, capsys):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flow = np.zeros((12, 16, 2))
+    write_dof(mv / f"{A}_{B}.dof", flow, header=b"PIEH" + bytes(8))
+    write_dof(mvf / f"{A}_{B}.dof", flow, header=b"PIEH" + bytes(8))
+    code, _ = run_mv(tmp_path, images, diffs, mv, mvf)
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "  int16    1/4    12x16             768  with --mv-header-bytes 12\n" in err
+    assert "starts with PIEH, as a Middlebury .flo does" in err
+    code, _ = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-header-bytes", "12")
+    assert code == 0
+
+
+def test_an_mv_folder_without_dof_files_is_an_error(tmp_path, capsys):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    write_dof(mvf / f"{A}_{B}.dof", np.zeros((12, 16, 2)))
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf)
+    assert code == 2 and rows is None
+    assert f"--mv: no .dof file in {mv}" in capsys.readouterr().err
+
+
+def test_nan_in_a_flow_is_refused(tmp_path, capsys):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flow = np.zeros((12, 16, 2))
+    write_dof(mvf / f"{A}_{B}.dof", flow, "float32")
+    flow[3, 4, 1] = np.nan
+    write_dof(mv / f"{A}_{B}.dof", flow, "float32")
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-dtype", "float32")
+    assert code == 2 and rows is None
+    assert (f"{A}_{B}.dof: 1 motion vector value(s) are NaN or inf"
+            in capsys.readouterr().err)
+
+
+@pytest.mark.parametrize("shape, unit, message", [
+    (("10", "16"), "full", "mv shape 10x16 is not the frame 48x64 divided by one integer"),
+    (("96", "128"), "full", "mv shape 96x128 is not the frame 48x64"),
+    (("24", "32"), "quarter", "--mv-unit-res quarter, but the flow is 1/2 of the frame"),
+])
+def test_a_flow_size_that_is_no_integer_division_or_unit_is_refused(tmp_path, capsys, shape,
+                                                                    unit, message):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flow = np.zeros((int(shape[0]), int(shape[1]), 2))
+    write_dof(mv / f"{A}_{B}.dof", flow)
+    write_dof(mvf / f"{A}_{B}.dof", flow)
+    code, _ = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-shape", *shape,
+                     "--mv-unit-res", unit)
+    assert code == 2 and message in capsys.readouterr().err
+
+
+def test_unmatched_mv_files_and_pairs_are_listed_and_an_error_unless_allowed(tmp_path,
+                                                                            capsys):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    cv2.imwrite(str(images / "0115_IMX874_Front_143.png"), step_image())
+    np.save(diffs / f"0115_IMX874_Front_143_{A}_diff_L.npy", band_diff())
+    flow = np.zeros((12, 16, 2))
+    for folder in (mv, mvf):
+        write_dof(folder / f"{A}_{B}.dof", flow)
+    write_dof(mv / f"0115_IMX874_Front_143_{A}.dof", flow)    # none in mv_float
+    write_dof(mv / "zzz.dof", flow)                           # names no pair
+    write_dof(mvf / f"{B}_{A}.dof", flow)                     # a pair with no diff
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf)
+    err = capsys.readouterr().err
+    assert code == 2 and rows is None
+    assert "mv file in --mv naming no pair: zzz" in err
+    assert f"mv file in --mv-float of a pair with no diff: {B}_{A}.dof" in err
+    assert f"pair without an mv file in --mv-float: 0115_IMX874_Front_143_{A}_diff_L" in err
+    assert "2 mv file(s) match no diff pair and 1 pair(s) miss an mv file" in err
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--allow-unpaired")
+    out = capsys.readouterr().out
+    assert code == 0 and set(rows) == {AB, "TOTAL"}            # skipped in every measure
+    assert (f"note: 1 pair(s) without both mv files, skipped: "
+            f"0115_IMX874_Front_143_{A}_diff_L") in out
+
+
+def test_a_name_suffix_is_read_and_printed_and_two_namings_are_refused(tmp_path, capsys):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    flow = np.zeros((12, 16, 2))
+    for folder in (mv, mvf):
+        write_dof(folder / f"{A}_{B}_mv.dof", flow)
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf)
+    assert code == 0 and int(rows[AB]["mv_H"]) == 12
+    assert "| files <A>_<B>_mv.dof\n" in capsys.readouterr().out
+    write_dof(mv / f"{A}_{B}.dof", flow)
+    code, _ = run_mv(tmp_path, images, diffs, mv, mvf)
+    assert code == 2 and "--mv: two mv files for the pair" in capsys.readouterr().err
+    os.remove(mv / f"{A}_{B}.dof")
+    cv2.imwrite(str(images / "0115_IMX874_Front_143.png"), step_image())
+    np.save(diffs / f"0115_IMX874_Front_143_{A}_diff_L.npy", band_diff())
+    write_dof(mv / f"0115_IMX874_Front_143_{A}_flow.dof", flow)
+    code, _ = run_mv(tmp_path, images, diffs, mv, mvf, "--allow-unpaired")
+    assert code == 2
+    assert "--mv: the mv file names end in 2 suffixes ('flow', 'mv')" in capsys.readouterr().err
+
+
+def test_an_ambiguous_mv_name_is_refused(tmp_path, capsys):
+    images, diffs = make_dirs(tmp_path)
+    for stem in ("a", "b", "b_x"):
+        cv2.imwrite(str(images / f"{stem}.png"), step_image())
+    np.save(diffs / "a_b_diff_L.npy", band_diff())
+    mv, mvf = tmp_path / "mv", tmp_path / "mv_float"
+    mv.mkdir()
+    mvf.mkdir()
+    for folder in (mv, mvf):
+        write_dof(folder / "a_b_x.dof", np.zeros((12, 16, 2)))   # a + b_x, or a + b + "x"
+    code, _ = run_mv(tmp_path, images, diffs, mv, mvf)
+    assert code == 2
+    assert "mv file 'a_b_x': ambiguous, it reads as the pair of a + b or a + b_x" in (
+        capsys.readouterr().err)
+
+
+def test_same_stem_pairing_pairs_mv_files_by_the_stem(tmp_path):
+    images, diffs = make_dirs(tmp_path)
+    cv2.imwrite(str(images / "a.png"), step_image())
+    np.save(diffs / "a.npy", band_diff())
+    mv, mvf = tmp_path / "mv", tmp_path / "mv_float"
+    mv.mkdir()
+    mvf.mkdir()
+    write_dof(mv / "a.dof", np.ones((12, 16, 2)))
+    write_dof(mvf / "a.dof", np.zeros((12, 16, 2)))
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--mv-scale", "1")
+    assert code == 0
+    assert f(rows["a"], "mv_epe_sum_all") == pytest.approx(math.sqrt(2) * 12 * 16)
+
+
+def test_mv_with_diffs_float_adds_the_mv_columns_after_the_compare_ones(tmp_path):
+    images, diffs, mv, mvf = mv_dirs(tmp_path)
+    floats = tmp_path / "floats"
+    floats.mkdir()
+    np.save(floats / f"{AB}.npy", band_diff(value=1.0))
+    for folder in (mv, mvf):
+        write_dof(folder / f"{A}_{B}.dof", np.zeros((12, 16, 2)))
+    code, rows = run_mv(tmp_path, images, diffs, mv, mvf, "--diffs-float", str(floats))
+    assert code == 0
+    with open(tmp_path / "kpi.csv", newline="") as fh:
+        assert next(csv.reader(fh)) == COMPARE_HEADER + list(K.MV_FIELDS)
+    assert f(rows[AB], "qerr_sum_abs_diff_all") == 2 * 4 * 48
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["--mv", "x"], "--mv needs --mv-float"),
+    (["--mv-float", "x"], "--mv-float needs --mv"),
+    (["--mv-dtype", "int16"], "--mv-dtype needs --mv"),
+    (["--mv-probe"], "--mv-probe needs --mv"),
+    (["--mv", "x", "--mv-float", "y", "--mv-scale", "0"],
+     "argument --mv-scale: expected a finite number other than 0, got '0'"),
+    (["--mv", "x", "--mv-float", "y", "--mv-scale=nan"],
+     "argument --mv-scale: expected a finite number other than 0, got 'nan'"),
+    (["--mv", "x", "--mv-float", "y", "--mv-header-bytes=-1"],
+     "argument --mv-header-bytes: expected an integer >= 0, got '-1'"),
+    (["--mv", "x", "--mv-float", "y", "--mv-shape", "0", "4"],
+     "argument --mv-shape: expected an integer >= 1, got '0'"),
+])
+def test_bad_mv_flags_are_refused(tmp_path, capsys, argv, message):
+    with pytest.raises(SystemExit) as refused:
+        K.main(["--images", str(tmp_path), "--diffs", str(tmp_path),
+                "--out", str(tmp_path / "o.csv"), *argv])
+    assert refused.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_diffs_and_out_stay_required_without_the_probe(tmp_path, capsys):
+    with pytest.raises(SystemExit) as refused:
+        K.main(["--images", str(tmp_path)])
+    assert refused.value.code == 2
+    assert "the following arguments are required: --diffs, --out" in capsys.readouterr().err
+
+
+def test_probe_prints_what_fits_and_writes_nothing(tmp_path, capsys):
+    # An interleaved (hw2) int16 flow at 1/4, u -60 and v 500 everywhere: read
+    # as hw2 each plane is flat (step 0); read as 2hw, plane 0 alternates
+    # u, v, u, ... (step |500 - -60| = 560, median (500 - 60) / 2 = 220).
+    images, _, mv, _ = mv_dirs(tmp_path)
+    flow = np.zeros((12, 16, 2))
+    flow[..., 0], flow[..., 1] = -60, 500
+    write_dof(mv / f"{A}_{B}.dof", flow, layout="hw2")
+    before = sorted(p.name for p in tmp_path.rglob("*"))
+    code = K.main(["--images", str(images), "--mv", str(mv), "--mv-probe"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert sorted(p.name for p in tmp_path.rglob("*")) == before
+    assert f"{A}_{B}.dof, 768 bytes" in out
+    assert "  int16    1/4    12x16             768  yes\n" in out
+    assert "int16 12x16 header 0: 0 non-finite value(s), as stored (before --mv-scale)" in out
+    assert "  hw2: u min -60 max -60 median -60 step 0 | v min 500 max 500 median 500 step 0" in out
+    assert "  2hw: u min -60 max 500 median 220 step 560 | v min -60 max 500 median 220 step 560" in out
+    assert "probe only: nothing measured, nothing written" in out
