@@ -296,10 +296,10 @@ class CalibratedMXAdd(nn.Module):
 
 
 def pack_warp_reference(reference: torch.Tensor, mx_type: str = "mx-e4bm8", block_size: int = 32) -> MXTensor:
-    """Pack the warp reference as uint8 with zero exponents (plain INT).
+    """Pack the warp reference as integer codes with zero exponents (plain INT).
 
     The reference is NOT quantized to MX: just ``round + clamp`` into the
-    uint8 range and store with an all-zero exponent field (the first-layer
+    selected integer range and store with an all-zero exponent field (the first-layer
     integer-input rule).  ``e_min_layer = mantissa_offset`` (calibrate_offset
     0) so the PCU's effective shift becomes ``out_cal - (frx + fry)``.
 
@@ -313,14 +313,12 @@ def pack_warp_reference(reference: torch.Tensor, mx_type: str = "mx-e4bm8", bloc
     cfg = mx_config_factory[mx_type]
     if reference.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         # integer reference (sensor format): only clamp, rounding is a no-op
-        q = reference.clamp(0, 255).long()
+        q = reference.clamp(0, 255).long() if reference.dtype == torch.uint8 else reference.clamp(-128, 127).long()
     else:
-        q = torch.round(reference).clamp(0, 255).long()
+        q = torch.round(reference).clamp(-128, 127).long()
     W = q.shape[-1]
     num_blocks = math.ceil(W / block_size)
     pad = num_blocks * block_size - W
-    if pad:
-        q = F.pad(q, (0, pad), mode="constant", value=0)
     # blocks = q.view(*q.shape[:-1], num_blocks, block_size)
     blocks = q
     return MXTensor(
@@ -350,36 +348,15 @@ def grid_quantization(
 
 
 def pack_warp_grid(coords: torch.Tensor, grid_bit_width: int = 16,
-                   mx_type: str = "mx-e4bm16") -> tuple:
-    """Pack warp sample coordinates into the int16 fixed-point grid (mx-e4bm16).
-
-    This is the notebook's ``grid_quantization``: the grid holds the ABSOLUTE
-    sample position in pixels, quantized per axis with adaptive fraction bits
-
-        frac_bits_axis = grid_bit_width - floor(log2(ceil(max|coord_axis|))) - 2
-
-    so the fixed-point word ``q = round(coord * 2**frac)`` fits the wide
-    (16-bit) lane by construction.  The exponent field is all zero -- the
-    value lives in the mantissa ("NOT MX INT BUT INT").
-
-    The TRC weights are exact over ``2**(frx + fry)`` and must fit the 16-bit
-    weight lane, so the total fraction bits are capped at
-    ``min(grid_bit_width - 2, 14)``.  On small frames both axes are reduced
-    as evenly as possible, which keeps the x/y quantization error balanced.
-
-    Args:
-        coords: float tensor [B, 2, H_out, W_out] absolute sample coordinates
-                (channel 0 = x columns, channel 1 = y rows).
-
-    Returns:
-        (mx_grid, frac_bits): mx_grid an ``mx-e4bm16`` MXTensor whose data is
-        int16 [B, 2, H_out, W_out]; frac_bits an int tensor [frx, fry].
-    """
-
-    quantized_grid, max_motion, frac_bits = grid_quantization(
-        coords[0],
-        grid_bit_width
-    )
+                   mx_type: str = "mx-e4bm16", frac_bits=(8, 8)) -> tuple:
+    """Pack an encoded int16 relative grid with configured per-axis fraction bits."""
+    if coords.dtype != torch.int16:
+        raise TypeError("warp grid must be encoded int16 relative motion")
+    frx, fry = frac_bits_pair(frac_bits)
+    if not (0 <= frx <= 8 and 0 <= fry <= 8):
+        raise ValueError("per-axis fraction bits must be in 0..8")
+    frac_bits = torch.tensor([frx, fry], device=coords.device, dtype=torch.long).reshape(1, 2, 1, 1)
+    quantized_grid = coords
 
     cfg = mx_config_factory[mx_type]
 
@@ -470,7 +447,7 @@ class CalibratedMXWarp(nn.Module):
 
         self.mx_warp = MXWarp_Loops(channels=channels, acc_bit_width=acc_bit_width)
 
-        # calibrated per grid fraction bits (data-dependent)
+        # PCU configuration follows the supplied grid format.
         self._frac_key = None
         self.is_calibrate = True
 
@@ -485,9 +462,7 @@ class CalibratedMXWarp(nn.Module):
     def calibrate(self, frac_bits=(7, 7)):
         """(Re)build the warp PCU c_structs for these grid fraction bits. Idempotent.
 
-        The fraction bits are data-dependent (they come from the coordinate
-        magnitude), so ``forward`` calls this automatically whenever they
-        change; call it directly only to pre-calibrate or to override.
+        Fraction bits are supplied by the preceding layer.
         """
         self.mx_warp.load_c_struct(
             build_warp_c_struct_arr(
@@ -499,16 +474,10 @@ class CalibratedMXWarp(nn.Module):
         )
         self._frac_key = tuple(int(v) for v in frac_bits_pair(frac_bits))
 
-    def forward(self, reference: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        qp = self.qparams
-        mx_ref = pack_warp_reference(reference, mx_type=qp.mx_type)
-        mx_grid, frac_bits = pack_warp_grid(coords, grid_bit_width=self.grid_bit_width)
-
-        # if self.is_calibrate:
-        #     key = tuple(int(v) for v in frac_bits)
-        #     if key != self._frac_key:
-        #         self.calibrate(frac_bits)
-        #     # return sw_warp(reference, coords)
-        out = self.mx_warp(mx_ref, mx_grid, frac_bits)
-        out_dq = out / 2.**frac_bits.sum() # workaround because I need to absorb the scale from this into the pcu (c_struct) 
-        return out_dq 
+    def forward(self, reference: torch.Tensor, coords: torch.Tensor, frac_bits=(8, 8)) -> torch.Tensor:
+        if reference.shape[0] != 1 or coords.shape[0] != 1 or reference.shape[-2:] != coords.shape[-2:]:
+            raise ValueError("warp requires one frame and a same-size grid")
+        mx_ref = pack_warp_reference(reference, mx_type=self.qparams.mx_type)
+        mx_grid, fr = pack_warp_grid(coords, grid_bit_width=self.grid_bit_width, frac_bits=frac_bits)
+        self.calibrate(fr)
+        return self.mx_warp(mx_ref, mx_grid, fr)

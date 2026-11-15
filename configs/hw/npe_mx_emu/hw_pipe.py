@@ -254,7 +254,7 @@ def trc_warp(q_x: torch.Tensor,
     frx, fry = frac_bits_pair(frac_bits)
     if frx < 0 or fry < 0:
         raise ValueError(f"frac_bits must be non-negative, got {(frx, fry)}")
-    if frx + fry > 14:
+    if not (0 <= frx <= 8 and 0 <= fry <= 8):
         raise ValueError(
             f"weight scale 2**{frx + fry} overflows the 16-bit weight mantissa "
             f"(mx-e4bm16 holds up to 2**14); frac_bits={(frx, fry)}"
@@ -346,7 +346,7 @@ def bcu(
     if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
         raise NotImplementedError(f"acc_bit_width must be one of {SUPPORTED_ACC_WIDTHS}")
 
-    prod_mant = (x_data * w_data).long()
+    prod_mant = x_data.long() * w_data.long()
     combined_exp = (x_exp + w_exp).long()
     # exact integer scaling (both branches get a non-negative shift)
     shifted = torch.where(
@@ -766,20 +766,26 @@ def get_ref_frame(src, x_offset, y_offset):
     # this is a relative grid and to be able to handle the last element in the line it copied
     src_height, src_width = src.shape[2:]
 
-    xs0 = torch.clamp(torch.floor(x_offset), 0, src_width - 2).long()
-    ys0 = torch.clamp(torch.floor(y_offset), 0, src_height - 2).long()
+    xs0 = torch.clamp(torch.floor(x_offset), 0, src_width - 1).long()
+    ys0 = torch.clamp(torch.floor(y_offset), 0, src_height - 1).long()
 
     ref00 = src[..., ys0, xs0]
-    ref01 = src[..., ys0, xs0 + 1]
-    ref10 = src[..., ys0 + 1, xs0]
-    ref11 = src[..., ys0 + 1, xs0 + 1]
+    ref01 = src[..., ys0, (xs0 + 1).clamp(max=src_width - 1)]
+    ref10 = src[..., (ys0 + 1).clamp(max=src_height - 1), xs0]
+    ref11 = src[..., (ys0 + 1).clamp(max=src_height - 1), (xs0 + 1).clamp(max=src_width - 1)]
 
     return ref00, ref01, ref10, ref11
 
 
 def trc(quantized_grid, src, frac_bits):
-    x_offset, x_frac = split_msb_lsb(quantized_grid[0, 0, ...].to(dtype=torch.int16), frac_bits[0][0])
-    y_offset, y_frac = split_msb_lsb(quantized_grid[0, 1, ...].to(dtype=torch.int16), frac_bits[0][1])
+    frx, fry = frac_bits_pair(frac_bits)
+    h, w = src.shape[-2:]
+    yy, xx = torch.meshgrid(torch.arange(h, device=src.device),
+                            torch.arange(w, device=src.device), indexing="ij")
+    qx = (quantized_grid[0, 0].long() + (xx << frx)).clamp(0, (w - 1) << frx)
+    qy = (quantized_grid[0, 1].long() + (yy << fry)).clamp(0, (h - 1) << fry)
+    x_offset, x_frac = split_msb_lsb(qx, frx)
+    y_offset, y_frac = split_msb_lsb(qy, fry)
     # interpulate_weights = torch.stack(gen_warp_weights(x_frac, y_frac))
     # frame_coords = torch.stack(get_ref_frame(src, ys0, xs0))
 
@@ -845,7 +851,7 @@ class MXWarp_Loops(nn.Module):
 
         output = torch.zeros(
             batch_size, self.channels, out_height, out_width,
-            device=mx_ref.data.device
+            device=mx_ref.data.device, dtype=torch.int64
         )
 
         tru_a_elem_data, tru_w_elem_data = trc(mx_grid.data, mx_ref.data, frac_bits)
@@ -876,7 +882,7 @@ class MXWarp_Loops(nn.Module):
                     # TODO in a network use the scale from frac_bits, obtained by pack_warp_grid to compute the actual o_line
                     # this code is only to simplify this
                     # o_line = pcu(p_sum, c_struct=self.c_struct_arr[c], e_min_layer=mx_ref.e_min_layer)
-                    o_line = p_sum 
+                    o_line = pcu(p_sum, c_struct=self.c_struct_arr[c], e_min_layer=mx_ref.e_min_layer) 
                     # return a line in a channel in a batch
                     output[b, c, oh, :] = o_line
 

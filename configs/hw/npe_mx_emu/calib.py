@@ -86,7 +86,7 @@ def build_warp_c_struct_arr(
     bias: torch.Tensor,
     out_channels: int,
     frac_bits=(7, 7),
-    relux_bits: int = 24,
+    relux_bits: int = 8,
 ) -> dict:
     """Derive the PCU c_structs for a warp layer.
 
@@ -113,9 +113,9 @@ def build_warp_c_struct_arr(
         raise ValueError(f"bias has {bias.shape[0]} channels, layer expects {out_channels}")
     frx, fry = frac_bits_pair(frac_bits)
     fp = frx + fry
-    if fp > 14:
+    if not (0 <= frx <= 8 and 0 <= fry <= 8):
         raise ValueError(
-            f"weight scale 2**{fp} overflows the 16-bit weight mantissa (max 2**14); "
+            f"weight scale 2**{fp} overflows the 16-bit weight mantissa (max 2**16); "
             f"frac_bits={(frx, fry)}"
         )
     mo = mantissa_offset(qparams.mx_type)
