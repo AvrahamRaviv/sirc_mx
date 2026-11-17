@@ -55,6 +55,8 @@ from typing import NamedTuple, Optional
 import torch
 import torch.nn.functional as F
 
+from fixed_point.fxp_quant import _round_to_int
+
 MANTISSA_BIAS = 6  # legacy: MXINT8 mantissa bias. New code: use _int_format_params.
 OUT_EXP_BITS = 4   # HW output shared-exponent width (xblock_accum.out_exp_bits)
 
@@ -364,7 +366,7 @@ def _bias_to_grid(bias_fp, e_grid, half_up, device):
     `half_up` floor(v + 0.5), ties toward +inf, the HW's offline rounding
     (PLA, xblock_accum.bias_round 'half_up'). The one bias rounding helper."""
     v = bias_fp.detach().to(torch.float64).to(device) * float(2.0 ** (-int(e_grid)))
-    return ((v + 0.5).floor() if half_up else v.round()).to(torch.int64)
+    return _round_to_int(v, "half_up" if half_up else "half_even").to(torch.int64)
 
 
 def pla_bins(m_pos, m_neg, bias_fp, e_acc, frac):

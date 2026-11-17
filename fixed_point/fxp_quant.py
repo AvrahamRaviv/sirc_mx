@@ -27,7 +27,7 @@ import math
 
 import torch
 
-_VALID_ROUND_MODES = ("half_away", "half_even", "trunc")
+_VALID_ROUND_MODES = ("half_away", "half_even", "half_up", "trunc")
 _MIN_TOTAL_BITS = 2
 _MAX_TOTAL_BITS = 32
 
@@ -39,7 +39,7 @@ OUT_QUANT_DEFAULTS = {
     "calibrate": False,      # True = `scale` is frozen from data by a calibration pass
     "pow2": False,           # calibration rounds the step up to a power of two
     "signed": True,
-    "round": "half_away",    # 'half_away' | 'half_even' | 'trunc'
+    "round": "half_away",    # 'half_away' | 'half_even' | 'half_up' | 'trunc'
     "saturate": True,        # clamp to the representable range (False = lattice only)
     "clip_grad": False,      # True = zero the gradient of saturated elements
     "outputs": "all",        # 'all', or a list of indices when the module returns a tuple
@@ -188,6 +188,10 @@ def _round_to_int(v, round_mode):
         return torch.floor(v.abs() + 0.5).copysign(v)
     if round_mode == "half_even":
         return torch.round(v)
+    if round_mode == "half_up":
+        # Nearest, ties toward +inf: the NPE PCU rounding (37.5 -> 38, -37.5 ->
+        # -37; HW warp Q&A, Q7), also its offline bias rounding.
+        return torch.floor(v + 0.5)
     if round_mode == "trunc":
         return torch.trunc(v)
     raise ValueError(
@@ -213,7 +217,8 @@ def fake_quant_fxp(x, frac_bits=8, total_bits=16, signed=True,
             restricted to shifts.
         total_bits: full word width, including the sign bit when `signed`.
         signed: two's-complement range vs unsigned.
-        round_mode: 'half_away' (HW convention) | 'half_even' (torch.round) | 'trunc'.
+        round_mode: 'half_away' (default) | 'half_even' (torch.round) |
+            'half_up' (ties toward +inf, the NPE PCU rule) | 'trunc'.
         saturate: clamp out-of-range values to the ends. False keeps the lattice
             but allows any magnitude — useful to isolate rounding from clipping.
         clip_grad: zero the gradient of elements that saturated. Default False

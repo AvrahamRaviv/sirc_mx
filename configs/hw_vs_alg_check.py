@@ -20,8 +20,9 @@ difference moved. Sections:
       ReLU, (b) PReLU, (c) rounding and clamp
   T12 warp (main_ALG.warp vs main_HW.warp on their CalibratedMXWarp): one
       vector per ALG-vs-HW difference of the warp deep run, each labelled
-      [D<n> | HW Q<m>] with its question in the list sent to the HW team
-      (warp_vectors.py)
+      [D<n> | HW Q<m>] with its question in hw/warp_hw_questions_and_answers.md
+      and the value that answer gives (warp_vectors.py); then the vectors
+      where ALG or their emulator is off the answer, and the open ones
 A section whose cases a config cannot run (no grids for them, a format a side
 refuses) prints "<T> skipped on <config>: <why>" and the run goes on; the last
 line names every skipped section. Exit (sim_cli): 0 every section ran; 2 one
@@ -92,25 +93,33 @@ def finish():
 
 # ---------------------------------------------------------------- T12 warp
 # The vectors live in warp_vectors.py (one per difference D1-D10, labelled
-# with its HW question), so tests read the same values this prints.
+# with its HW question, each with the value the HW answer gives), so tests
+# read the same values this prints.
 import warp_vectors as _WV
 
 
 def warp_section():
     """T12; on a config the warp cannot run on, says so and why, and the
-    run goes on (T1-T11 do not depend on the warp)."""
-    hdr("T12 warp: ALG (main_ALG) vs HW (their CalibratedMXWarp via main_HW)")
+    run goes on (T1-T11 do not depend on the warp). After the vectors, names
+    every resolved one where ALG, or their emulator, is off the HW answer,
+    and every one the answer leaves open."""
+    hdr("T12 warp: ALG (main_ALG) vs HW (their CalibratedMXWarp via main_HW) vs the HW answer")
     why = _WV.probe(CFG)
     if why is not None:
         skip("T12", why)
         return
     sp = _H.warp_spec(CFG)
-    print(f"  config grid: int{sp['grid_bits']}, frac {sp['frac_cfg']}, relative flow "
-          f"(call site {sp['call_site']}); theirs: absolute position, frac from the "
-          f"data. acc in reference code units.")
-    for v in _WV.vectors(CFG):
+    print(f"  config grid: int{sp['grid_bits']}, frac {list(sp['frac'])}, relative motion "
+          f"(call site {sp['call_site']}). acc in reference code units.")
+    vs = _WV.vectors(CFG)
+    for v in vs:
         print(f"  [{v['label']}] {v['text']}")
-    print(f"  {_WV.D10_NOTE}")
+    off_alg, off_hw = _WV.gaps(vs)
+    for who, off in (("ALG", off_alg), ("their emulator", off_hw)):
+        print(f"  {who} off the HW answer: "
+              + (", ".join(v["label"] for v in off) if off else "none"))
+    print("  open in the HW answers: "
+          + (", ".join(v["label"] for v in vs if v["status"] != _WV.RESOLVED) or "none"))
 
 
 if ARGS.only == "warp":

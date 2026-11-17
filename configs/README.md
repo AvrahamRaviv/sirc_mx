@@ -16,8 +16,8 @@ conv), and **warp**.
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
 | `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv (incl. PLA via a labelled bins stand-in) and warp (`CalibratedMXWarp`) run on their code. convT is a placeholder: their emulator has no convT |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop. `--only warp`: the warp vectors (T12) alone |
-| `warp_vectors.py` | the T12 warp vectors: label, printed text, and each side's values |
-| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
+| `warp_vectors.py` | the T12 warp vectors: label, printed text, each side's values and the value the HW answer gives |
+| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `warp_hw_questions_and_answers.md` (their warp answers: the HW spec of the warp), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib; per-call-site fxp lists by the lib's pure rule, `fixed_point/fxp_sites.py`) |
 | `sim_cli.py` | what the CLIs share: the exit codes, and the many-case loop that reports each refusal and goes on |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
@@ -33,7 +33,7 @@ conv), and **warp**.
 |---|---|
 | conv | `x w a_int a_exp w_int w_exp acc sat out` |
 | convt | `x w a_int a_exp w_int w_exp out` (HW adds `x_dil`) |
-| warp | `x flow ref_code grid_code out_pre out_code out` (HW: see HW warp) |
+| warp | `x flow ref_code grid_code out_pre out_code out` (HW: the same names but `out_pre`, see HW warp) |
 
 - **conv**:
   - Integer form: `value = mant * 2^(E-6)` and `code = E + 127`.
@@ -43,15 +43,21 @@ conv), and **warp**.
   - `xblock_accum.convT = "hw"`: the lib's `MXConvTranspose2dHW` quantizes the compact input (blocks along W), zero-inserts the extracted operand and runs the HW conv. Taps as conv; `w_int` / `w_exp` are its equivalent conv weight `[O, Cin, kH, kW]`. HW confirmed this order (quantize compact, zeros never in a block).
   - Otherwise plain MX blocked along Cin with fp32 accumulation: only `out` compares, as float.
   - HW side: their emulator has no convT yet (output interleaving still open).
-- **warp**:
-  - `ref` is int8 with a static scale.
-  - `grid` is Q8.8: a displacement in px, channel 0 = x.
-  - Bilinear with 8-bit weights; samples outside the image count as 0.
+- **warp** (the HW spec: `hw/warp_hw_questions_and_answers.md`):
+  - `ref` is int8 with a static scale (Q6).
+  - `grid` is Q8.8: a displacement in px, channel 0 = x (relative motion, Q3).
+  - Bilinear with 8-bit weights per axis. Border (`cases.Warp`, Q1, Q2, Q10): the
+    whole sample position saturates to the frame, `[0, W-1] x [0, H-1]`, and the
+    +1 neighbour of the last row / column is that row / column again: edge
+    replication, zero motion returns the frame, no padding.
   - `out` is int8 with a static scale, when the warp entry has an `output` fxp. With none (the
     `hw_exact` and `dof_run` configs), or one the lib reads as off (`false`, `null`,
     `{"enabled": false}`), the lib leaves the warp result unrounded: ALG `out` is
     `out_pre`, there is no `out_code`, and the run prints a line saying so (`main_ALG.warp_out_note`).
-  - Every step rounds half away from zero and saturates.
+  - Each step rounds by its fxp's `round` and saturates. The shipped configs say
+    `half_away` (ties away from zero); HW rounds the grid word (in the producing
+    layer) and the output half up, ties toward +inf (Q5, Q7), which the lib's
+    fxp `round: "half_up"` gives (opt-in, default unchanged).
 
 ## Usage
 
@@ -137,59 +143,90 @@ parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.
 
 ## HW warp (npe_mx_emu)
 
-`main_HW.warp` runs their `CalibratedMXWarp` as their example notebook
-calls it; nothing of theirs is reimplemented or edited:
-1. Inputs from the case: `reference = x / ref_scale` (code units; their
-   packer rounds half to even and clamps to uint8 0..255, no scale) and
-   `coords` = absolute positions, mesh + flow, `[B, H, W, 2]`, float64 as in
-   their notebooks (their weights and bcu product take the coordinates' dtype).
-2. Config: grid word width (their `grid_bit_width`) and fraction bits from the
-   warp entry's grid fxp at call site 0 (a per-site list must hold one spec
-   per call site, by the lib's rule in `fixed_point/fxp_sites.py`, else
-   refused; the sim runs one forward, so both sides use site 0; `call_sites`
-   is tapped);
-   accumulator width from `xblock_accum.bits` (the BCU conv uses). Refused
-   unless the reference is 8-bit and the grid word at most 16 bits.
-3. Setup: `LayerMXQParams(x_cal=0, w_cal=0, out_cal=0)` (output in code
-   units), then `calibrate()` with its default fraction bits (7, 7). It only
-   fills the PCU c_structs, which `forward()` requires and never reads (their
-   PCU is bypassed). Nothing comes from data.
+The HW spec of the warp is their answers, `hw/warp_hw_questions_and_answers.md`
+(Q11: their corrected BCU -> PCU emulator is the reference). `main_HW.warp`
+runs their `CalibratedMXWarp.forward(reference, grid, frac_bits)`; nothing of
+theirs is reimplemented or edited:
+1. Inputs from the case: `reference = x / ref_scale` in code units (their
+   packer rounds it and clamps to int8 [-128, 127], Q6); `grid` = the flow as
+   the int16 relative-motion word in the config's Q format, as the producing
+   layer's PCU gives it: `floor(flow * 2^frac + 1/2)`, ties toward +inf,
+   saturated to the grid word (`main_HW.grid_word`, Q3, Q5, Q7).
+2. Config: the fraction bits (frx, fry) from the warp entry's grid fxp at
+   call site 0 (a per-site list must hold one spec per call site, by the lib's
+   rule in `fixed_point/fxp_sites.py`, else refused; the sim runs one forward,
+   so both sides use site 0; `call_sites` is tapped), passed to their code;
+   accumulator width from `xblock_accum.bits` (the BCU conv uses).
+3. Setup: `LayerMXQParams(x_cal=0, w_cal=0, out_cal)`, with `out_cal =
+   log2(ref_scale / out_scale)`: their PCU only shifts, so out step = ref step
+   * 2^-out_cal. Their forward builds the PCU c_structs from the fraction bits
+   (int8 output, relux 8) and applies the PCU: round half up, int8 saturate.
 4. Taps, by pass-through wrappers on `pack_warp_reference`, `pack_warp_grid`,
-   `trc` and `bcu`: `hw_ref_code` (W padded to 32), `hw_grid_code`,
-   `hw_frac_bits`, `hw_weights`, `hw_corners`, `hw_acc` (bcu's int64 p_sum,
-   taken inside their loop), `out_raw` (their float32 output as is: acc /
-   2^(frx+fry), rounded by float32 once |acc| > 2^24) and
-   `out = out_raw * ref_scale`.
+   `trc` and `bcu`: `ref_code`, `grid_code`, `frac_bits`, `hw_weights`,
+   `hw_corners`, `hw_acc` (bcu's int64 p_sum, taken inside their loop),
+   `out_shift`, `out_code` (their int64 PCU output) and
+   `out = out_code * out_scale`. `ref_code`, `grid_code`, `out_code` and `out`
+   are the same names as ALG's, so the generic compare checks them bit for bit.
 
-Their fraction bits come from the data (per frame, from max |position|); the
-config's are fixed. `frac_cfg`, `hw_frac_bits` and `frac_match` show both, and
-a `!!` line is printed when they differ; their code runs on its own.
-`frac_over`: frx + fry above 14, their weight lane (their `trc_warp` and
-`build_warp_c_struct_arr` refuse it, the path that runs does not).
+Refused (a named `NotImplementedError`, never their `ValueError`), because
+their code does not take it: more than one frame (Q8: one frame and one grid
+per call), a grid of another size (Q10), a non-finite reference, a reference
+that is not signed 8-bit (their uint8 lane needs a uint8 tensor, whose
+float-to-code rounding is open, Q5), an output fxp that is not int8, a grid
+wider than int16 or with fraction bits outside 0..8 (Q3), and an out / ref
+step that is not a power of two (`warp_subpix`: the PCU multiplier format is
+open, Q7).
 
-Refused, because their code would give wrong numbers without an error:
-batch > 1 with different flows (they read batch 0's grid), a reference their
-packer would clamp (negative or above 255, so the randn warp cases), a
-non-finite reference, H < 2, and an axis whose fraction bits come out infinite
-or negative. The `warp_u8_*` cases (codes
-0..127, the range both sides hold the same) run on both sides.
+main.py adds the accumulator in reference code units, inside the frame and on
+the border, labelled with the questions it bears on, and the lines a reader
+must not miss: frx + fry = 16 makes the zero-fraction weight 2^16, which
+their int64 weight holds and a plain 16-bit field does not (open, Q4).
 
-main.py adds, per stage and labelled with the numbers of the questions sent
-to the HW team: ref code, grid position (px), acc inside the frame and on the
-border (code units), and their float32 output against their own int64 acc.
-The generic compare covers `out`. ALG's int8 `out_code` has no HW counterpart.
-`hw_vs_alg_check.py` T12 has one vector per difference, labelled the same way
-(built in `warp_vectors.py`, which keeps each vector's ALG and HW values for
-the tests). On a config the warp cannot run on (no `act_quant` entry, a
-warp entry missing an input or its fxp, a per-site list of the wrong length;
-any refusal, `sim_config.REFUSED`) T12 prints
-`T12 skipped on <config>: <why>` (`warp_vectors.probe`). The same
-holds for every section: T1-T10 run on fixed conv cases (`conv3x3_p0`, `conv1x1`, `conv3x3_p0_bias`), so a
-config that holds grids only for its own cases (`npe_e4_pla`,
-`npe_hw_exact_in`) skips them with the reason, and the rest runs. The last
-line names the skipped sections; exit 0 when every section ran, 2 when one
-was skipped (the exit codes above). Any other error, in T12 or any section, is
-not a skip: it propagates with its traceback, exit 1.
+Result on `mx_config_npe_e4.json`: every warp case HW runs agrees with ALG
+on ref, grid and acc (border included); `out_code` differs only on a
+negative tie (`warp_half_pixel`, `warp_neg_frac`, `warp_oob`), because that
+config rounds the output half away and HW half up. With the warp's grid and
+output fxp at `round: "half_up"` every one is bit-exact. Configs with no
+output fxp (`hw_exact`, `dof_run`) leave ALG's out unrounded, against HW's
+int8 (a float difference, said by the run).
+
+`hw_vs_alg_check.py` T12 has one vector per question, labelled `[D<n> | HW
+Q<m>]` (built in `warp_vectors.py`, which keeps each vector's ALG and HW
+values for the tests), each with the value the HW answer gives, worked out
+from the answer (never from their code), and whether the answer is
+`resolved` or what it leaves `open`. Then it names the resolved vectors where
+ALG, or their emulator, is off the answer, and the open ones:
+
+| vector | question | status |
+|---|---|---|
+| D1 border, far edge (y = H-1+0.25 -> the edge pixel) | Q1 | resolved |
+| D1 border, near edge (x = -0.25 -> the edge pixel, as their emulator clamps) | Q1 | open: negative words, four-side symmetry |
+| D1 identity, last row and column | Q2 | resolved |
+| D2 relative motion in the config's Q format | Q3 | resolved |
+| D3 frx + fry = 16, the 2^16 weight | Q4 | open: its encoding in the 16-bit field |
+| D4 grid ties (+-0.5/256 -> +1 / 0) | Q5 | resolved; ALG off it on half_away configs |
+| D6 reference ties (float to code) | Q5 | open: the tie rule |
+| D5 reference format (int8) | Q6 | resolved |
+| D7 output ties (37.5 -> 38, -37.5 -> -37) | Q7 | resolved; ALG off it on half_away configs |
+| D8 batch (one frame per call) | Q8 | resolved |
+| D9 integer store (D10 integer product) | Q9 | resolved |
+| D1 padding (x = W-1+0.5 at W = 40 and 32) | Q10 | resolved |
+
+Not modelled (the answers do not specify them, or the agreed scope excludes
+them): the X / Y motion limits and how the fraction bits reach the HW
+(passed through, Q3), `reference_offset`, the PCU multiplier format (Q7),
+native batch and other grid sizes.
+
+On a config the warp cannot run on (no `act_quant` entry, a warp entry
+missing an input or its fxp, a per-site list of the wrong length; any
+refusal, `sim_config.REFUSED`) T12 prints `T12 skipped on <config>: <why>`
+(`warp_vectors.probe`). The same holds for every section: T1-T10 run on fixed
+conv cases (`conv3x3_p0`, `conv1x1`, `conv3x3_p0_bias`), so a config that
+holds grids only for its own cases (`npe_e4_pla`, `npe_hw_exact_in`) skips
+them with the reason, and the rest runs. The last line names the skipped
+sections; exit 0 when every section ran, 2 when one was skipped (the exit
+codes above). Any other error, in T12 or any section, is not a skip: it
+propagates with its traceback, exit 1.
 
 ## Static grids and PLA
 

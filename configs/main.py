@@ -115,43 +115,26 @@ def _row(stage, q, a, h, tol=0.0, mask=None):
 
 
 def warp_stages(case, alg, hw):
-    """The warp, ALG vs HW, per stage where both sides have one, in units both
-    share. Rows {stage, q (the HW question it bears on), n, n_diff, max_d}:
-      ref code     ALG int8 ref_code vs their uint8 code (padding dropped)
-      grid px      sample position each grid word stands for: ALG mesh +
-                   grid_code / 2^frac_cfg vs theirs hw_grid_code / 2^hw_frac_bits
-      acc interior the bilinear sum in ref code units, ALG out_pre / ref_scale
-      acc border   vs their hw_acc / 2^(frx+fry); interior = all 4 corners of
-                   ALG's position inside the frame, border = the rest
-    `out` is in the generic tap compare. ALG's int8 out_code has no HW
-    counterpart: their PCU is bypassed (HW Q7)."""
+    """The warp accumulator, ALG vs HW, in reference code units (the other
+    warp stages, ref_code grid_code out_code, are shared taps in the generic
+    compare). Rows {stage, q (the HW questions it bears on), n, n_diff, max_d},
+    each ALG out_pre / ref_scale vs their hw_acc / 2^(frx+fry):
+      acc interior  where all 4 corners of the sample position (mesh +
+                    grid_code / 2^frac_bits) lie inside the frame
+      acc border    the rest
+    """
     B, _, H, W = case["x"].shape
     yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float64),
                             torch.arange(W, dtype=torch.float64), indexing="ij")
-    mesh = torch.stack([xx, yy])                               # [2, H, W]
-    fa = hw["frac_cfg"].double().view(1, 2, 1, 1)
-    fh = hw["hw_frac_bits"].double().view(1, 2, 1, 1)
-    a_pos = mesh + alg["grid_code"].double() / 2.0 ** fa       # [B, 2, H, W]
-    h_pos = (hw["hw_grid_code"].double() / 2.0 ** fh).expand_as(a_pos)
-    k = int(hw["frac_sum"])
+    fr = hw["frac_bits"].double().view(1, 2, 1, 1)
+    pos = torch.stack([xx, yy]) + alg["grid_code"].double() / 2.0 ** fr   # [B, 2, H, W]
     a_acc = alg["out_pre"].double() / case["warp"]["ref_scale"]
-    h_acc = hw["hw_acc"].double() / 2.0 ** k
-    x0, y0 = torch.floor(a_pos[:, 0]), torch.floor(a_pos[:, 1])
+    h_acc = hw["hw_acc"].double() / 2.0 ** float(fr.sum())
+    x0, y0 = torch.floor(pos[:, 0]), torch.floor(pos[:, 1])
     inside = (x0 >= 0) & (x0 + 1 < W) & (y0 >= 0) & (y0 + 1 < H)   # [B, H, W]
     inside = inside.unsqueeze(1).expand_as(a_acc)
-    return [_row("ref code", "Q5 Q6", alg["ref_code"], hw["hw_ref_code"][..., :W]),
-            _row("grid px", "Q3 Q5", a_pos, h_pos),
-            _row("acc interior", "Q3", a_acc, h_acc, WARP_ACC_TOL, inside),
+    return [_row("acc interior", "Q3", a_acc, h_acc, WARP_ACC_TOL, inside),
             _row("acc border", "Q1 Q2 Q10", a_acc, h_acc, WARP_ACC_TOL, ~inside)]
-
-
-def warp_float32_store(hw):
-    """(n, n above 2^24, n rounded): their float32 output vs their own int64
-    acc. out_raw * 2^(frx+fry) is exact where |acc| <= 2^24 (HW Q9)."""
-    acc = hw["hw_acc"]
-    back = hw["out_raw"].double() * 2.0 ** int(hw["frac_sum"])
-    return (acc.numel(), int((acc.abs() > 2 ** 24).sum()),
-            int((back != acc.double()).sum()))
 
 
 def report_warp(case, alg, hw, cfg):
@@ -159,12 +142,10 @@ def report_warp(case, alg, hw, cfg):
     for r in warp_stages(case, alg, hw):
         print(f"    {r['stage']:<13} {r['q']:<10} {r['n_diff']:>6}/{r['n']:<6} "
               f"differ, max {r['max_d']:.6g}")
-    n, big, rounded = warp_float32_store(hw)
-    print(f"    their float32 output vs their int64 acc (Q9): {big}/{n} acc above "
-          f"2^24, {rounded} rounded")
     note = ALG.warp_out_note(cfg)
-    print(f"    {note}" if note is not None else
-          "    ALG out_code: no HW counterpart, their PCU is bypassed (Q7)")
+    if note is not None:
+        print(f"    {note}")
+        print("    HW out: their PCU gives an int8 word (Q7), so out differs from ALG's")
     for line in HW.warp_notes(hw):
         print(f"  {line}")
 

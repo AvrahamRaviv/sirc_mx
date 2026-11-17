@@ -407,7 +407,8 @@ def warp(case, cfg, taps):
     out_pre out_code | out.
 
     ref: int8, static scale.  grid: Q8.8 (int16, step 1/256 px).
-    out: int8, static scale.  All round half away from zero and saturate.
+    out: int8, static scale.  Each rounds by its fxp's `round` and
+    saturates; the border is cases.Warp's (the HW rule).
     One real forward of a fresh module: call site WARP_CALL_SITE (0) of a
     per-site config.
     `_tap` makes it keep its quantized inputs, the raw bilinear result and

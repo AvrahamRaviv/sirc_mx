@@ -17,7 +17,9 @@ Rules:
      shifts and a saturating accumulator only - if both sides shared the
      quantizer, agreeing would prove nothing. Config reading is shared on
      purpose: per-call-site fxp lists go through fixed_point/fxp_sites (pure
-     python, via sim_config), so both sides accept and refuse the same configs.
+     python, via sim_config), and an fxp key a config leaves out takes the
+     lib's default (fixed_point/fxp_quant OUT_QUANT_DEFAULTS, a dict, never its
+     quantizer), so both sides accept and refuse the same configs.
   2. Take the float inputs from the case (x, w, b, flow) and quantize them here.
   3. Log every stage with `tap`, same names as ALG. main.py compares shared
      names in order and blames the first that differs; extra HW-only taps are
@@ -35,6 +37,7 @@ if _HERE not in sys.path:
 
 import contextlib
 import dataclasses
+import math
 
 import torch
 
@@ -54,6 +57,8 @@ from npe_mx_emu import mx_config_factory, SUPPORTED_ACC_WIDTHS
 from npe_mx_emu import Cstruct, pcu, mantissa_offset
 from npe_mx_emu import hw_pipe as _hw_pipe
 from npe_mx_emu import layers as _hw_layers
+
+from fixed_point.fxp_quant import OUT_QUANT_DEFAULTS   # config defaults only
 
 # Widths fixed inside npe_mx_emu - their API has no parameter for them, so the
 # config can't reach them (listed so a config that disagrees is visible):
@@ -265,7 +270,6 @@ def conv(case, cfg, taps):
         if "in_scale" not in grid or "e_base_w" not in grid:
             raise SystemExit(f"{os.path.basename(cfg['file'])}: input layer needs "
                              f"hw_grids in_scale and e_base_w")
-        import math
         cal_f = -math.log2(float(grid["in_scale"]))
         if cal_f != round(cal_f):
             raise NotImplementedError(
@@ -357,180 +361,219 @@ def convt(case, cfg, taps):
     raise NotImplementedError("HW convt")
 
 
-# Warp. Their reference lane: uint8 codes with zero exponents, no scale
-# (pack_warp_reference's default type). Call site: SC.WARP_CALL_SITE.
-WARP_REF_MX_TYPE = "mx-e4bm8"
-WARP_REF_RANGE = (0, 255)       # pack_warp_reference clamps to this, silently
-WARP_GRID_WORD_BITS = 16        # trc casts the grid word to int16
-# frx + fry above this overflows their 16-bit weight lane: their trc_warp and
-# build_warp_c_struct_arr raise, the path that runs (trc) does not check (HW Q4)
-WARP_FRAC_SUM_LIMIT = 14
+# Warp, as the HW team answered it (hw/warp_hw_questions_and_answers.md) and
+# their corrected emulator does it. Call site: SC.WARP_CALL_SITE.
+WARP_REF_MX_TYPE = "mx-e4bm8"   # their reference lane: int8 codes, zero exponents
+WARP_REF_BITS = 8               # pack_warp_reference: int8 [-128, 127] (Q6)
+WARP_GRID_WORD_BITS = 16        # pack_warp_grid takes an int16 word only (Q3)
+WARP_FRAC_RANGE = (0, 8)        # fraction bits per axis pack_warp_grid takes (Q3)
+WARP_OUT_BITS = 8               # their forward calibrates relux_bits=8: int8 out (Q7)
+# frx + fry = 16 makes the zero-fraction weight 2^16, which a plain unsigned
+# 16-bit field does not hold; its encoding is open (Q4). Their emulator keeps
+# it as an int64 weight.
+WARP_WEIGHT_FIELD_BITS = 16
+
+
+def _fxp_key(fxp, key):
+    """An fxp spec's value, or the lib's default for it (OUT_QUANT_DEFAULTS:
+    config reading, not its quantizer)."""
+    return fxp.get(key, OUT_QUANT_DEFAULTS[key])
 
 
 def warp_spec(cfg):
-    """The config's warp entry, as their code takes it: grid word width
-    (their grid_bit_width), the grid fraction bits per axis (frx, fry) at the
-    sim's call site, and how many call sites the config declares.
-    Refused when their lanes can't hold what the config describes, or the
-    entry lacks an input, its fxp (sim_config.warp_sites) or its total_bits."""
+    """The config's warp entry, as their code takes it: the grid word width,
+    the grid fraction bits per axis (frx, fry) at the sim's call site, how
+    many call sites the config declares. Refused when their code cannot run
+    what the config describes: a reference that is not a signed 8-bit word,
+    an output fxp that is not int8, a grid wider than int16 or with fraction
+    bits outside 0..8, and an entry lacking an input, its fxp
+    (sim_config.warp_sites) or its total_bits."""
     name = SC.entry_name(cfg, "warp")
+    f = os.path.basename(cfg["file"])
     e = cfg["entries"][name]
     ref, grid = (s[SC.WARP_CALL_SITE] for s in SC.warp_sites(cfg, e))
     for role, fxp in zip(SC.WARP_INPUTS, (ref, grid)):
-        SC.require(fxp, ("total_bits",), f"{os.path.basename(cfg['file'])}: {name} {role} "
-                   f"fxp (call site {SC.WARP_CALL_SITE})", "their lane widths come from the config")
-    if int(ref["total_bits"]) != 8:
+        SC.require(fxp, ("total_bits",), f"{f}: {name} {role} fxp (call site "
+                   f"{SC.WARP_CALL_SITE})", "their lane widths come from the config")
+    if int(ref["total_bits"]) != WARP_REF_BITS or not _fxp_key(ref, "signed"):
         raise NotImplementedError(
-            f"HW warp: {name} ref is {ref['total_bits']}-bit; their reference "
-            f"lane is 8-bit ({WARP_REF_MX_TYPE}, uint8)")
+            f"HW warp: {name} ref is {'' if _fxp_key(ref, 'signed') else 'un'}signed "
+            f"{ref['total_bits']}-bit; main_HW feeds their reference lane signed int8 "
+            f"(their uint8 path takes a uint8 tensor, whose float-to-code rounding "
+            f"is open, HW Q5/Q6)")
     if int(grid["total_bits"]) > WARP_GRID_WORD_BITS:
         raise NotImplementedError(
-            f"HW warp: {name} grid is {grid['total_bits']}-bit; their trc casts "
-            f"the grid word to int{WARP_GRID_WORD_BITS}")
-    if grid.get("frac_bits") is None:
-        raise SystemExit(f"{os.path.basename(cfg['file'])}: {name} grid has no "
-                         f"frac_bits; the sim reads the grid format from the config")
-    f = int(grid["frac_bits"])
+            f"HW warp: {name} grid is {grid['total_bits']}-bit; their pack_warp_grid "
+            f"takes an int{WARP_GRID_WORD_BITS} word")
+    if grid.get("frac_bits") is None or grid.get("scale") is not None:
+        raise SystemExit(f"{f}: {name} grid has no frac_bits (or a scale); the sim "
+                         f"reads the grid's Q format from the config")
+    fb = int(grid["frac_bits"])
+    lo, hi = WARP_FRAC_RANGE
+    if not lo <= fb <= hi:
+        raise NotImplementedError(
+            f"HW warp: {name} grid has {fb} fraction bits; their pack_warp_grid "
+            f"takes {lo}..{hi} per axis (HW Q3)")
+    _need_int8_out(cfg, e, name)
     return {"call_sites": SC.entry_call_sites(e, name), "call_site": SC.WARP_CALL_SITE,
-            "grid_bits": int(grid["total_bits"]), "frac_cfg": (f, f)}
+            "grid_bits": int(grid["total_bits"]), "frac": (fb, fb)}
 
 
-def abs_coords(flow):
-    """Relative flow [B,2,H,W] in px (channel 0 = x) -> what their
-    CalibratedMXWarp takes: ABSOLUTE sample positions [B,H,W,2] (x, y), in
-    float64 as their notebooks build them (their weights and bcu product take
-    the coordinates' float dtype; float64 keeps them exact)."""
-    B, _, H, W = flow.shape
-    yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float64),
-                            torch.arange(W, dtype=torch.float64), indexing="ij")
+def _need_int8_out(cfg, e, name):
+    """Their warp output is int8 (relux_bits 8, which their forward sets):
+    an output fxp that is on at the sim's call site and not a signed 8-bit
+    word is refused. No output fxp: their int8 still runs (ALG's float out
+    then differs, said by main_ALG.warp_out_note)."""
+    out = e.get("output")
+    if not isinstance(out, dict) or "fxp" not in out:
+        return
+    site = SC.site_fxp(e, out["fxp"], SC.WARP_CALL_SITE, f"{name} output")
+    if site is None or site is False:          # off, as the lib reads it
+        return
+    site = {} if site is True else site        # true: the lib's defaults
+    if not site.get("enabled", True):
+        return
+    if int(_fxp_key(site, "total_bits")) != WARP_OUT_BITS or not _fxp_key(site, "signed"):
+        raise NotImplementedError(
+            f"HW warp: {name} output fxp is {_fxp_key(site, 'total_bits')}-bit "
+            f"{'signed' if _fxp_key(site, 'signed') else 'unsigned'}; their warp "
+            f"output is int{WARP_OUT_BITS} (HW Q7)")
+
+
+def grid_word(flow, frac, grid_bits):
+    """Relative flow [B,2,H,W] in px (channel 0 = x) -> the int16 grid word
+    their CalibratedMXWarp takes: motion in Q format with `frac` = (frx, fry)
+    fraction bits, as the producing layer's PCU emits it (HW Q3, Q5): round
+    to nearest with ties toward +inf (Q7), saturated to the config's grid
+    word width (signed `grid_bits`)."""
     f = flow.double()
-    return torch.stack([xx + f[:, 0], yy + f[:, 1]], dim=-1)
+    scale = torch.tensor([2.0 ** frac[0], 2.0 ** frac[1]], dtype=torch.float64).view(1, 2, 1, 1)
+    q = torch.floor(f * scale + 0.5)
+    lim = 2 ** (grid_bits - 1)
+    return q.clamp(-lim, lim - 1).to(torch.int16)
 
 
-def _refuse_warp(ref, coords, flow, grid_bits):
-    """Refuse what their warp would compute wrongly without raising."""
-    B, _, H, _ = ref.shape
-    if B > 1 and not all(torch.equal(flow[b], flow[0]) for b in range(1, B)):
+def out_cal(s):
+    """Their PCU output shift: out step = ref step * 2^-out_cal (their PCU
+    scale is 1, so only a power-of-two ratio runs). Refused otherwise: the
+    PCU's programmable multiplier format is open (HW Q7)."""
+    r = math.log2(s["ref_scale"] / s["out_scale"])
+    if r != round(r):
         raise NotImplementedError(
-            "HW warp: batch > 1 with different flows; their pack_warp_grid and "
-            "trc read batch 0's grid only (HW Q8)")
-    if H < 2:
+            f"HW warp: out step {s['out_scale']:g} / ref step {s['ref_scale']:g} is "
+            f"not a power of two; their PCU only shifts (scale 1), and the PCU "
+            f"multiplier format is open (HW Q7)")
+    return int(round(r))
+
+
+def _refuse_warp(ref, flow):
+    """Refuse what their warp does not take (it raises, or would give a wrong
+    number without a word): more than one frame, a grid of another size
+    (HW Q8, Q10, the agreed scope), a non-finite reference or flow (their
+    packer, and an int16 cast, turn NaN into some code without a word)."""
+    if ref.shape[0] != 1:
         raise NotImplementedError(
-            f"HW warp: H = {H}; their get_ref_frame reads rows up to index H-2")
-    lo, hi = WARP_REF_RANGE
-    r = torch.round(ref)                  # the rounding their packer applies
-    if not bool(torch.isfinite(ref).all()) or float(r.min()) < lo or float(r.max()) > hi:
+            f"HW warp: batch {ref.shape[0]}; their CalibratedMXWarp takes one "
+            f"frame and one grid per call (HW Q8)")
+    if tuple(flow.shape[-2:]) != tuple(ref.shape[-2:]):
         raise NotImplementedError(
-            f"HW warp: reference codes in [{float(r.min()):g}, {float(r.max()):g}]; "
-            f"their pack_warp_reference clamps to uint8 [{lo}, {hi}] without "
-            f"a word (HW Q6)")
-    _, _, fr = _hw_layers.grid_quantization(coords[0], grid_bits)
-    if not bool(torch.isfinite(fr).all()) or float(fr.min()) < 0:
-        raise NotImplementedError(
-            f"HW warp: their grid_quantization gives fraction bits "
-            f"{fr.flatten().tolist()} (an axis with max |position| 0 gives "
-            f"inf); their trc would split the grid word wrongly")
+            f"HW warp: grid {tuple(flow.shape[-2:])} vs reference "
+            f"{tuple(ref.shape[-2:])}; their warp takes a same-size grid (HW Q10)")
+    for name, t in (("reference", ref), ("flow", flow)):
+        if not bool(torch.isfinite(t).all()):
+            raise NotImplementedError(
+                f"HW warp: a non-finite {name}; it would become an integer code "
+                f"without a word")
 
 
-def _warp_layer(channels, grid_bits, acc_bits):
-    """Their warp layer, with the minimal setup their example notebook uses:
-    LayerMXQParams(x_cal=0, w_cal=0, out_cal=0) (output in reference code
-    units, reference lane WARP_REF_MX_TYPE), then calibrate() with its default
-    fraction bits (7, 7). calibrate() only fills the PCU c_structs, which
-    forward() requires to be non-empty and never reads (their PCU is bypassed,
-    HW Q7); nothing in it comes from data."""
-    qp = LayerMXQParams(x_cal=0, w_cal=0, out_cal=0, mx_type=WARP_REF_MX_TYPE)
-    layer = CalibratedMXWarp(channels=channels, grid_bit_width=grid_bits,
-                             acc_bit_width=acc_bits, qparams=qp)
-    layer.calibrate()
-    return layer
+def _warp_layer(channels, grid_bits, acc_bits, out_shift):
+    """Their warp layer: LayerMXQParams(x_cal=0, w_cal=0, out_cal=out_shift)
+    on the reference lane WARP_REF_MX_TYPE; their forward builds the PCU
+    c_structs itself from the grid's fraction bits (calibrate)."""
+    qp = LayerMXQParams(x_cal=0, w_cal=0, out_cal=out_shift, mx_type=WARP_REF_MX_TYPE)
+    return CalibratedMXWarp(channels=channels, grid_bit_width=grid_bits,
+                            acc_bit_width=acc_bits, qparams=qp)
 
 
-def run_their_warp(ref, coords, grid_bits, acc_bits):
-    """Their CalibratedMXWarp.forward(ref, coords) as is, no refusals, with
-    every intermediate kept by pass-through wrappers: the packed reference
-    and grid (+ their fraction bits), trc's weights and corners, and bcu's
-    int64 p_sum per line. ref: [B,C,H,W] in code units; coords from
-    abs_coords."""
-    layer = _warp_layer(ref.shape[1], grid_bits, acc_bits)
+def run_their_warp(ref, grid, frac, grid_bits, acc_bits, out_shift=0):
+    """Their CalibratedMXWarp.forward(ref, grid, frac) as is, no refusals,
+    with every intermediate kept by pass-through wrappers: the packed
+    reference and grid (+ the fraction bits), trc's weights and corners, and
+    bcu's int64 p_sum per line. ref: [1,C,H,W] in code units (float: their
+    packer rounds and clamps it); grid: grid_word."""
+    layer = _warp_layer(ref.shape[1], grid_bits, acc_bits, out_shift)
     with torch.no_grad(), \
             _pass_through(_hw_layers, "pack_warp_reference") as refs, \
             _pass_through(_hw_layers, "pack_warp_grid") as grids, \
             _pass_through(_hw_pipe, "trc") as trcs, \
             _capture_bcu() as lines:
-        out = layer(ref, coords)
+        out = layer(ref, grid, frac)
     (mx_grid, fr), = grids
     (weights, corners), = trcs
     B, C, H, W = out.shape
-    return {"mx_ref": refs[0], "mx_grid": mx_grid,
-            "frac": fr.flatten().long(), "weights": weights, "corners": corners,
+    return {"mx_ref": refs[0], "mx_grid": mx_grid, "frac": fr.flatten().long(),
+            "weights": weights, "corners": corners,
             # bcu is called per (b, c, oh) in that loop order -> [B, C, H, W]
             "acc": torch.stack(lines).reshape(B, C, H, W), "out": out}
 
 
 def warp(case, cfg, taps):
     """Backward warp on the HW team's emulator (CalibratedMXWarp ->
-    MXWarp_Loops), as their notebook calls it, nothing reimplemented.
+    MXWarp_Loops: TRC -> BCU -> PCU), as their corrected code takes it,
+    nothing of theirs reimplemented.
 
-    Inputs from the case, conventions converted: reference = x / ref_scale,
-    in code units (their packer rounds half to even and clamps to uint8, no
-    scale); coords = absolute positions (abs_coords). Config: grid word width
-    and fraction bits (the warp entry's grid fxp, call site 0), accumulator
-    width (hw_acc_bits). Their fraction bits come from the data (per frame,
-    from max |position|): taps `frac_cfg` (config) and `hw_frac_bits` (theirs)
-    and `frac_match` show whether they agree; their code runs on its own.
+    Inputs from the case: reference = x / ref_scale in code units (their
+    packer rounds and clamps it to int8, HW Q6); grid = the flow as an int16
+    relative-motion word in the config's Q format (grid_word, HW Q3); the
+    fraction bits (frx, fry) from the warp entry's grid fxp at call site 0;
+    the PCU output shift from the case's ref / out steps (out_cal);
+    accumulator width from hw_acc_bits.
 
-    Refused (_refuse_warp): batch > 1 with different flows, a reference their
-    packer would clamp, H < 2, fraction bits their trc can't use.
+    Refused: warp_spec, out_cal and _refuse_warp say what.
 
-    Taps: x flow | call_sites call_site frac_cfg | hw_ref_code [B,C,H,W pad 32]
-          hw_grid_code [1,2,H,W] hw_frac_bits frac_match frac_sum
-          frac_over | hw_weights [H,W,4] hw_corners [B,C,H,W,4] |
-          hw_acc int64 (bcu's p_sum, taken inside their loop) | out_raw
-          (their float32 output as is: acc / 2^(frx+fry), in code units; float32
-          rounds acc above 2^24) | out (= out_raw * ref_scale)
+    Taps (shared names compared with ALG): x flow | call_sites call_site
+          frac_bits | ref_code [B,C,H,W] | grid_code [1,2,H,W] | hw_weights
+          [H,W,4] hw_corners [B,C,H,W,4] | hw_acc int64 (bcu's p_sum, taken
+          inside their loop) | out_shift | out_code (their PCU output, int8
+          values) | out (= out_code * out_scale)
     """
     x, flow, s = case["x"], case["flow"], case["warp"]
     spec = warp_spec(cfg)
     acc_bits = hw_acc_bits(cfg)
+    shift = out_cal(s)
     ref = x.double() / s["ref_scale"]
-    coords = abs_coords(flow)
-    _refuse_warp(ref, coords, flow, spec["grid_bits"])
-    r = run_their_warp(ref, coords, spec["grid_bits"], acc_bits)
+    _refuse_warp(ref, flow)
+    grid = grid_word(flow, spec["frac"], spec["grid_bits"])
+    r = run_their_warp(ref, grid, spec["frac"], spec["grid_bits"], acc_bits, shift)
 
-    frac_cfg = torch.tensor(spec["frac_cfg"])
-    k = int(r["frac"].sum())
     tap(taps, "x", x)
     tap(taps, "flow", flow)
     tap(taps, "call_sites", spec["call_sites"])
     tap(taps, "call_site", spec["call_site"])
-    tap(taps, "frac_cfg", frac_cfg)
-    tap(taps, "hw_ref_code", r["mx_ref"].data)
-    tap(taps, "hw_grid_code", r["mx_grid"].data)
-    tap(taps, "hw_frac_bits", r["frac"])
-    tap(taps, "frac_match", int(torch.equal(frac_cfg, r["frac"])))
-    tap(taps, "frac_sum", k)
-    tap(taps, "frac_over", int(k > WARP_FRAC_SUM_LIMIT))
+    tap(taps, "frac_bits", r["frac"])
+    tap(taps, "ref_code", r["mx_ref"].data)
+    tap(taps, "grid_code", r["mx_grid"].data)
     tap(taps, "acc_bits", acc_bits)
     tap(taps, "hw_weights", r["weights"])
     tap(taps, "hw_corners", r["corners"])
     tap(taps, "hw_acc", r["acc"])
-    tap(taps, "out_raw", r["out"])
-    tap(taps, "out", r["out"] * s["ref_scale"])
+    tap(taps, "out_shift", shift)
+    tap(taps, "out_code", r["out"])
+    tap(taps, "out", r["out"] * s["out_scale"])
     return taps["out"]
 
 
 def warp_notes(taps):
     """What a reader of an HW warp run must not miss, one line each."""
     notes = []
-    fc, fh = taps["frac_cfg"].tolist(), taps["hw_frac_bits"].tolist()
-    if not int(taps["frac_match"]):
-        notes.append(f"!! grid fraction bits: config {fc}, their pack_warp_grid "
-                     f"derived {fh} from the data; their code ran on its own (HW Q3)")
-    if int(taps["frac_over"]):
-        notes.append(f"!! frx + fry = {int(taps['frac_sum'])} > "
-                     f"{WARP_FRAC_SUM_LIMIT}: their weight lane limit; the path "
-                     f"runs anyway (HW Q4)")
+    w = taps["hw_weights"]
+    full = 1 << WARP_WEIGHT_FIELD_BITS
+    n_full = int((w >= full).sum())
+    if n_full:
+        notes.append(f"!! {n_full}/{w.numel()} TRC weights are 2^{WARP_WEIGHT_FIELD_BITS} "
+                     f"(frx + fry = {int(taps['frac_bits'].sum())}, zero fraction): "
+                     f"beyond a plain unsigned {WARP_WEIGHT_FIELD_BITS}-bit field; "
+                     f"their int64 weight holds it, the HW encoding is open (HW Q4)")
     if int(taps["call_sites"]) > 1:
         notes.append(f"config call_sites {int(taps['call_sites'])}: the sim "
                      f"runs call site {int(taps['call_site'])}")

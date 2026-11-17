@@ -24,17 +24,23 @@ BS = 32   # MX block size
 class Warp(nn.Module):
     """Backward warp: out[b,c,y,x] = bilinear(ref[b,c], x + flow_x, y + flow_y).
 
-    flow [B,2,H,W] is a displacement in px, channel 0 = x. x0 = floor(X),
-    ax = X - x0; four neighbours weighted (1-ax)(1-ay) ... ax*ay; a neighbour
-    outside the image contributes 0. float64, so with the flow on the 1/256
-    grid every weight is exact.
+    flow [B,2,H,W] is a displacement in px, channel 0 = x. Border, as the HW
+    answered (warp Q&A Q1, Q2, Q10): the whole sample position saturates to
+    the frame, X in [0, W-1] and Y in [0, H-1], with no excess fraction kept,
+    and the +1 neighbour of the last row / column is that row / column again
+    (edge replication: zero motion returns the frame; no padding). Then x0 =
+    floor(X), ax = X - x0; four neighbours weighted (1-ax)(1-ay) ... ax*ay.
+    The HW team answered this for the far edges; their emulator, the
+    reference (Q11), clamps the near edges (below 0) the same way, which is
+    followed here (Q1 leaves the four-side symmetry open). float64, so with
+    the flow on the 1/256 grid every weight is exact.
     """
 
     def forward(self, ref, flow):
         B, C, H, W = ref.shape
         f = flow.double()
-        X = torch.arange(W, dtype=torch.float64).view(1, 1, W) + f[:, 0]
-        Y = torch.arange(H, dtype=torch.float64).view(1, H, 1) + f[:, 1]
+        X = (torch.arange(W, dtype=torch.float64).view(1, 1, W) + f[:, 0]).clamp(0, W - 1)
+        Y = (torch.arange(H, dtype=torch.float64).view(1, H, 1) + f[:, 1]).clamp(0, H - 1)
         x0, y0 = torch.floor(X), torch.floor(Y)
         ax, ay = X - x0, Y - y0
         x0, y0 = x0.long(), y0.long()
@@ -42,11 +48,10 @@ class Warp(nn.Module):
         out = torch.zeros(B, C, H, W, dtype=torch.float64)
         for dy, wy in ((0, 1 - ay), (1, ay)):
             for dx, wx in ((0, 1 - ax), (1, ax)):
-                yy, xx = y0 + dy, x0 + dx
-                inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
-                idx = (yy.clamp(0, H - 1) * W + xx.clamp(0, W - 1)).view(B, 1, -1)
+                yy, xx = (y0 + dy).clamp(max=H - 1), (x0 + dx).clamp(max=W - 1)
+                idx = (yy * W + xx).view(B, 1, -1)
                 v = flat.gather(2, idx.expand(B, C, -1)).view(B, C, H, W)
-                out += v * (wx * wy * inside).unsqueeze(1)
+                out += v * (wx * wy).unsqueeze(1)
         return out.to(ref.dtype)
 
 

@@ -320,180 +320,277 @@ def test_hw_exact_first_layer():
 import subprocess                     # noqa: E402
 
 import main as M                      # noqa: E402
+import warp_vectors as WV             # noqa: E402
 
-U8 = [n for n, c in C.CASES.items() if c["op"] == "warp" and "ref" in c]
-
-
-def _u8_cases():
-    assert U8, "no warp case with a code-lattice reference in cases.CASES"
-    return U8
+WARP = C.select("warp")
+# the warp cases HW runs: out step = ref step (their PCU only shifts; Q7)
+WARP_HW = [n for n in WARP if C.CASES[n]["ref_scale"] == C.CASES[n]["out_scale"]]
 
 
-@pytest.mark.parametrize("name", _u8_cases())
+def _half_up(cfg):
+    """`cfg` with the warp's grid and output fxp rounding half up (ties
+    toward +inf), the HW rule (warp Q&A Q5, Q7)."""
+    cfg = copy.deepcopy(cfg)
+    e = cfg["entries"]["model.warp"]
+    for fxp in (e["inputs"][1]["fxp"], e["output"]["fxp"]):
+        fxp["round"] = "half_up"
+    return cfg
+
+
+@pytest.mark.parametrize("name", WARP)
 def test_hw_warp_runs_their_code(name):
-    """Every code-lattice warp case runs on their code: their packed
-    reference holds the case's codes, out is their output times the ref
-    step, the grid format comes from the config."""
+    """Every warp case with a power-of-two out / ref step runs on their
+    corrected code, the signed (randn) ones too: their packed reference holds
+    the case's int8 codes, the grid word is the relative motion in Q8.8 (the
+    config's fraction bits, passed in), the output is their int64 PCU word
+    times the out step. warp_subpix (another step ratio) is refused."""
     case = C.build(name)
+    s = case["warp"]
+    if s["out_scale"] != s["ref_scale"]:             # warp_subpix: 0.0137 / 0.0331
+        with pytest.raises(NotImplementedError, match=r"not a power of two.*HW Q7"):
+            HW.run(case, E4)
+        return
     t = HW.run(case, E4)
     B, Cc, H, W = case["x"].shape
-    codes = (case["x"].double() / case["warp"]["ref_scale"]).round().long()
-    assert torch.equal(t["hw_ref_code"][..., :W], codes)
-    assert t["hw_acc"].dtype == torch.int64 and t["hw_acc"].shape == (B, Cc, H, W)
-    assert t["hw_weights"].shape == (H, W, 4)
-    assert torch.equal(t["out"], t["out_raw"] * case["warp"]["ref_scale"])
-    assert t["frac_cfg"].tolist() == [8, 8]          # mx_config_npe_e4.json grid fxp
-    assert int(t["frac_sum"]) == int(t["hw_frac_bits"].sum())
+    codes = (case["x"].double() / s["ref_scale"]).round().clamp(-128, 127).long()
+    assert torch.equal(t["ref_code"], codes)
+    assert torch.equal(t["grid_code"].long(), (case["flow"].double() * 256).long())
+    assert t["frac_bits"].tolist() == [8, 8]          # mx_config_npe_e4.json grid fxp
+    assert t["hw_acc"].dtype == t["out_code"].dtype == torch.int64
+    assert t["hw_acc"].shape == t["out_code"].shape == (B, Cc, H, W)
+    assert t["hw_weights"].shape == (H, W, 4) and int(t["out_shift"]) == 0
+    assert torch.equal(t["out"], t["out_code"] * s["out_scale"])
+
+
+def test_warp_hw_cases_are_most_of_them():
+    assert len(WARP_HW) == len(WARP) - 1 > 0           # warp_subpix: refused, Q7 open
+
+
+@pytest.mark.parametrize("name", WARP_HW)
+def test_warp_alg_equals_hw_bit_exact_with_the_hw_rounding(name):
+    """With the warp's grid and output rounding half up (the HW rule), every
+    warp case HW runs is bit-exact, ALG vs their emulator: ref, grid and out
+    codes, out, and the accumulator inside and on the border. As shipped
+    (half away from zero), only ties of a negative value differ, in out_code;
+    the cases without a negative tie are bit-exact as shipped too."""
+    case = C.build(name)
+    for cfg in (_half_up(E4), E4):
+        a, h = ALG.run(case, cfg), HW.run(case, cfg)
+        rows = {k: v for k, v, *_ in M.compare(a, h)}
+        assert set(rows) >= {"ref_code", "grid_code", "out_code", "out"}
+        st = {r["stage"]: r for r in M.warp_stages(case, a, h)}
+        assert st["acc interior"]["n_diff"] == st["acc border"]["n_diff"] == 0
+        acc = h["hw_acc"].double() / 2 ** 16 * case["warp"]["ref_scale"] / case["warp"]["out_scale"]
+        neg_tie = bool(((acc - acc.floor()) == 0.5).logical_and(acc < 0).any())
+        bad = [k for k, v in rows.items() if v not in ("bit-exact", "float")]
+        if cfg is E4 and neg_tie:
+            assert bad == ["out_code", "out"]
+            d = a["out_code"].long() - h["out_code"]
+            assert set(d.unique().tolist()) == {-1, 0}      # half away: one down
+        else:
+            assert bad == [], (name, bad)
 
 
 def test_hw_warp_acc_is_their_int64_psum():
-    """hw_acc is bcu's p_sum taken in their loop, not read back from their
-    float32 output: with a constant reference c and a continuous flow every
-    interior sample's acc is c * 2^(frx+fry) exactly (their weights sum to
-    2^(frx+fry)), while their float32 output equals it only where |acc| <=
-    2^24; on a random reference it rounds some."""
+    """hw_acc is bcu's int64 p_sum taken in their loop: with a constant
+    reference c and a continuous flow every acc, border included (the
+    border replicates the edge), is c * 2^(frx+fry) exactly (their weights
+    sum to 2^(frx+fry)); their int8 output is then c."""
     g = torch.Generator().manual_seed(3)
-    flow = (torch.rand(1, 2, 8, 8, generator=g) * 2 - 1) * 1.5
-    t = HW.run(C.warp_case("c", torch.full((1, 1, 8, 8), 7), flow, C.P2, C.P2), E4)
-    k = int(t["frac_sum"])
-    pos = HW.abs_coords(flow)[0]
-    inner = ((pos[..., 0] >= 0) & (pos[..., 0] < 7) & (pos[..., 1] >= 0)
-             & (pos[..., 1] < 7)).expand(1, 1, 8, 8)
-    assert int(inner.sum()) > 0
-    assert bool((t["hw_acc"][inner] == 7 * 2 ** k).all())
-    t = HW.run(C.warp_case("r", torch.randint(0, 128, (1, 1, 8, 8), generator=g),
-                           flow, C.P2, C.P2), E4)
-    acc, back = t["hw_acc"], t["out_raw"].double() * 2.0 ** int(t["frac_sum"])
-    small = acc.abs() <= 2 ** 24
-    assert bool(small.any()) and bool((back[small] == acc[small].double()).all())
-    n, big, rounded = M.warp_float32_store(t)
-    assert big > 0 and rounded > 0                  # float32 dropped acc bits
-    assert bool((back != acc.double()).any())
+    flow = torch.round((torch.rand(1, 2, 8, 8, generator=g) * 2 - 1) * 1.5 * 256) / 256
+    t = HW.run(C.warp_case("c", torch.full((1, 1, 8, 8), -7), flow, C.P2, C.P2), E4)
+    assert bool((t["hw_acc"] == -7 * 2 ** 16).all())
+    assert bool((t["out_code"] == -7).all())
+    assert bool((t["hw_weights"].sum(-1) == 2 ** 16).all())
 
 
-@pytest.mark.parametrize("name", ["warp_u8_subpix", "warp_u8_subpix_w64"])
-def test_hw_warp_interior_equals_alg_exact(name):
-    """Codes 0..127, flow on 1/256, their fraction bits >= 8 per axis: inside
-    the frame their acc / 2^(frx+fry) is the exact bilinear sum of ALG's own
-    codes (cases.Warp in float64, exact on the 1/256 grid)."""
+@pytest.mark.parametrize("name", ["warp_u8_subpix", "warp_u8_subpix_w64", "warp_oob"])
+def test_hw_warp_acc_equals_alg_exact(name):
+    """Flow on 1/256, frx = fry = 8: on every pixel, border included, their
+    acc / 2^16 is the exact bilinear sum of ALG's own codes by the HW border
+    rule (cases.Warp in float64, exact on the 1/256 grid)."""
     case = C.build(name)
     a, h = ALG.run(case, E4), HW.run(case, E4)
-    assert int(h["hw_frac_bits"].min()) >= 8
     want = C.Warp()(a["ref_code"].double(), a["grid_code"].double() / 256)
-    got = h["hw_acc"].double() / 2.0 ** int(h["frac_sum"])
+    got = h["hw_acc"].double() / 2.0 ** 16
     st = {r["stage"]: r for r in M.warp_stages(case, a, h)}
-    _, _, H, W = case["x"].shape
-    pos = HW.abs_coords(case["flow"])[0]
-    x0, y0 = pos[..., 0].floor(), pos[..., 1].floor()
-    inside = ((x0 >= 0) & (x0 + 1 < W) & (y0 >= 0) & (y0 + 1 < H)).expand_as(got)
-    assert int(inside.sum()) == st["acc interior"]["n"] > 0
-    assert torch.equal(got[inside], want[inside])
+    assert st["acc border"]["n"] > 0 and st["acc interior"]["n"] > 0
+    assert torch.equal(got, want)
 
 
-def test_hw_warp_stages_name_the_border_rule():
-    """main.warp_stages on the identity flow: ref, grid and interior equal,
-    the border differs: their last row reads the row above and, W being a
-    multiple of 32, their last column the column before (HW Q2)."""
-    case = C.build("warp_u8_zero")
+@pytest.mark.parametrize("H, W", [(5, 32), (4, 40), (3, 7)])
+def test_zero_motion_returns_the_reference_last_row_and_col(H, W):
+    """Q2: zero motion preserves the reference, its last row and column
+    included, at widths that are and are not a multiple of 32: ALG (cases.Warp)
+    and HW (their trc) both. Their old trc read the row and column before
+    (its clamp to H-2 / W-2)."""
+    ref = WV.ramp(H, W, lambda x, y: (13 * y + 3 * x) % 200 - 100)
+    case = C.warp_case("z", ref, C.const_flow(1, H, W, 0.0, 0.0), C.P2, C.P2)
     a, h = ALG.run(case, E4), HW.run(case, E4)
-    st = {r["stage"]: r for r in M.warp_stages(case, a, h)}
-    assert all(r["n"] > 0 for r in st.values())
-    assert st["ref code"]["n_diff"] == st["grid px"]["n_diff"] == 0
-    assert st["acc interior"]["n_diff"] == 0
-    assert st["acc border"]["n_diff"] > 0
-    got = h["hw_acc"][0, 0].double() / 2.0 ** int(h["frac_sum"])
-    ref = a["ref_code"][0, 0].double()
-    assert torch.equal(got[-1, :-1], ref[-2, :-1])
-    assert torch.equal(got[:-1, -1], ref[:-1, -2])
-    assert torch.equal(got[:-1, :-1], ref[:-1, :-1])
+    assert torch.equal(a["out_code"].long(), ref.long())
+    assert torch.equal(h["out_code"], ref.long())
+    assert torch.equal(C.Warp()(ref.double(), torch.zeros(1, 2, H, W)), ref.double())
 
 
-def test_hw_warp_refuses_what_their_code_would_get_wrong():
-    """Batch > 1 with different flows (their batch-0 grid), a reference their
-    packer would clamp (signed, or above 255), a non-finite reference (their
-    packer makes NaN code 0), H < 2, an axis whose fraction bits come out
-    infinite or negative (an 8-bit grid on W = 200). Same flows over a batch
-    run."""
-    ok = torch.randint(0, 128, (2, 1, 3, 8), generator=torch.Generator().manual_seed(1))
+@pytest.mark.parametrize("fx, fy, at, want", [
+    (2.75, 0.0, (1, 4), 61),           # x = 4 + 2.75 > W-1 = 5: the edge pixel ref[1, 5]
+    (0.0, 9.5, (0, 2), 33),            # y beyond H-1: ref[3, 2]
+    (-0.25, 0.0, (1, 0), 11),          # x < 0: ref[1, 0] (their emulator's rule, Q1 open)
+    (-3.0, -3.0, (2, 2), 10),          # both below 0: ref[0, 0]
+    (0.5, 0.0, (2, 5), 62),            # x = W-1+0.5: ref[2, 5], no excess fraction kept
+    (0.25, 0.0, (2, 4), 54.5)])        # inside: 0.75 * 52 + 0.25 * 62
+def test_border_saturates_the_whole_coordinate(fx, fy, at, want):
+    """Q1 / Q10: the sample position saturates to [0, W-1] x [0, H-1], with
+    no excess fraction, so beyond the edge the sample is the edge pixel. ref
+    [y, x] = 10(x+1)+y on 4x6 (the Q&A's own frame). ALG (cases.Warp) and
+    HW (their acc / 2^16) both give the value the rule gives, worked out by
+    hand; zero outside (the old ALG rule) gives other values beyond the
+    frame."""
+    ref = WV.ramp(4, 6, lambda x, y: 10 * (x + 1) + y)
+    flow = C.const_flow(1, 4, 6, fx, fy)
+    y, x = at
+    assert float(C.Warp()(ref.double(), flow.double())[0, 0, y, x]) == want
+    h = HW.run(C.warp_case("b", ref, flow, C.P2, C.P2), E4)
+    assert float(h["hw_acc"][0, 0, y, x]) / 2 ** 16 == want
+
+
+def test_hw_warp_signed_reference_saturates_to_int8():
+    """Q6: the reference is int8 [-128, 127]: negative codes run (the old
+    packer clamped them to 0, main_HW refused), codes beyond saturate, on
+    both sides the same."""
+    ref = torch.tensor([[[[-200, -128, -50, 0, 127, 200]] * 2]])
+    case = C.warp_case("s", ref, C.const_flow(1, 2, 6, 0.0, 0.0), C.P2, C.P2)
+    a, h = ALG.run(case, E4), HW.run(case, E4)
+    want = [-128, -128, -50, 0, 127, 127]
+    assert a["ref_code"][0, 0, 0].tolist() == h["ref_code"][0, 0, 0].tolist() == want
+    assert h["out_code"][0, 0, 0].tolist() == want
+
+
+def test_hw_warp_output_ties_toward_plus_inf():
+    """Q7: the PCU rounds to nearest, ties toward +inf, and saturates to int8:
+    acc 37.5 -> 38, -37.5 -> -37. ALG gives the same with the output fxp
+    rounding half up; as shipped (half away) -37.5 -> -38."""
+    ref = torch.cat([WV.ramp(2, 40, lambda x, y: 37 + x % 2),
+                     WV.ramp(2, 40, lambda x, y: -37 - x % 2)], 1)
+    case = C.warp_case("t", ref, C.const_flow(1, 2, 40, 0.5, 0.0), C.P2, C.P2)
+    h = HW.run(case, E4)
+    assert h["hw_acc"][0, :, 0, 0].tolist() == [37.5 * 2 ** 16, -37.5 * 2 ** 16]
+    assert h["out_code"][0, :, 0, 0].tolist() == [38, -37]
+    assert ALG.run(case, _half_up(E4))["out_code"][0, :, 0, 0].tolist() == [38, -37]
+    assert ALG.run(case, E4)["out_code"][0, :, 0, 0].tolist() == [38, -38]
+
+
+def test_hw_warp_output_shift_from_the_steps():
+    """Their PCU shifts the output by out_cal = log2(ref step / out step):
+    out step twice the ref step halves the code (round half up), a quarter
+    of it quadruples it, saturated to int8."""
+    ref = WV.ramp(2, 8, lambda x, y: 10 * x - 35)            # -35, -25, ..., 35
+    flow = C.const_flow(1, 2, 8, 0.0, 0.0)
+    h = HW.run(C.warp_case("h", ref, flow, C.P2, 2 * C.P2), E4)
+    assert int(h["out_shift"]) == -1
+    r = ref[0, 0, 0].double()
+    assert h["out_code"][0, 0, 0].tolist() == torch.floor(r / 2 + 0.5).tolist()
+    h = HW.run(C.warp_case("q", ref, flow, C.P2, C.P2 / 4), E4)
+    assert int(h["out_shift"]) == 2
+    assert h["out_code"][0, 0, 0].tolist() == (r * 4).clamp(-128, 127).tolist()
+
+
+def test_hw_grid_word_rounds_ties_up_and_saturates():
+    """The grid word, as the producing layer's PCU gives it (Q5, Q7): nearest,
+    ties toward +inf, saturated to the signed word."""
+    flow = torch.tensor([0.5, -0.5, 1.5, -1.5, 0.25, 200.0, -200.0]).div(256).view(1, 1, 1, 7)
+    flow = torch.cat([flow, flow * 256 * 256 / 64], 1)       # y: past +-128 px
+    q = HW.grid_word(flow, (8, 8), 16)
+    assert q.dtype == torch.int16
+    assert q[0, 0, 0].tolist() == [1, 0, 2, -1, 0, 200, -200]
+    assert q[0, 1, 0].tolist()[-2:] == [32767, -32768]
+
+
+def test_hw_warp_refuses_what_their_code_does_not_take():
+    """More than one frame (their forward raises, Q8: one frame per call,
+    native batch not needed), a non-finite reference or flow, grid fraction bits
+    outside 0..8 (Q3), a grid wider than int16, a reference or output that is
+    not signed 8-bit, a non power-of-two out / ref step (Q7: the multiplier
+    format is open). Each is a named NotImplementedError (a refusal), never
+    their ValueError (a failure)."""
+    ok = torch.randint(-128, 128, (2, 1, 3, 8), generator=torch.Generator().manual_seed(1))
     f = C.const_flow(2, 3, 8, 0.5, 0.0)
-    t = HW.run(C.warp_case("b", ok, f, C.P2, C.P2), E4)
-    one = HW.run(C.warp_case("b1", ok[1:], f[1:], C.P2, C.P2), E4)
-    assert torch.equal(t["hw_acc"][1:], one["hw_acc"])
-    f2 = f.clone()
-    f2[1, 0] += 1.0
-    with pytest.raises(NotImplementedError, match="batch > 1 with different flows"):
-        HW.run(C.warp_case("b", ok, f2, C.P2, C.P2), E4)
-    for bad in (-1, 256):
-        ref = ok[:1].clone()
-        ref[0, 0, 0, 0] = bad
-        with pytest.raises(NotImplementedError, match="clamps to uint8"):
-            HW.run(C.warp_case("r", ref, C.const_flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
+    with pytest.raises(NotImplementedError, match=r"batch 2.*one\s+frame.*HW Q8"):
+        HW.run(C.warp_case("b", ok, f, C.P2, C.P2), E4)          # even with equal flows
     ref = ok[:1].double().clone()
     ref[0, 0, 0, 0] = float("nan")
-    with pytest.raises(NotImplementedError, match="uint8"):
+    with pytest.raises(NotImplementedError, match="non-finite reference"):
         HW.run(C.warp_case("n", ref, C.const_flow(1, 3, 8, 0, 0), C.P2, C.P2), E4)
-    g8 = copy.deepcopy(E4)
-    g8["entries"]["model.warp"]["inputs"][1]["fxp"]["total_bits"] = 8
-    with pytest.raises(NotImplementedError, match="fraction bits"):   # x frac -1
-        HW.run(C.warp_case("g8", torch.full((1, 1, 2, 200), 10),
-                           C.const_flow(1, 2, 200, 0, 0), C.P2, C.P2), g8)
-    with pytest.raises(NotImplementedError, match="H = 1"):
-        HW.run(C.warp_case("h", ok[:1, :, :1], C.const_flow(1, 1, 8, 0, 0), C.P2, C.P2), E4)
-    fy = C.const_flow(1, 3, 8, 0.0, 0.0)
-    fy[0, 1] = -torch.arange(3.0).view(3, 1)        # every y position 0
-    with pytest.raises(NotImplementedError, match="fraction bits"):
-        HW.run(C.warp_case("y", ok[:1], fy, C.P2, C.P2), E4)
-    with pytest.raises(NotImplementedError, match="uint8"):
-        HW.run(C.build("warp_int_shift"), E4)       # randn reference: signed
+    nan_flow = C.const_flow(1, 3, 8, 0, 0)
+    nan_flow[0, 1, 0, 0] = float("inf")
+    with pytest.raises(NotImplementedError, match="non-finite flow"):
+        HW.run(C.warp_case("n", ok[:1], nan_flow, C.P2, C.P2), E4)
+
+    def cfg_with(i, **fxp):
+        cfg = copy.deepcopy(E4)
+        e = cfg["entries"]["model.warp"]
+        (e["inputs"][i] if i is not None else e["output"])["fxp"].update(fxp)
+        return cfg
+    z = C.warp_case("z", ok[:1], C.const_flow(1, 3, 8, 0, 0), C.P2, C.P2)
+    for cfg, why in ((cfg_with(1, frac_bits=9), r"9 fraction bits.*0\.\.8 per axis \(HW Q3\)"),
+                     (cfg_with(1, total_bits=32), "takes an int16 word"),
+                     (cfg_with(0, total_bits=16), "ref is signed 16-bit"),
+                     (cfg_with(0, signed=False), "ref is unsigned 8-bit"),
+                     (cfg_with(None, total_bits=16), r"output fxp is 16-bit signed.*int8 \(HW Q7\)")):
+        with pytest.raises(NotImplementedError, match=why):
+            HW.run(z, cfg)
+    cfg = copy.deepcopy(E4)
+    cfg["entries"]["model.warp"]["output"]["fxp"] = True        # the lib's defaults: 16-bit
+    with pytest.raises(NotImplementedError, match="output fxp is 16-bit"):
+        HW.run(z, cfg)
+    cfg["entries"]["model.warp"]["output"]["fxp"] = False       # off: their int8 runs
+    assert "out_code" in HW.run(z, cfg)
+    with pytest.raises(NotImplementedError, match="not a power of two"):
+        HW.run(C.warp_case("s", ok[:1], C.const_flow(1, 3, 8, 0, 0), C.P2, 0.7 * C.P2), E4)
 
 
 def test_hw_warp_grid_format_from_config_and_reported():
-    """frac_cfg is the config's grid fxp at call site 0; their own fraction
-    bits are tapped beside it, a mismatch and frx + fry > 14 are named, the
-    call sites are reported; lanes their code lacks are refused."""
+    """frac_bits are the config's grid fxp at call site 0, passed to their
+    pack_warp_grid (0..8 per axis, Q3); frx + fry = 16 is legal (Q4) and the
+    2^16 weights it makes are named (encoding open); call sites reported."""
     def cfg_with(**grid):
         cfg = copy.deepcopy(E4)
         cfg["entries"]["model.warp"]["inputs"][1]["fxp"].update(grid)
         return cfg
-    z = lambda H, W: C.warp_case("z", torch.zeros(1, 1, H, W), C.const_flow(1, H, W, 0, 0),
-                                 C.P2, C.P2)
-    t = HW.run(z(4, 40), cfg_with(frac_bits=7))
-    assert t["frac_cfg"].tolist() == [7, 7] and int(t["frac_match"]) == 0
+    z = C.warp_case("z", torch.zeros(1, 1, 4, 40), C.const_flow(1, 4, 40, 0, 0), C.P2, C.P2)
+    t = HW.run(z, cfg_with(frac_bits=6))
+    assert t["frac_bits"].tolist() == [6, 6]
+    assert bool((t["hw_weights"].sum(-1) == 2 ** 12).all())
     notes = " ".join(HW.warp_notes(t))
-    assert "HW Q3" in notes and "HW Q4" in notes and int(t["frac_over"]) == 1
-    assert "call_sites 3" in notes
-    t = HW.run(z(65, 65), E4)                       # their rule gives 8, 8 here
-    assert t["hw_frac_bits"].tolist() == [8, 8] and int(t["frac_match"]) == 1
-    assert "HW Q3" not in " ".join(HW.warp_notes(t))
-    assert int(HW.run(z(4, 40), HWX)["call_sites"]) == 2
+    assert "HW Q4" not in notes and "call_sites 3" in notes
+    t = HW.run(z, E4)
+    assert "160/640 TRC weights are 2^16" in " ".join(HW.warp_notes(t))
+    assert int(HW.run(z, HWX)["call_sites"]) == 2
     cfg = copy.deepcopy(E4)                          # per-site list: site 0 is used
     g = cfg["entries"]["model.warp"]["inputs"][1]["fxp"]
     cfg["entries"]["model.warp"]["inputs"][1]["fxp"] = [dict(g, frac_bits=f) for f in (6, 7, 5)]
-    t = HW.run(z(4, 40), cfg)
-    assert t["frac_cfg"].tolist() == [6, 6] and int(t["call_site"]) == 0
-    with pytest.raises(NotImplementedError, match="int16"):
-        HW.run(z(4, 40), cfg_with(total_bits=32))
-    cfg = copy.deepcopy(E4)
-    cfg["entries"]["model.warp"]["inputs"][0]["fxp"]["total_bits"] = 16
-    with pytest.raises(NotImplementedError, match="8-bit"):
-        HW.run(z(4, 40), cfg)
+    t = HW.run(z, cfg)
+    assert t["frac_bits"].tolist() == [6, 6] and int(t["call_site"]) == 0
+    cfg = cfg_with(frac_bits=None)
+    with pytest.raises(SystemExit, match="grid has no frac_bits"):
+        HW.run(z, cfg)
 
 
-def test_hw_warp_setup_c_struct_is_not_read():
-    """main_HW's minimal setup calibrates with their default fraction bits;
-    the result does not depend on them, their forward never reads the PCU
-    c_structs (PCU bypassed)."""
-    case = C.build("warp_u8_half")
-    ref = case["x"].double() / case["warp"]["ref_scale"]
-    coords = HW.abs_coords(case["flow"])
-    outs = []
-    for fb in ((7, 7), (1, 2)):
-        layer = HW._warp_layer(ref.shape[1], 16, 48)
-        layer.calibrate(fb)
-        with torch.no_grad():
-            outs.append(layer(ref, coords))
-    assert torch.equal(outs[0], outs[1])
-    assert torch.equal(outs[0], HW.run(case, E4)["out_raw"])
+def test_fxp_half_up_round_mode_is_opt_in():
+    """fxp round 'half_up': nearest, ties toward +inf (the NPE PCU rule);
+    the default stays half away from zero; the bias helper shares it."""
+    from fixed_point.fxp_quant import OUT_QUANT_DEFAULTS, fake_quant_fxp, normalize_out_quant
+    from fixed_point.mx_fixed_point_hw import _bias_to_grid
+    v = torch.tensor([37.5, -37.5, 2.5, -2.5, 0.49, -0.51, 200.0, -200.0])
+    q = fake_quant_fxp(v, frac_bits=0, total_bits=8, round_mode="half_up")
+    assert q.tolist() == [38, -37, 3, -2, 0, -1, 127, -128]
+    assert fake_quant_fxp(v, frac_bits=0, total_bits=8).tolist() == [38, -38, 3, -3, 0, -1,
+                                                                      127, -128]
+    assert OUT_QUANT_DEFAULTS["round"] == "half_away"
+    assert normalize_out_quant({"round": "half_up"})["round"] == "half_up"
+    with pytest.raises(ValueError, match="out_quant.round must be in"):
+        normalize_out_quant({"round": "half_down"})
+    assert _bias_to_grid(v, 0, True, "cpu").tolist() == [38, -37, 3, -2, 0, -1, 200, -200]
 
 
 from mx_layers_act import MXActQuant   # noqa: E402
@@ -621,15 +718,15 @@ def test_alg_warp_off_sites_and_true_run_as_the_lib(operand, shape):
 
 
 def test_t12_output_requant_q7_without_output_fxp():
-    """D7 on a config with no output fxp: ALG gives the acc unrounded."""
+    """D7 on a config with no output fxp: ALG gives the acc unrounded, off
+    the HW answer, which their PCU gives."""
     (v,) = [x for x in WV.vectors(HWX) if x["label"] == "D7 | HW Q7"]
-    assert (v["acc"], v["alg"], v["hw"], v["pcu"]) == (37.5, 37.5, 37.5, 38)
+    assert (v["acc"], v["alg"], v["hw"], v["want"]) == ([37.5, -37.5], [37.5, -37.5],
+                                                        [38, -37], [38, -37])
     assert "no output fxp" in v["text"]
 
 
-# --- hw_vs_alg_check T12: the warp vectors sent with the HW questions --------
-
-import warp_vectors as WV             # noqa: E402
+# --- hw_vs_alg_check T12: the warp vectors, against the HW answers ------------
 
 T12 = WV.vectors(E4)
 
@@ -645,109 +742,128 @@ def test_t12_covers_every_hw_question():
     assert labels
     assert {q for _, q in labels} == {f"HW Q{i}" for i in range(1, 11)}
     assert {d for d, _ in labels} == {f"D{i}" for i in range(1, 10)}
+    assert all(v["status"] == WV.RESOLVED or v["status"].startswith("open: ") for v in T12)
+
+
+# Each T12 vector's HW answer, worked out here from the answer's own words in
+# hw/warp_hw_questions_and_answers.md (never from their code), and the open
+# ones by label. Their emulator must give every resolved answer.
+OPEN = {"D1 | HW Q1": 1, "D3 | HW Q4": 1, "D6 | HW Q5": 1}
+
+
+def test_t12_open_ones_are_the_questions_the_answers_leave_open():
+    got = {}
+    for v in T12:
+        if v["status"] != WV.RESOLVED:
+            got[v["label"]] = got.get(v["label"], 0) + 1
+    assert got == OPEN
+    off_alg, off_hw = WV.gaps(T12)
+    assert off_hw == []                                        # their emulator: every answer
+    assert [v["label"] for v in off_alg] == ["D4 | HW Q5", "D7 | HW Q7"]   # E4: half away
+    off_alg, off_hw = WV.gaps(WV.vectors(_half_up(E4)))
+    assert off_alg == off_hw == []
 
 
 def test_t12_border_q1():
-    """ALG reads zero outside the frame; HW reads a frame pixel there."""
+    """Q1: the complete coordinate saturates, no excess fraction kept.
+    ref[y,x] = 10(x+1)+y on 4x6: x = 2, y = H-1+0.25 -> ref[3, 2] = 33 (the
+    Q&A's 'Replicate' column); x = -0.25, y = 1 -> 11, the near edge, open."""
     left, bottom = _t12("D1 | HW Q1")
-    ref = left["ref"][0, 0].double()
-    # x = -0.25 at (y 1, x 0): ALG 0.25 * 0 + 0.75 * ref[1, 0]
-    assert left["alg"] == pytest.approx(0.75 * float(ref[1, 0])) == pytest.approx(8.25)
-    # their index is floor (q >> frac = -1), which get_ref_frame clamps to 0;
-    # the fraction is the low bits, 0.75 -> 0.25 * ref[1, 0] + 0.75 * ref[1, 1]
-    assert left["hw"] == pytest.approx(0.25 * float(ref[1, 0]) + 0.75 * float(ref[1, 1]))
-    assert left["hw"] == pytest.approx(18.5)
-    # y = H-1+0.25 at (y 3, x 2): ALG 0.75 * ref[3, 2]; HW (question 1): their
-    # index clamped to H-2, the raw fraction 0.25 kept
-    assert bottom["alg"] == pytest.approx(0.75 * float(ref[3, 2]))
-    assert bottom["hw"] == pytest.approx(
-        0.75 * float(ref[2, 2]) + 0.25 * float(ref[3, 2])) == pytest.approx(32.25)
+    assert (bottom["want"], bottom["alg"], bottom["hw"], bottom["status"]) == (
+        33, 33, 33, WV.RESOLVED)
+    assert (left["want"], left["alg"], left["hw"]) == (11, 11, 11)
+    assert left["status"].startswith("open: Q1")
 
 
 def test_t12_identity_q2():
-    """Zero flow: ALG returns the frame; HW the last row (column) from the
-    row (column) before it."""
+    """Q2: zero motion preserves the reference: last row [24, 27, 30, 33]
+    (the Q&A's own example), last column of 2x32 at 3 * 31 = 93."""
     row, col = _t12("D1 | HW Q2")
-    ref = row["ref"][0, 0].double()
-    assert row["alg"] == ref[-1].tolist()
-    assert row["hw"] == ref[-2].tolist()
-    ref = col["ref"][0, 0].double()
-    assert col["alg"] == float(ref[0, -1]) and col["hw"] == float(ref[0, -2])
+    assert row["want"] == row["alg"] == row["hw"] == [24, 27, 30, 33]
+    assert col["want"] == col["alg"] == col["hw"] == 93
 
 
-def test_t12_fraction_bits_q3_q4():
-    """Their fraction bits come from the frame: 15 minus the bits of the
-    largest position on that axis (16-bit signed word); the config's are
-    fixed. Equal only where the frame gives the config's format (65x65)."""
-    q3, moved = _t12("D2 | HW Q3")
-    (q4,) = _t12("D3 | HW Q4")
-    fcfg = list(HW.warp_spec(E4)["frac_cfg"])
-    assert set(q3["hw"]) == set(WV.FRAC_SIZES)
-    for (Hh, Ww), fh in q3["hw"].items():
-        assert q3["alg"][(Hh, Ww)] == fcfg
-        assert fh == [15 - (Ww - 1).bit_length(), 15 - (Hh - 1).bit_length()]
-        assert (fh == fcfg) == ((Hh, Ww) == (65, 65))
-        assert q4["hw"][(Hh, Ww)] == sum(fh) > HW.WARP_FRAC_SUM_LIMIT
-    assert moved["grid"]["n_diff"] > 0 and moved["acc"]["n_diff"] > 0
+def test_t12_fraction_bits_q3():
+    """Q3: relative motion in the supplied format, the config's 8 bits per
+    axis: no grid word off flow * 2^8, and the interior acc equal."""
+    (v,) = _t12("D2 | HW Q3")
+    assert (v["want"], v["alg"], v["hw"], v["frac"]) == (0, 0, 0, [8, 8])
+    assert v["acc"]["n"] > 0 and v["acc"]["n_diff"] == 0
+
+
+def test_t12_frac_sum_q4_records_the_open_endpoint():
+    """Q4: 8 + 8 = 16 is legal; zero flow makes every w00 2^16, which their
+    int64 weight holds; the field's encoding of 2^16 is open."""
+    (v,) = _t12("D3 | HW Q4")
+    assert (v["frac_sum"], v["hw"], v["n"], v["want"]) == (16, 8, 8, None)
+    assert v["status"].startswith("open: Q4")
 
 
 def test_t12_ties_q5():
-    """Grid ties: ALG rounds half away from zero, HW the tie to 0 px; the
-    reference: ALG half up, HW half to even."""
+    """Q5 + Q7: the grid word comes from the producer's PCU, ties toward +inf:
+    +0.5/256 -> +1, -0.5/256 -> 0; ALG as shipped rounds half away (-1). The
+    reference float-to-code tie is open: ALG half away, their packer half to
+    even."""
     g_pos, g_neg, ref = _t12("D4 | HW Q5") + _t12("D6 | HW Q5")
-    assert (g_pos["tie"], g_pos["alg"], g_pos["hw"]) == (0.5, 1, 0)
-    assert (g_neg["tie"], g_neg["alg"], g_neg["hw"]) == (-0.5, -1, 0)
-    r = ref["ref"].double()
-    assert ref["alg"] == torch.floor(r + 0.5).tolist() == [3, 4, 4]
-    assert ref["hw"] == torch.round(r).tolist() == [2, 4, 4]
+    assert (g_pos["tie"], g_pos["want"], g_pos["alg"], g_pos["hw"]) == (0.5, 1, 1, 1)
+    assert (g_neg["tie"], g_neg["want"], g_neg["alg"], g_neg["hw"]) == (-0.5, 0, -1, 0)
+    assert (ref["alg"], ref["hw"], ref["want"]) == ([3, 4, 4], [2, 4, 4], None)
+    assert ref["status"].startswith("open: Q5")
 
 
 def test_t12_reference_format_q6():
-    """ALG saturates to int8, their packer clamps to uint8; main_HW refuses."""
+    """Q6: int8 [-128, 127]: [-50, 0, 127, 200] -> [-50, 0, 127, 127]; main_HW
+    now runs a signed reference."""
     (v,) = _t12("D5 | HW Q6")
-    r = v["ref"].double()
-    assert v["alg"] == r.clamp(-128, 127).tolist()
-    assert v["hw"] == r.clamp(0, 255).tolist()
-    assert v["refusal"].startswith("refused")
+    assert v["want"] == v["alg"] == v["hw"] == [-50, 0, 127, 127]
+    assert v["refusal"] == "ran"
 
 
 def test_t12_output_requant_q7():
-    """acc 37.5: ALG requantizes (half away -> 38), HW stores the acc as is."""
+    """Q7: acc 37.5 -> 38, -37.5 -> -37 (the Q&A's own example)."""
     (v,) = _t12("D7 | HW Q7")
-    assert (v["acc"], v["alg"], v["hw"], v["pcu"]) == (37.5, 38, 37.5, 38)
+    assert (v["acc"], v["want"], v["hw"], v["alg"]) == ([37.5, -37.5], [38, -37], [38, -37],
+                                                        [38, -38])
 
 
 def test_t12_batch_q8():
-    """Batch 1 moved +1 px: ALG moves it, their code samples batch 1 on
-    batch 0's (zero) grid; main_HW refuses."""
+    """Q8: one frame per call. ALG moves batch 1; their code raises, main_HW
+    refuses with a name."""
     (v,) = _t12("D8 | HW Q8")
     ref1 = v["ref"][1, 0, 0].double()
-    assert v["alg"] == ref1[1:5].tolist()
-    assert v["hw"] == ref1[:4].tolist()
-    assert v["refusal"].startswith("refused")
+    assert v["alg_out"] == ref1[1:5].tolist()
+    assert (v["want"], v["hw"]) == ("refused", "refused")
+    assert v["theirs"].startswith("raise ValueError")
 
 
-def test_t12_float32_store_q9():
+def test_t12_integer_store_q9():
+    """Q9: integer types through the PCU: their int8 output is the PCU rule
+    of their own int64 acc on every pixel."""
     (v,) = _t12("D9 | HW Q9")
-    assert 0 < v["rounded"] <= v["big"] <= v["n"] and v["lsb"] > 0
+    assert (v["want"], v["hw"], v["dtypes"]) == (0, 0, "torch.int64, torch.int64")
 
 
 def test_t12_padding_q10():
-    """x = W-1+0.5 on 100: ALG 0.5 * 100 at both widths; HW reads its zero
-    padding at W = 40 (padded to 64), the frame's own pixel at W = 32."""
+    """Q10: no padding: x = W-1+0.5 on a constant 100 is 100 at W = 40 and 32
+    (the delivered emulator gave 50 at W = 40)."""
     w40, w32 = _t12("D1 | HW Q10")
-    assert (w40["W"], w40["alg"], w40["hw"]) == (40, 50, 50)
-    assert (w32["W"], w32["alg"], w32["hw"]) == (32, 50, 100)
+    assert (w40["W"], w40["want"], w40["alg"], w40["hw"]) == (40, 100, 100, 100)
+    assert (w32["W"], w32["want"], w32["alg"], w32["hw"]) == (32, 100, 100, 100)
 
 
 def test_hw_vs_alg_check_prints_the_t12_vectors():
-    """--only warp prints every vector's own text (built from its values)."""
+    """--only warp prints every vector's own text (built from its values),
+    then the vectors off the HW answer and the open ones, by name."""
     p = subprocess.run([sys.executable, "hw_vs_alg_check.py", "--only", "warp"],
                        cwd=os.path.join(_ROOT, "configs"), capture_output=True,
                        text=True, timeout=300)
     assert p.returncode == 0, p.stderr[-2000:]
+    out = p.stdout.splitlines()
     lines = [f"  [{v['label']}] {v['text']}" for v in T12]
-    assert lines and all(ln in p.stdout.splitlines() for ln in lines), p.stdout[-2000:]
+    assert lines and all(ln in out for ln in lines), p.stdout[-2000:]
+    assert out[-3:] == ["  ALG off the HW answer: D4 | HW Q5, D7 | HW Q7",
+                        "  their emulator off the HW answer: none",
+                        "  open in the HW answers: D1 | HW Q1, D3 | HW Q4, D6 | HW Q5"]
 
 
 def test_hw_vs_alg_check_runs_on_hw_exact():
@@ -899,10 +1015,13 @@ def test_gen_hw_grids_leaves_no_tmp_file_on_a_refused_base(tmp_path):
 def test_main_cli_reports_each_refusal_and_goes_on():
     """main.py -m all on npe_e4: the input-layer and PLA cases are refused
     (no grids in that config), the run goes on to the warp, the refusals are
-    named, and the exit code says a case did not run (2), never a pass."""
+    named, and the exit code says a case did not run (2), never a pass. The
+    warp cases with a negative output tie mismatch (that config rounds half
+    away, HW half up: Q7), which outranks the refusals: exit 1."""
     p = _cli("main.py", "-m", "all", "--config", "mx_config_npe_e4.json")
-    assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
+    assert p.returncode == 1, p.stdout[-2000:] + p.stderr[-2000:]
     out = p.stdout.splitlines()
+    assert ", mismatched: warp_half_pixel, warp_neg_frac, warp_oob," in out[-1]
     assert any(ln.startswith("  HW refused: mx_config_npe_e4.json: input layer needs")
                for ln in out)
     assert "=== warp_u8_subpix_w64 ===" in out
@@ -1175,7 +1294,7 @@ runpy.run_path({script!r}, run_name="__main__")
 """
 
 
-@pytest.mark.parametrize("module, name", [("main_ALG", "_code"), ("main_HW", "abs_coords")])
+@pytest.mark.parametrize("module, name", [("main_ALG", "_code"), ("main_HW", "grid_word")])
 def test_hw_vs_alg_check_fails_on_a_key_error_inside_the_warp(tmp_path, module, name):
     """A KeyError raised inside either warp side (a bug, not a config entry
     the sim lacks) is a failure: traceback, exit 1, never "T12 skipped"."""
