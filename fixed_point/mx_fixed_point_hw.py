@@ -342,8 +342,12 @@ def pla_multipliers(alpha, mult_bits=8, frac_bits=None):
     a = torch.as_tensor(alpha).detach().to(torch.float64).cpu().flatten()
     lo, hi = -(1 << (mult_bits - 1)), (1 << (mult_bits - 1)) - 1
 
+    # Kept in float64 until it fits: an int64 cast of a huge slope wraps.
+    def neg_mult(f):
+        return _round_to_int(a * 2.0 ** f, "half_up")
+
     def fits(f):
-        mn = torch.floor(a * 2.0 ** f + 0.5)
+        mn = neg_mult(f)
         return (1 << f) <= hi and int(mn.min()) >= lo and int(mn.max()) <= hi
 
     if frac_bits is None:
@@ -357,7 +361,7 @@ def pla_multipliers(alpha, mult_bits=8, frac_bits=None):
             raise ValueError(f"PLA: frac {frac} overflows {mult_bits}b "
                              f"multipliers (slopes {a.min().item():.4g}.."
                              f"{a.max().item():.4g})")
-    m_neg = torch.floor(a * 2.0 ** frac + 0.5).to(torch.int64)
+    m_neg = neg_mult(frac).to(torch.int64)
     return torch.full_like(m_neg, 1 << frac), m_neg, frac
 
 
@@ -385,8 +389,8 @@ def pla_bins(m_pos, m_neg, bias_fp, e_acc, frac):
         z = torch.zeros_like(m_pos)
         return z.view(-1, 1), scales, torch.zeros_like(scales)
     v = bias_fp.detach().to(torch.float64).cpu().flatten() * float(2.0 ** (-int(e_acc)))
-    b_acc = (v + 0.5).floor().to(torch.int64)
-    biases = (scales.to(torch.float64) * v.view(-1, 1) + 0.5).floor().to(torch.int64)
+    b_acc = _round_to_int(v, "half_up").to(torch.int64)
+    biases = _round_to_int(scales.to(torch.float64) * v.view(-1, 1), "half_up").to(torch.int64)
     return (-b_acc).view(-1, 1), scales, biases
 
 

@@ -122,6 +122,24 @@ def test_multipliers_round_half_up_and_auto_frac():
         pla_multipliers(torch.tensor([0.25]), frac_bits=7)     # m_pos = 128
 
 
+def test_multipliers_ties_toward_plus_inf():
+    """m_neg ties go toward +inf (HW PCU rule): +2.5 -> 3, -1.5 -> -1, where
+    half even gives 2 and -2."""
+    m_pos, m_neg, frac = pla_multipliers(torch.tensor([2.5 / 64, -1.5 / 64],
+                                                      dtype=torch.float64))
+    assert frac == 6 and m_neg.dtype == torch.int64 and m_neg.tolist() == [3, -1]
+
+
+def test_multipliers_fit_check_ties_toward_plus_inf():
+    """The fit check rounds as m_neg does: -128.5 -> -128 fits 8b at frac 6
+    (half away would give -129 and drop to frac 5). Half even agrees with
+    half up at both 8b edges (127.5, -128.5 sit above an odd floor), so no
+    fit decision can tell those two apart; the m_neg test above does."""
+    m_pos, m_neg, frac = pla_multipliers(torch.tensor([-128.5 / 64]))
+    assert frac == 6 and m_neg.tolist() == [-128]
+    pla_multipliers(torch.tensor([-128.5 / 64]), frac_bits=6)    # no raise
+
+
 def test_config_validation():
     with pytest.raises(ValueError, match="out_window"):
         _xb(out_window="off")
@@ -225,6 +243,19 @@ def test_bins_hand_vector():
     # Bin bias tie rounds half up: 1 * 2.5 -> 3 (half-even would give 2).
     assert pla_bins(torch.tensor([64]), torch.tensor([1]), torch.tensor([2.5 * 2.0 ** e]),
                     e, 6)[2].tolist() == [[3, 160]]
+
+
+def test_bins_ties_toward_plus_inf():
+    """b_acc and the bin biases round ties toward +inf (HW PCU rule), on
+    both signs: half even would give boundary -2 / 2 and B_neg -2 below."""
+    e = -10
+    bnd, _, bb = pla_bins(torch.tensor([64]), torch.tensor([1]),
+                          torch.tensor([2.5 * 2.0 ** e], dtype=torch.float64), e, 6)
+    assert bnd.tolist() == [[-3]] and bb.tolist() == [[3, 160]]
+    bnd, _, bb = pla_bins(torch.tensor([64]), torch.tensor([1]),
+                          torch.tensor([-1.5 * 2.0 ** e], dtype=torch.float64), e, 6)
+    assert bnd.tolist() == [[1]] and bb.tolist() == [[-1, -96]]
+    assert bnd.dtype == torch.int64 and bb.dtype == torch.int64
 
 
 def test_bins_layer_tie_and_shape_checked():
