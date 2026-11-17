@@ -454,8 +454,7 @@ def clamp_block_exp(q, e_base, exp_bits, fmt='int8', round='nearest', sync=True)
     step = 2.0 ** (int(e_base) - mant_bias)
     hi = max_val * 2.0 ** (int(e_base) + (1 << int(exp_bits)) - 1 - mant_bias)
     hi = min(hi, torch.finfo(q.dtype).max)     # a wide register tops out above fp
-    half = 0.0 if round == "truncate" else 0.5
-    y = torch.sign(q) * torch.floor(q.abs() / step + half) * step
+    y = _round_to_int(q / step, "trunc" if round == "truncate" else "half_away") * step
     y = y.clamp(-hi, hi)
     changed = (y != q).sum()
     return y, (int(changed.item()) if sync else changed)

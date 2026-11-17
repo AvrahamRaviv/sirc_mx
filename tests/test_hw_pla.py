@@ -140,6 +140,16 @@ def test_multipliers_fit_check_ties_toward_plus_inf():
     pla_multipliers(torch.tensor([-128.5 / 64]), frac_bits=6)    # no raise
 
 
+def test_multipliers_fit_check_upper_edge_non_tie():
+    """127.6 at frac 6 rounds to 128, an 8b overflow, so the fit check must
+    round as m_neg does (not truncate to 127): auto picks frac 5 (63.8 ->
+    64), and frac 6 is refused instead of emitting a wrapped multiplier."""
+    m_pos, m_neg, frac = pla_multipliers(torch.tensor([127.6 / 64]))
+    assert frac == 5 and m_pos.tolist() == [32] and m_neg.tolist() == [64]
+    with pytest.raises(ValueError, match="overflows"):
+        pla_multipliers(torch.tensor([127.6 / 64]), frac_bits=6)
+
+
 def test_config_validation():
     with pytest.raises(ValueError, match="out_window"):
         _xb(out_window="off")

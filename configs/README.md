@@ -27,6 +27,8 @@ conv), and **warp**.
 | `main.py` | runs both sides, compares the shared taps in order, names the first that differs |
 | `infer_dof/` | not the sim: one framework config per DOF inference experiment, to make its HW grids from (its `README.md`) |
 
+The rounding copies in `cases.py`, `hw_vs_alg_check.py` and `warp_vectors.py` are on purpose: they are spec references kept independent of the lib (as `main_HW.py` rule 1), so never route them through `fixed_point/fxp_quant._round_to_int`.
+
 ## Taps
 
 | op | taps (ALG order) |

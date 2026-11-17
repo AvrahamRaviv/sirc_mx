@@ -86,6 +86,17 @@ def test_clamp_rerounds_block_below_base():
     assert y.tolist() == [3 * 2.0 ** -21, -3 * 2.0 ** -21] and n == 2
 
 
+def test_clamp_reround_ties_half_away():
+    # Exact ties onto base -15 (step 2^-21): +-2.5 -> +-3 and -1.5 -> -2, half
+    # away from zero (half even gives 2, -2, -2; half up 3, -2, -1).
+    # truncate drops the half: 2, -2, -1.
+    step = 2.0 ** -21
+    q = torch.tensor([2.5 * step, -2.5 * step, -1.5 * step])
+    assert clamp_block_exp(q, -15, 4)[0].tolist() == [3 * step, -3 * step, -2 * step]
+    assert clamp_block_exp(q, -15, 4, round="truncate")[0].tolist() == \
+        [2 * step, -2 * step, -1 * step]
+
+
 def test_clamp_saturates_block_above_top():
     # base 0, 4 bits -> top 15; a block at E = 20 clamps to 127 * 2^(15-6).
     # A small element of that block (3 * 2^14 = 96 top steps) fits as is.
