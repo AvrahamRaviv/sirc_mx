@@ -25,26 +25,37 @@ shared exponent, as in the se4 configs.
 
 ## Gaps to HW (`se4_warp_convT_hw.json`)
 
-What the closest config does against the NPE HW, owner decisions 2026-11-12.
+What the closest config does against the NPE HW, owner decisions 2026-11-12. `Qn` = question n of the HW
+team's answers, `configs/hw/warp_hw_questions_and_answers.md` (2026-11-15).
 
 | item | this config | HW | state |
 |---|---|---|---|
 | mantissa round | `nearest` (lib default; no `mant_round` key) | nearest (HW agreed 2026-11-02); the HW emulator still truncates (`configs/README.md`), so a bit-exact run against it differs here | already matched |
 | exponent base | static `e_base_a` / `e_base_w` from the grids, 4-bit register (`in_exp_bits: 4`) | static, 4 bits | already matched |
 | exponent register anchor | `in_exp_anchor: "min"` | min non-zero block exponent | fixed here |
+| near-zero weight block, `min` anchor | `block_exp_range` counts every block with max > 0, so a dead filter (max 4.9e-39, DOF `convs.0.0.0` out-channel 0) sets `e_base_w` -128 and the run gives NaN (owner's run 2026-11-16; no NaN with anchor `max`) | not known | waiting for HW |
+| block exponent near 2^k | `floor(log2(amax))` in float32 (microxcaling): one too high just below a power of two (README, "Notes") | not answered (Q12) | waiting for HW |
 | PLA | `pla: "infer"`, `pla_bias: "bins"`: the activation folded into the PCU multiply, per-bin scale and bias | PCU PLA, bin form | fixed here |
 | bias / output round + static shift | `bias_round: "half_up"`, `out_round: "nearest"`, `out_margin_bits: 1`, `static_shift_bits: 7` | half up, nearest, 7-bit signed static shift | fixed here |
+| fixed-point round (warp ref, grid, warp output, model output) | fxp `round: "half_away"`, ties away from zero (-37.5 -> -38); the lib has no ties-toward-+inf fxp mode (`_VALID_ROUND_MODES`: `half_away`, `half_even`, `trunc`) | PCU nearest, ties toward +inf (-37.5 -> -37, Q7); the reference and grid words are rounded by the layer that makes them (Q5) | left open |
 | first-layer input | `in_mode: "int"`: per-tensor int8, scale `in_scale` in the grids | int8 input, no block exponent | fixed here |
 | first-layer bias | the bias rounds on the lib's first-layer accumulator grid, finer than HW's: bit-exact only without bias; with a bias a per-channel offset up to 2^-16 is left (`configs/README.md`, "HW-exact (M1-M8)") | bias on HW's accumulator grid | left open |
-| warp ref + grid | int8 ref, calibrated scale per call site; Q8.8 grid | int8 ref, Q8.8 grid | already matched |
-| warp output | int8, calibrated arbitrary-real scale per call site | int8 | fixed here |
+| warp reference | signed int8, calibrated scale per call site | signed int8 `[-128, 127]` by default, uint8 when selected (Q6) | already matched |
+| warp grid | relative motion, Q8.8 on both axes | relative motion, int16 Qm.k with 0 <= k <= 8, X and Y may differ, the format fixed by the producer, not per frame (Q3, Q4) | already matched (Q8.8 is legal; the other formats are unused) |
+| warp border | the DOF model's own warp (in nndof, outside this repo) samples the float frame: `grid_sample`, zero outside, `align_corners=True` (Q1); the sim's float spec `cases.Warp` also gives 0 outside | the whole coordinate clamped to the edge, its excess fraction dropped: edge replication (Q1); negative words and all four sides not confirmed | left open |
+| motion limit | none | separate X and Y maximum motion, saturated to it (320.23 -> 319, Q3); how the limits are set is not specified | left open |
+| warp full weight | float bilinear, no weight field | 16-bit unsigned weight field; the full weight 2^16 at 8 + 8 fraction bits does not fit, its encoding is open (Q4) | waiting for HW |
+| warp output | int8, calibrated arbitrary-real scale per call site | int8 `[-128, 127]`, own scale through the PCU rescale (Q7) | fixed here |
+| warp output multiplier | the scale is any real (`pow2: false`) | PCU multiplier format, and its link to the Q10 scaling unit, not given (Q7) | waiting for HW |
+| warp batch | the model's batch, reference and grid as the model gives them | one frame and a same-size grid per call (Q8, Q10) | left open: check that DOF infer runs batch 1 with a same-size grid |
 | model output | `out_quant` Q8.8 | Q8.8 | fixed here |
 | `model.block{2,3}.convtranspose_2` (grouped convT) | plain MX (group `convT_plain`), no HW path | grouped convT on the NPE | waiting for HW |
-| warp packing | int8 ref, one fraction width | uint8 vs int8, fraction bits per frame | waiting for HW |
 | overflow | clamp (lib default; no `overflow` / `overflow_saturate` keys) | accumulator wraps, window saturates | left open |
 | concat / eltwise sum | float | NPE ops | later |
-| full-network bit-exact check vs the emulator | not done | | not done |
+| full-network bit-exact check vs the emulator | not done | the HW team fixed the emulator bugs agreed in the answers (commit `257a52e`): border clamp (Q1), last row and column (Q2), relative grid with 0..8 fraction bits per axis (Q3, Q4), signed int8 reference (Q6), PCU on the warp output (Q7), int64 product and accumulator (Q9), no width padding (Q10), one frame with a same-size grid (Q8, Q10) | not done |
 
+- Fixed-point round: the conv outputs already round as the PCU does (`out_round: "nearest"` adds half, then
+  floors; `bias_round: "half_up"`); only the fxp quantizers (warp, `out_quant`) still round ties away from zero.
 - Overflow stays the default clamp (owner: "left overflow issue for now unsolved"): `overflow: "raise"`
   would stop an inference run at the first out-of-range word.
 - `out_window` stays `always` as in se4 (PLA needs the window on; `always` is on, and with PLA `infer` train
