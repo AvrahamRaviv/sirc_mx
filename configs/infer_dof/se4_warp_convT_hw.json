@@ -130,7 +130,7 @@
             "total_bits": 8,
             "signed": true,
             "calibrate": true,
-            "round": "half_away",
+            "round": "half_up",
             "saturate": true
           }
         },
@@ -150,7 +150,7 @@
           "signed": true,
           "calibrate": true,
           "pow2": false,
-          "round": "half_away",
+          "round": "half_up",
           "saturate": true
         }
       }
@@ -161,7 +161,7 @@
       "total_bits": 16,
       "frac_bits": 8,
       "signed": true,
-      "round": "half_away",
+      "round": "half_up",
       "saturate": true,
       "clip_grad": false
     }

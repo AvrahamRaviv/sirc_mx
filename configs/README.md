@@ -186,7 +186,11 @@ Result on `mx_config_npe_e4.json`: every warp case HW runs agrees with ALG
 on ref, grid and acc (border included); `out_code` differs only on a
 negative tie (`warp_half_pixel`, `warp_neg_frac`, `warp_oob`), because that
 config rounds the output half away and HW half up. With the warp's grid and
-output fxp at `round: "half_up"` every one is bit-exact. Configs with no
+output fxp at `round: "half_up"` every one is bit-exact. The DOF HW config
+`infer_dof/se4_warp_convT_hw.json` rounds the warp reference, the warp output
+and the model out_quant half up (owner 2026-11-17): every warp case is
+bit-exact there, and T12 has one resolved vector off, D4 (its warp grid fxp
+still rounds half away). Configs with no
 output fxp (`hw_exact`, `dof_run`) leave ALG's out unrounded, against HW's
 int8 (a float difference, said by the run).
 

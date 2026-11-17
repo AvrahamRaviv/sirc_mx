@@ -68,6 +68,11 @@ HW_SOURCE = os.path.join(_ROOT, "configs", "mx_config_dof_run_hw_exact.json")
 NPE_SOURCE = os.path.join(_ROOT, "configs", "mx_config_npe_e4.json")
 HW_XBLOCK = ["pla", "pla_bias", "bias_round", "out_round", "out_margin_bits",
              "in_exp_anchor", "static_shift_bits"]
+# Owner 2026-11-17 ("Add the ties-up rounding"): in the HW config the warp
+# reference, the warp output and the model out_quant round half up, ties
+# toward +inf, the NPE PCU rule (warp Q&A Q7); every other config keeps the
+# lib default.
+HW_ROUND = "half_up"
 FIRST = "model.feature_pyramid_extractor.convs.0.0.0"   # group input_layer
 PLA_FOLDED = CONVS    # each directly followed by its activation in a Sequential
 PLA_KEYS = ["pla_frac", "pla_m_pos", "pla_m_neg",
@@ -220,8 +225,9 @@ def _out_quant_entries(cfg):
 
 def _without_hw(cfg):
     """`cfg` with the HW switches taken out: their xblock keys, the
-    input_layer group (the first layer back to a plain name), the warp output
-    and the model out_quant entry."""
+    input_layer group (the first layer back to a plain name), the warp output,
+    the warp reference's HW rounding (back to its source's) and the model
+    out_quant entry."""
     c = copy.deepcopy(cfg)
     for k in HW_XBLOCK:
         del c["mx_specs"]["xblock_accum"][k]
@@ -232,6 +238,7 @@ def _without_hw(cfg):
             l = FIRST
         elif _name(l) == WARP:
             del l["output"]
+            l["inputs"][0]["fxp"]["round"] = WARP_REF["round"]
         elif l in _out_quant_entries(c):
             continue
         layers.append(l)
@@ -258,8 +265,11 @@ def _check_hw_keys_from_their_sources(cfg):
     assert want["xblock_accum"]["in_mode"] == "int"
     assert cfg["groups"]["input_layer"] == want
     assert _entry(cfg, FIRST) == _entry(hw, FIRST)
-    assert _entry(cfg, WARP)["output"] == _entry(npe, WARP)["output"]
-    assert _out_quant_entries(cfg) == _out_quant_entries(hw)
+    w = _entry(cfg, WARP)
+    assert (w["inputs"][0]["fxp"]["round"], w["output"]["fxp"]["round"]) == (HW_ROUND,) * 2
+    npe_out = _entry(npe, WARP)["output"]
+    assert w["output"] == dict(npe_out, fxp=dict(npe_out["fxp"], round=HW_ROUND))
+    assert _out_quant_entries(cfg) == [dict(e, round=HW_ROUND) for e in _out_quant_entries(hw)]
     assert _out_quant_entries(cfg)[0]["frac_bits"] == OUT_FRAC
 
 
