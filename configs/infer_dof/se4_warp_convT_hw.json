@@ -139,7 +139,7 @@
             "total_bits": 16,
             "frac_bits": 8,
             "signed": true,
-            "round": "half_away",
+            "round": "half_up",
             "saturate": true
           }
         }

@@ -762,10 +762,10 @@ def test_t12_open_ones_are_the_questions_the_answers_leave_open():
     assert [v["label"] for v in off_alg] == ["D4 | HW Q5", "D7 | HW Q7"]   # E4: half away
     off_alg, off_hw = WV.gaps(WV.vectors(_half_up(E4)))
     assert off_alg == off_hw == []
-    # the DOF HW config (owner 2026-11-17): ref, output and model out_quant half
-    # up, the warp grid fxp still half away: only the grid tie is off
+    # the DOF HW config (owner and co-manager 2026-11-17): warp ref, grid,
+    # output and model out_quant half up: no resolved vector off
     off_alg, off_hw = WV.gaps(WV.vectors(SE4_HW))
-    assert [v["label"] for v in off_alg] == ["D4 | HW Q5"] and off_hw == []
+    assert off_alg == off_hw == []
 
 
 SE4_HW = SC.load_config("infer_dof/se4_warp_convT_hw.json")
@@ -773,9 +773,9 @@ SE4_HW = SC.load_config("infer_dof/se4_warp_convT_hw.json")
 
 @pytest.mark.parametrize("name", WARP_HW)
 def test_warp_bit_exact_on_the_dof_hw_config(name):
-    """infer_dof/se4_warp_convT_hw.json rounds the warp output half up (owner
-    2026-11-17): every warp case HW runs is bit-exact, ALG vs their emulator,
-    negative output ties included."""
+    """infer_dof/se4_warp_convT_hw.json rounds the warp grid and output half
+    up (2026-11-17): every warp case HW runs is bit-exact, ALG vs their
+    emulator, negative output ties included."""
     case = C.build(name)
     a, h = ALG.run(case, SE4_HW), HW.run(case, SE4_HW)
     bad = [k for k, v, *_ in M.compare(a, h) if v not in ("bit-exact", "float")]
