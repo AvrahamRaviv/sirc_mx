@@ -508,11 +508,13 @@ def test_hw_grid_word_rounds_ties_up_and_saturates():
 
 def test_hw_warp_refuses_what_their_code_does_not_take():
     """More than one frame (their forward raises, Q8: one frame per call,
-    native batch not needed), a non-finite reference or flow, grid fraction bits
-    outside 0..8 (Q3), a grid wider than int16, a reference or output that is
-    not signed 8-bit, a non power-of-two out / ref step (Q7: the multiplier
-    format is open). Each is a named NotImplementedError (a refusal), never
-    their ValueError (a failure)."""
+    native batch not needed), a grid of another size than the reference (Q10),
+    a non-finite reference or flow, grid fraction bits outside 0..8 (Q3), a
+    grid wider than int16, a reference or output that is not signed 8-bit, a
+    non power-of-two out / ref step (Q7: the multiplier format is open). Each
+    is a named NotImplementedError (a refusal), never their ValueError (a
+    failure). A grid fxp with a `scale` stops the run: the lib would use the
+    scale, main_HW feeds their code frac_bits, so the sides would differ."""
     ok = torch.randint(-128, 128, (2, 1, 3, 8), generator=torch.Generator().manual_seed(1))
     f = C.const_flow(2, 3, 8, 0.5, 0.0)
     with pytest.raises(NotImplementedError, match=r"batch 2.*one\s+frame.*HW Q8"):
@@ -525,6 +527,8 @@ def test_hw_warp_refuses_what_their_code_does_not_take():
     nan_flow[0, 1, 0, 0] = float("inf")
     with pytest.raises(NotImplementedError, match="non-finite flow"):
         HW.run(C.warp_case("n", ok[:1], nan_flow, C.P2, C.P2), E4)
+    with pytest.raises(NotImplementedError, match=r"same-size grid \(HW Q10\)"):
+        HW.run(C.warp_case("g", ok[:1], C.const_flow(1, 3, 4, 0, 0), C.P2, C.P2), E4)
 
     def cfg_with(i, **fxp):
         cfg = copy.deepcopy(E4)
@@ -547,6 +551,8 @@ def test_hw_warp_refuses_what_their_code_does_not_take():
     assert "out_code" in HW.run(z, cfg)
     with pytest.raises(NotImplementedError, match="not a power of two"):
         HW.run(C.warp_case("s", ok[:1], C.const_flow(1, 3, 8, 0, 0), C.P2, 0.7 * C.P2), E4)
+    with pytest.raises(SystemExit, match=r"grid has no frac_bits \(or a scale\)"):
+        HW.run(z, cfg_with(1, scale=1 / 256))
 
 
 def test_hw_warp_grid_format_from_config_and_reported():
