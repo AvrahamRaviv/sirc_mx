@@ -23,6 +23,28 @@ Base and the 4-bit exponent:
 Not made: 5 w_int8, 6 se4_w_int8: deferred by the owner 2026-11-10; weights stay MX int8 with the 4-bit
 shared exponent, as in the se4 configs.
 
+## Results (DOF infer, owner's runs 2026-11-18)
+
+Each quant run against the float reference `infer_front_float_reproduce`, 374 pairs, KPI by
+`tools/dof_edge_kpi.py` (owner's output 2026-11-18). motion = motion error / float motion, on the edge
+band; > 1 px = pixels with motion error > 1 px; image = image error added over float.
+
+| run | motion | > 1 px | image |
+|---|---|---|---|
+| float rerun vs float reference (noise floor) | 0.01 % | 0.00 % | +0.00 % |
+| `se4_warp_convT` + PLA | 2.43 % | 0.29 % | +0.13 % |
+| `se4_warp_convT` + HW rounding | 2.43 % | 0.26 % | +0.12 % |
+| `se4_warp_convT` + warp output int8 | 2.59 % | 0.30 % | +0.17 % |
+| `se4_warp_convT` + `out_quant` Q8.8 | 2.43 % | 0.29 % | +0.13 % |
+| `se4_warp_convT` + first layer int8 | 2.65 % | 0.34 % | +0.13 % |
+| `se4_warp_convT_hw`, `in_exp_anchor: "max"` (all HW keys) | 2.82 % | 0.36 % | +0.18 % |
+
+- Each bisect row is `se4_warp_convT.json` plus that one HW change.
+- The full HW row runs `in_exp_anchor: "max"`: `"min"` gives NaN (below, row "near-zero weight block").
+- The numbers need the nndof motion-save fix (below, row "DOF mv save"). Before it, every run with
+  `out_quant` read 75 % motion error: the `out_quant` run's `mv/*.dof` were exactly 0.25x the others'
+  (correlation 1.000).
+
 ## Gaps to HW (`se4_warp_convT_hw.json`)
 
 What the closest config does against the NPE HW, owner decisions 2026-11-12. `Qn` = question n of the HW
@@ -32,7 +54,7 @@ team's answers, `configs/hw/warp_hw_questions_and_answers.md` (2026-11-15).
 |---|---|---|---|
 | mantissa round | `nearest` (lib default; no `mant_round` key) | nearest (HW agreed 2026-11-02); the HW emulator still truncates (`configs/README.md`), so a bit-exact run against it differs here | already matched |
 | exponent base | static `e_base_a` / `e_base_w` from the grids, 4-bit register (`in_exp_bits: 4`) | static, 4 bits | already matched |
-| exponent register anchor | `in_exp_anchor: "min"` | min non-zero block exponent | fixed here |
+| exponent register anchor | `in_exp_anchor: "min"`; the DOF runs need `"max"` until the near-zero row below is solved | min non-zero block exponent | blocked by the near-zero row |
 | near-zero weight block, `min` anchor | `block_exp_range` counts every block with max > 0, so a dead filter (max 4.9e-39, DOF `convs.0.0.0` out-channel 0) sets `e_base_w` -128 and the run gives NaN (owner's run 2026-11-16; no NaN with anchor `max`) | not known | waiting for HW |
 | block exponent near 2^k | `floor(log2(amax))` in float32 (microxcaling): one too high just below a power of two (README, "Notes") | not answered (Q12) | waiting for HW |
 | PLA | `pla: "infer"`, `pla_bias: "bins"`: the activation folded into the PCU multiply, per-bin scale and bias | PCU PLA, bin form | fixed here |
@@ -49,10 +71,33 @@ team's answers, `configs/hw/warp_hw_questions_and_answers.md` (2026-11-15).
 | warp output multiplier | the scale is any real (`pow2: false`) | PCU multiplier format, and its link to the Q10 scaling unit, not given (Q7) | waiting for HW |
 | warp batch | the model's batch, reference and grid as the model gives them | one frame and a same-size grid per call (Q8, Q10) | left open: check that DOF infer runs batch 1 with a same-size grid |
 | model output | `out_quant` Q8.8 | Q8.8 | fixed here |
+| DOF mv save (nndof, outside this repo) | nndof `infer_list.py` saved `flow_pyr[0]`. In float runs it aliases the model flow and gets the post-processing's in-place x4 (flow px -> net_in px); with `out_quant` the alias breaks, so those runs saved 1/4 units, and `flow_pyr[0]` is never quantized by `out_quant`. Fix (owner, local nndof edit 2026-11-18): save the model flow, cloned before post-processing, times net_in / flow size (4); float files unchanged (float rerun vs reference 0.01 %) | n/a (a DOF infer save, not an HW op) | fixed locally, to push into nndof |
 | `model.block{2,3}.convtranspose_2` (grouped convT) | plain MX (group `convT_plain`), no HW path | grouped convT on the NPE | waiting for HW |
 | overflow | clamp (lib default; no `overflow` / `overflow_saturate` keys) | accumulator wraps, window saturates | left open |
 | concat / eltwise sum | float | NPE ops | later |
 | full-network bit-exact check vs the emulator | not done | the HW team fixed the emulator bugs agreed in the answers (commit `257a52e`): border clamp (Q1), last row and column (Q2), relative grid with 0..8 fraction bits per axis (Q3, Q4), signed int8 reference (Q6), PCU on the warp output with the int8 output clamp (`calib.py` `relux_bits` 24 -> 8, Q7), the fraction-sum cap 14 -> 16 (Q4), int64 product and accumulator (Q9), no width padding (Q10), one frame with a same-size grid (Q8, Q10). The sim's warp op is bit-exact against it on every warp case HW runs (`configs/README.md`, "HW warp") | not done |
+
+### Open gaps
+
+Every row above whose state is not "already matched" or "fixed here":
+
+- exponent register anchor: blocked by the near-zero weight block.
+- near-zero weight block, `min` anchor: NaN; waiting for HW.
+- block exponent near 2^k: waiting for HW (Q12).
+- fixed-point round: the reference's float-to-code tie, waiting for HW (Q5).
+- first-layer bias: lib's accumulator grid finer than HW's; left open.
+- warp border: the DOF model's warp, in nndof; left open.
+- motion limit: no separate X / Y limit; left open.
+- warp full weight: encoding open; waiting for HW (Q4).
+- warp output multiplier: format not given; waiting for HW (Q7).
+- warp batch: check batch 1 with a same-size grid; left open.
+- DOF mv save: fixed locally, to push into nndof.
+- grouped convT `model.block{2,3}.convtranspose_2`: no HW path; waiting for HW.
+- overflow: clamp, HW wraps / saturates; left open.
+- concat / eltwise sum: float; later.
+- full-network bit-exact check vs the emulator: not done.
+
+### Notes
 
 - Fixed-point round: the conv outputs already round as the PCU does (`out_round: "nearest"` adds half, then
   floors; `bias_round: "half_up"`); the fxp quantizers (warp, `out_quant`) round `half_up` in this config only,
