@@ -2,10 +2,11 @@
 main_HW.py - run one case through the HW implementation (the HW side).
 
 HW code lives in hw/npe_mx_emu/, the HW team's own (their drops merged with
-their commits, configs/README.md "HW side") - never hand-edited here. This file only wires it in: it builds their layer, calls their
-calibration and forward, and taps what their code produced (via a forward
-pre-hook and pass-through wrappers on their module functions - no logic of
-theirs is reimplemented). Status: conv (dense, depthwise), convT and warp
+their commits, configs/README.md "HW side") - never hand-edited here. This
+file only wires it in: it builds their layer, calls their calibration and
+forward, and taps what their code produced (via a forward pre-hook and
+pass-through wrappers on their module functions - no logic of theirs is
+reimplemented). Status: conv (dense, depthwise), convT and warp
 wired in.
 
 Same interface as main_ALG:
@@ -415,7 +416,9 @@ def convt(case, cfg, taps):
     weight. dilation is torch's kernel dilation.
 
     Refused (their NotImplementedError, named): groups != 1,
-    output_padding != 0.
+    output_padding != 0. Refused here: an activation (case act), which conv
+    folds into their PCU; neither side's convT applies one, so running
+    without it would read as a match.
 
     ALG's convT, unless the lib's HW path (xblock_accum.convT "hw"), blocks
     along Cin and accumulates in fp32: only `out` compares, as float.
@@ -424,6 +427,10 @@ def convt(case, cfg, taps):
     zero insert and pad, [B, Cin, H', W'], int) and x_dil_exp (its
     per-element exponents; the inserted zeros carry 0).
     """
+    if case.get("act"):
+        raise NotImplementedError(
+            f"HW convT: an activation ({case['act']['kind']}); the sim folds one "
+            f"into the PCU on conv only")
     w, p = case["w"], case["params"]
     Cin, O, kH, kW = w.shape
     hw = _hw_setup(case, cfg, case["x"], convt_weight(w))

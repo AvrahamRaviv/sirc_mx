@@ -209,6 +209,15 @@ def test_hw_convt_weight_observed_converted():
     assert int(t["w_cal"]) == cal(wc) != cal(c["w"])
 
 
+def test_hw_convt_with_an_activation_refused():
+    """conv folds an activation into their PCU; convT does not, on either
+    side, so a convT case with one is a named refusal, never a run without it."""
+    c = C.build("convt_k4_s2")
+    c["act"] = {"kind": "prelu", "alpha": torch.zeros(8)}
+    with pytest.raises(NotImplementedError, match="HW convT: an activation \\(prelu\\)"):
+        HW.run(c, E4)
+
+
 @pytest.mark.parametrize("name, params, why", [
     ("convt_k3_s2", {}, "output_padding != 0 is not supported"),
     ("convt_k4_s2", {"groups": 2}, r"grouped transposed conv is not supported"),
