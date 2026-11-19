@@ -21,15 +21,18 @@ from npe_mx_emu.hw_pipe import (
     Cstruct,
     MXAdd_Loops,
     MXConv2D_Loops,
+    MXConvTranspose2D_Loops,
     MXDepthwise2D_Loops,
     MXWarp_Loops,
     align_mx_to_elements,
     bcu,
     frac_bits_pair,
+    pad_dilate_streams,
     pcu,
     pcu_div,
     pcu_pla,
     relux,
+    space_kernel_taps,
     split_msb_lsb,
     trc_warp,
     tru_a,
@@ -47,19 +50,21 @@ from npe_mx_emu.calib import (
     e_min_layer,
 )
 from npe_mx_emu.observers import MXObserver
-from npe_mx_emu.layers import CalibratedMXAdd, CalibratedMXConv2d, CalibratedMXDepthwiseConv2d, \
+from npe_mx_emu.layers import CalibratedMXAdd, CalibratedMXConv2d, CalibratedMXConvTranspose2d, CalibratedMXDepthwiseConv2d, \
     CalibratedMXWarp, pack_warp_grid, pack_warp_reference
 
 __all__ = [
     "Cstruct",
     "CalibratedMXAdd",
     "CalibratedMXConv2d",
+    "CalibratedMXConvTranspose2d",
     "CalibratedMXDepthwiseConv2d",
     "CalibratedMXWarp",
     "GREATER_THAN_ONE_BIT",
     "LayerMXQParams",
     "MXAdd_Loops",
     "MXConv2D_Loops",
+    "MXConvTranspose2D_Loops",
     "MXDepthwise2D_Loops",
     "MXObserver",
     "MXTensor",
@@ -82,7 +87,9 @@ __all__ = [
     "mx_weight_quantizer",
     "pack_warp_grid",
     "pack_warp_reference",
+    "pad_dilate_streams",
     "split_msb_lsb",
+    "space_kernel_taps",
     "trc_warp",
     "tru_a_warp",
     "wrap_accumulator",

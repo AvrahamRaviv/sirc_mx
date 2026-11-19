@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from npe_mx_emu.mx_format import MXTensor, mx_config_factory, mx_weight_quantizer
 
@@ -61,6 +62,57 @@ def align_mx_to_elements(mx: MXTensor):
 
     return data_flat[..., :mx.original_shape[-1]], exp_flat[..., :mx.original_shape[-1]]
 
+def pad_dilate_streams(
+    x_data_flat: torch.Tensor,
+    x_exp_flat: torch.Tensor,
+    padding: tuple,
+    dilation: tuple,
+):
+    """Insert geometry zeros into the aligned per-element streams (TRU stage).
+
+    Both padding (border) and dilation (interior interleave) are the SAME
+    operation: inserting ``(mantissa=0, exp=0)`` pairs into the flat
+    per-element streams AFTER ``align_mx_to_elements`` -- i.e. after the
+    block/exponent correspondence has been resolved to per-element values.
+    Real elements keep their original mantissa and their original block
+    exponent; every inserted zero is ``(0, 0)``, belongs to no block, and
+    contributes exactly 0 to the accumulator.
+
+    Order: dilate interior first (convT expanded-canvas semantics), then pad
+    the border of the expanded canvas.  MUST happen upstream of the gather
+    (tru_a strip slice + unfold): the gather replicates elements into
+    overlapping windows, so once unfolded the zero positions are no longer
+    expressible as a stream transform.
+
+    Streams: [B, C, H, W] in, [B, C, H', W'] out with
+    H' = (H-1)*d_h + 1 + 2*p_h,  W' = (W-1)*d_w + 1 + 2*p_w.
+    d=1, p=0 is the identity (returns the inputs unchanged).
+
+    NOTE: `dilation` here means INPUT zero-insertion (the convT expanded
+    canvas: insert d-1 zeros between input elements, then slide the dense
+    kernel by 1).  It is NOT torch nn.Conv2d's kernel dilation (taps striding
+    the raw input d apart) -- a different operation numerically.
+    """
+    p_h, p_w = padding
+    d_h, d_w = dilation
+
+    if (d_h, d_w) != (1, 1):
+        B, C, H, W = x_data_flat.shape
+        H_d = (H - 1) * d_h + 1
+        W_d = (W - 1) * d_w + 1
+        od = torch.zeros(B, C, H_d, W_d, dtype=x_data_flat.dtype, device=x_data_flat.device)
+        oe = torch.zeros(B, C, H_d, W_d, dtype=x_exp_flat.dtype, device=x_exp_flat.device)
+        od[:, :, ::d_h, ::d_w] = x_data_flat
+        oe[:, :, ::d_h, ::d_w] = x_exp_flat
+        x_data_flat, x_exp_flat = od, oe
+
+    if (p_h, p_w) != (0, 0):
+        x_data_flat = F.pad(x_data_flat, (p_w, p_w, p_h, p_h))
+        x_exp_flat = F.pad(x_exp_flat, (p_w, p_w, p_h, p_h))
+
+    return x_data_flat, x_exp_flat
+
+
 def tru_w(mx: MXTensor):
     """
     Expand shared_exp so every mantissa element has its own exponent,
@@ -85,6 +137,33 @@ def tru_w(mx: MXTensor):
 
     actual_elements = mx.original_shape[-1] * mx.original_shape[-2] * mx.original_shape[-3]  # flat the kernel and return only the real values (reduce the padding values)
     return data_flat[:, : actual_elements], exp_flat[:, : actual_elements]
+
+
+def space_kernel_taps(w_flat_oc, exp_flat_oc, in_channels, kernel_size, dilation):
+    """Kernel dilation: insert ``(mantissa=0, exp=0)`` pairs BETWEEN TAPS of a
+    per-OC aligned weight stream (post-``tru_w``), preserving quantization.
+
+    The flat stream is viewed as [C_in, K_h, K_w] (C-major, matching
+    tru_w/tru_a layout) and zeros are inserted along the kh/kw dims ONLY --
+    never between channels -- then it is re-flattened to
+    [C_in*K_eff_h*K_eff_w] with K_eff = d*(K-1)+1.  Each element already
+    carries its own exponent after tru_w, so real weights keep their original
+    block exponents; inserted zeros are exp-0 orphans contributing exactly 0.
+    tru_a then gathers windows of the effective size and the pairing falls out
+    C-major consistent.  d=(1,1) is the identity (caller guards).
+    """
+    d_h, d_w = dilation
+    K_h, K_w = kernel_size
+    w = w_flat_oc.view(in_channels, K_h, K_w)
+    e = exp_flat_oc.view(in_channels, K_h, K_w)
+    K_eff_h = (K_h - 1) * d_h + 1
+    K_eff_w = (K_w - 1) * d_w + 1
+    wd = torch.zeros(in_channels, K_eff_h, K_eff_w, dtype=w.dtype, device=w.device)
+    ed = torch.zeros(in_channels, K_eff_h, K_eff_w, dtype=e.dtype, device=e.device)
+    wd[:, ::d_h, ::d_w] = w
+    ed[:, ::d_h, ::d_w] = e
+    return wd.reshape(-1), ed.reshape(-1)
+
 
 def tru_a(x_data_flat: torch.Tensor,
           x_exp_flat: torch.Tensor,
@@ -417,7 +496,7 @@ class MXConv2D_Loops(nn.Module):
     def __init__(
         self, in_channels, out_channels, kernel_size,
         stride=1, padding=0, min_val=-1.0, max_val=1.0,
-        acc_bit_width: int = 48
+        dilation=1, acc_bit_width: int = 48
     ):
         super(MXConv2D_Loops, self).__init__()
 
@@ -430,6 +509,7 @@ class MXConv2D_Loops(nn.Module):
         self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
         self.stride = (stride, stride) if isinstance(stride, int) else stride
         self.padding = (padding, padding) if isinstance(padding, int) else padding
+        self.dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
 
         self.weight = nn.Parameter(torch.randn(
             out_channels, in_channels, *self.kernel_size
@@ -465,13 +545,21 @@ class MXConv2D_Loops(nn.Module):
                 f"Input has {C_in} channels, layer expects {self.in_channels}"
             )
 
-        if self.padding[0] > 0 or self.padding[1] > 0:
-            raise NotImplementedError("Padding not yet supported")
+        # Ordinary conv NEVER expands the activation: public `dilation` is
+        # torch's KERNEL dilation.  Activation side is border-padded only;
+        # kernel spacing happens weight-side in the per-OC loop below.
+        K_eff_h = (K_h - 1) * self.dilation[0] + 1
+        K_eff_w = (K_w - 1) * self.dilation[1] + 1
 
-        # Align input mantissas with their per-element exponents
         x_data_flat, x_exp_flat = align_mx_to_elements(mx)
-        out_height = (input_height + 2 * self.padding[0] - K_h) // S_h + 1
-        out_width = (input_width + 2 * self.padding[1] - K_w) // S_w + 1
+        x_data_flat, x_exp_flat = pad_dilate_streams(
+            x_data_flat, x_exp_flat, self.padding, (1, 1)
+        )
+
+        H_canvas = input_height + 2 * self.padding[0]
+        W_canvas = input_width + 2 * self.padding[1]
+        out_height = (H_canvas - K_eff_h) // S_h + 1
+        out_width = (W_canvas - K_eff_w) // S_w + 1
 
         output = torch.zeros(
             batch_size, self.out_channels, out_height, out_width,
@@ -484,6 +572,14 @@ class MXConv2D_Loops(nn.Module):
             for oc in range(self.out_channels):
                 tru_w_array = w_flat[oc]
                 tru_w_exp_array = exp_flat[oc]
+                if (self.dilation[0], self.dilation[1]) != (1, 1):
+                    # kernel dilation: (0,0) pairs between taps of THIS oc's
+                    # kernel (view [C_in,K_h,K_w], kh/kw dims only) -- real
+                    # weights keep their per-element exponents (post-tru_w)
+                    tru_w_array, tru_w_exp_array = space_kernel_taps(
+                        tru_w_array, tru_w_exp_array,
+                        self.in_channels, self.kernel_size, self.dilation,
+                    )
                 for oh in range(out_height):
                     # order the input such that it run conv exactly as the npe
                     tru_a_data, tru_a_exp = tru_a(
@@ -492,8 +588,8 @@ class MXConv2D_Loops(nn.Module):
                             oh,
                             S_h,
                             S_w,
-                            K_w,
-                            K_h,
+                            K_eff_w,
+                            K_eff_h,
                             out_width,
                             b
                     )
@@ -536,7 +632,7 @@ class MXDepthwise2D_Loops(nn.Module):
 
     def __init__(self, channels, kernel_size,
                  stride=1, padding=0, min_val=-1.0, max_val=1.0,
-                 acc_bit_width: int = 48):
+                 dilation=1, acc_bit_width: int = 48):
         super(MXDepthwise2D_Loops, self).__init__()
 
         if acc_bit_width not in SUPPORTED_ACC_WIDTHS:
@@ -547,6 +643,7 @@ class MXDepthwise2D_Loops(nn.Module):
         self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
         self.stride = (stride, stride) if isinstance(stride, int) else stride
         self.padding = (padding, padding) if isinstance(padding, int) else padding
+        self.dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
 
         self.weight = nn.Parameter(torch.randn(
             channels, 1, *self.kernel_size
@@ -582,13 +679,20 @@ class MXDepthwise2D_Loops(nn.Module):
                 f"Input has {C_in} channels, layer expects {self.channels}"
             )
 
-        if self.padding[0] > 0 or self.padding[1] > 0:
-            raise NotImplementedError("Padding not yet supported")
+        # Depthwise conv, like dense conv: public `dilation` is KERNEL dilation
+        # (weight-side spacing in the channel loop); activation is padded only.
+        K_eff_h = (K_h - 1) * self.dilation[0] + 1
+        K_eff_w = (K_w - 1) * self.dilation[1] + 1
 
-        # Align input mantissas with their per-element exponents
         x_data_flat, x_exp_flat = align_mx_to_elements(mx)
-        out_height = (input_height + 2 * self.padding[0] - K_h) // S_h + 1
-        out_width = (input_width + 2 * self.padding[1] - K_w) // S_w + 1
+        x_data_flat, x_exp_flat = pad_dilate_streams(
+            x_data_flat, x_exp_flat, self.padding, (1, 1)
+        )
+
+        H_canvas = input_height + 2 * self.padding[0]
+        W_canvas = input_width + 2 * self.padding[1]
+        out_height = (H_canvas - K_eff_h) // S_h + 1
+        out_width = (W_canvas - K_eff_w) // S_w + 1
 
         output = torch.zeros(
             batch_size, self.channels, out_height, out_width,
@@ -603,6 +707,11 @@ class MXDepthwise2D_Loops(nn.Module):
             for c in range(self.channels):
                 tru_w_array = w_flat[c]
                 tru_w_exp_array = exp_flat[c]
+                if (self.dilation[0], self.dilation[1]) != (1, 1):
+                    tru_w_array, tru_w_exp_array = space_kernel_taps(
+                        tru_w_array, tru_w_exp_array,
+                        1, self.kernel_size, self.dilation,
+                    )
                 for oh in range(out_height):
                     # order the input of channel c exactly as the npe feeds it
                     tru_a_data, tru_a_exp = tru_a_dw(
@@ -612,8 +721,8 @@ class MXDepthwise2D_Loops(nn.Module):
                             oh,
                             S_h,
                             S_w,
-                            K_w,
-                            K_h,
+                            K_eff_w,
+                            K_eff_h,
                             out_width,
                             b
                     )
@@ -640,6 +749,153 @@ class MXDepthwise2D_Loops(nn.Module):
                     # return a line in a channel in a batch
                     output[b, c, oh, :] = o_line
 
+        return output
+
+
+class MXConvTranspose2D_Loops(MXConv2D_Loops):
+    """Transposed conv = trans-stride zero-insert of the activation + stride-1
+    dense conv, sharing the whole TRU/BCU/PCU pipe with ``MXConv2D_Loops``.
+
+    Geometry (matches ``nn.ConvTranspose2d`` for ``groups=1``,
+    ``output_padding=0``; out = (H-1)*s - 2p + d(K-1) + 1):
+
+      * the activation is expanded by ``stride`` (insert stride-1 zeros,
+        post-quantization exp-0 orphans) and then border-padded by
+        ``p_eng = d*(K-1) - padding`` per axis; a NEGATIVE p_eng means cropping
+        that many rows/cols from the OUTPUT borders;
+      * the public weight lives on ``self.weight`` in torch ConvTranspose2d
+        layout ``(in, out, K, K)``; ``load_mx_weight`` transposes to
+        ``(out, in)`` and flips kH/kW BEFORE weight quantization (raw-float
+        index permutation, so the quantizer blocks the converted kernel);
+      * ``dilation`` is torch's KERNEL dilation and applies through the same
+        aligned-weight tap spacing as ordinary conv (space_kernel_taps).
+
+    Rejected: ``groups != 1``, ``output_padding != 0`` (NotImplementedError),
+    dynamic ``output_size`` (n/a in the engine).
+    """
+
+    def __init__(
+        self, in_channels, out_channels, kernel_size,
+        stride=1, padding=0, output_padding=0, groups=1, dilation=1,
+        min_val=-1.0, max_val=1.0, acc_bit_width: int = 48
+    ):
+        if groups != 1:
+            raise NotImplementedError("grouped transposed conv is not supported (groups must be 1)")
+        op = (output_padding, output_padding) if isinstance(output_padding, int) else output_padding
+        if any(op):
+            raise NotImplementedError("output_padding != 0 is not supported")
+
+        super().__init__(
+            in_channels, out_channels, kernel_size,
+            stride=1, padding=0,
+            min_val=min_val, max_val=max_val,
+            dilation=dilation, acc_bit_width=acc_bit_width,
+        )
+        self.trans_stride = (stride, stride) if isinstance(stride, int) else stride
+        self.trans_padding = (padding, padding) if isinstance(padding, int) else padding
+
+        # public weight in torch ConvTranspose2d layout (in, out, K, K)
+        with torch.no_grad():
+            fan_in = in_channels * self.kernel_size[0] * self.kernel_size[1]
+            self.weight = nn.Parameter(
+                torch.randn(in_channels, out_channels, *self.kernel_size) / math.sqrt(fan_in)
+            )
+
+    def load_mx_weight(self, block_size: int = 32, mx_type: str = "mx-e4bm8", calibrate_offset: int = 6):
+        # convert BEFORE quantization: (in,out)->(out,in), flip kH/kW (adjoint);
+        # contiguous() because transpose+flip leaves negative strides, which
+        # mx_weight_quantizer's .view(-1) refuses (T7 multi-channel crash)
+        w_conv = self.weight.data.transpose(0, 1).flip([-1, -2]).contiguous()
+        self.mx_weight = mx_weight_quantizer(w_conv, block_size=block_size, mx_type=mx_type, calibrate_offset=calibrate_offset)
+
+    def forward(self, mx: MXTensor, print_debug : bool = False):
+        if self.mx_weight is None or not self.c_struct_arr:
+            raise RuntimeError("MXConvTranspose2D_Loops is not calibrated: call load_mx_weight()/load_c_struct() first")
+
+        batch_size, C_in, input_height, input_width = mx.original_shape
+        K_h, K_w = self.kernel_size
+
+        if C_in != self.in_channels:
+            raise ValueError(
+                f"Input has {C_in} channels, layer expects {self.in_channels}"
+            )
+
+        K_eff_h = (K_h - 1) * self.dilation[0] + 1
+        K_eff_w = (K_w - 1) * self.dilation[1] + 1
+        p_eng_h = self.dilation[0] * (K_h - 1) - self.trans_padding[0]
+        p_eng_w = self.dilation[1] * (K_w - 1) - self.trans_padding[1]
+        pad_h, pad_w = max(p_eng_h, 0), max(p_eng_w, 0)
+        crop_h, crop_w = max(-p_eng_h, 0), max(-p_eng_w, 0)
+
+        # activation: expand by trans_stride (zero-insert), then border-pad;
+        # both are post-quantization exp-0 insertions on the aligned streams,
+        # BEFORE tru_a gathers windows.
+        x_data_flat, x_exp_flat = align_mx_to_elements(mx)
+        x_data_flat, x_exp_flat = pad_dilate_streams(
+            x_data_flat, x_exp_flat, (pad_h, pad_w), self.trans_stride
+        )
+
+        H_canvas = (input_height - 1) * self.trans_stride[0] + 1 + 2 * pad_h
+        W_canvas = (input_width - 1) * self.trans_stride[1] + 1 + 2 * pad_w
+        out_height = H_canvas - K_eff_h + 1
+        out_width = W_canvas - K_eff_w + 1
+        if out_height <= 0 or out_width <= 0:
+            raise ValueError(f"convT geometry produced empty output ({out_height}x{out_width})")
+
+        output = torch.zeros(
+            batch_size, self.out_channels, out_height, out_width,
+            device=mx.data.device
+        )
+
+        # stride-1 dense conv over the expanded canvas (same pipe as conv)
+        for b in range(batch_size):
+            w_flat, exp_flat = tru_w(self.mx_weight)
+            for oc in range(self.out_channels):
+                tru_w_array = w_flat[oc]
+                tru_w_exp_array = exp_flat[oc]
+                if (self.dilation[0], self.dilation[1]) != (1, 1):
+                    tru_w_array, tru_w_exp_array = space_kernel_taps(
+                        tru_w_array, tru_w_exp_array,
+                        self.in_channels, self.kernel_size, self.dilation,
+                    )
+                for oh in range(out_height):
+                    tru_a_data, tru_a_exp = tru_a(
+                            x_data_flat,
+                            x_exp_flat,
+                            oh,
+                            1,
+                            1,
+                            K_eff_w,
+                            K_eff_h,
+                            out_width,
+                            b
+                    )
+
+                    p_sum = bcu(
+                        tru_a_data,
+                        tru_a_exp,
+                        tru_w_array,
+                        tru_w_exp_array,
+                        acc_bit_width=self.acc_bit_width
+                    )
+                    o_line = pcu(p_sum, c_struct=self.c_struct_arr[oc], e_min_layer=self.mx_weight.e_min_layer+mx.e_min_layer)
+
+                    if print_debug:
+                        print("tru_a_data", tru_a_data[0])
+                        print("tru_a_exp", tru_a_exp[0])
+                        print("tru_w_array", tru_w_array)
+                        print("tru_w_exp_array", tru_w_exp_array)
+                        print("p_sum", p_sum)
+                        print("o_line", o_line)
+                        raise Exception("cause i can")
+                    output[b, oc, oh, :] = o_line
+
+        if crop_h or crop_w:
+            output = output[
+                :, :,
+                crop_h:(output.shape[2] - crop_h if crop_h else None),
+                crop_w:(output.shape[3] - crop_w if crop_w else None),
+            ]
         return output
 
 

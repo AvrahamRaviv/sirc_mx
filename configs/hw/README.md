@@ -26,6 +26,24 @@ MX pipeline per layer:
 5. the output feeds the next MX layer through a (re)quantizer; HW also supports
    static quantization (future flow)
 
+Geometry options are **post-quantization** `(mantissa=0, exp=0)` insertions
+into the aligned per-element streams, before the window gather (after
+`strip.unfold` they could not be expressed):
+
+* conv **padding** and **dilation** follow PyTorch meanings: padding pads the
+  border of the aligned activation stream; `dilation` is *kernel* dilation via
+  `space_kernel_taps` (zero taps between kernel taps of each OC's flattened
+  weight, after `tru_w`, never between channels), effective kernel
+  `K_eff = d*(K-1)+1`.  Ordinary conv never expands the activation.
+* **transposed conv** (`MXConvTranspose2D_Loops` / `CalibratedMXConvTranspose2d`):
+  expands the *activation* by the transpose stride (zero-insert), border-pads
+  by `d*(K-1) - padding` (negative = crop output borders), then runs the
+  shared stride-1 dense pipe.  The public weight stays in torch's
+  `(in, out, K, K)` layout and is transposed+flipped before quantization;
+  `groups != 1` and `output_padding != 0` are rejected.
+
+Blocks, exponents and calibration are untouched by any of these insertions.
+
 Scale balance across the network (one integer-ization, unsigned BCU):
 
 0. **scale-to-integer** the network input (first layer ONLY) and all the

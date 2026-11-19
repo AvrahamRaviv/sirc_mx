@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from npe_mx_emu.calib import LayerMXQParams, build_c_struct_arr, build_warp_c_struct_arr
-from npe_mx_emu.hw_pipe import MXAdd_Loops, MXConv2D_Loops, MXDepthwise2D_Loops, MXWarp_Loops, \
+from npe_mx_emu.hw_pipe import MXAdd_Loops, MXConv2D_Loops, MXConvTranspose2D_Loops, MXDepthwise2D_Loops, MXWarp_Loops, \
     frac_bits_pair
 from npe_mx_emu.mx_format import MXTensor, base_mx_quantizer, input_mx_quantizer, mantissa_offset, \
     mx_config_factory
@@ -33,6 +33,7 @@ class CalibratedMXConv2d(nn.Module):
         min_val: float = -1.0,
         max_val: float = 1.0,
         qparams: "LayerMXQParams | None" = None,
+        dilation=1,
     ):
         super(CalibratedMXConv2d, self).__init__()
         if qparams is None:
@@ -45,6 +46,7 @@ class CalibratedMXConv2d(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
+            dilation=dilation,
             min_val=min_val,
             max_val=max_val,
         )
@@ -54,12 +56,14 @@ class CalibratedMXConv2d(nn.Module):
         kernel_size = conv.kernel_size[0] if conv.kernel_size[0] == conv.kernel_size[1] else conv.kernel_size
         stride = conv.stride[0] if conv.stride[0] == conv.stride[1] else conv.stride
         padding = conv.padding[0] if conv.padding[0] == conv.padding[1] else conv.padding
+        dilation = conv.dilation[0] if conv.dilation[0] == conv.dilation[1] else conv.dilation
         layer = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
+            dilation=dilation,
             qparams=qparams,
         )
         with torch.no_grad():
@@ -132,6 +136,7 @@ class CalibratedMXDepthwiseConv2d(nn.Module):
         min_val: float = -1.0,
         max_val: float = 1.0,
         qparams: "LayerMXQParams | None" = None,
+        dilation=1,
     ):
         super(CalibratedMXDepthwiseConv2d, self).__init__()
         if qparams is None:
@@ -143,6 +148,7 @@ class CalibratedMXDepthwiseConv2d(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
+            dilation=dilation,
             min_val=min_val,
             max_val=max_val,
         )
@@ -157,11 +163,13 @@ class CalibratedMXDepthwiseConv2d(nn.Module):
         kernel_size = conv.kernel_size[0] if conv.kernel_size[0] == conv.kernel_size[1] else conv.kernel_size
         stride = conv.stride[0] if conv.stride[0] == conv.stride[1] else conv.stride
         padding = conv.padding[0] if conv.padding[0] == conv.padding[1] else conv.padding
+        dilation = conv.dilation[0] if conv.dilation[0] == conv.dilation[1] else conv.dilation
         layer = cls(
             channels=conv.in_channels,
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
+            dilation=dilation,
             qparams=qparams,
         )
         with torch.no_grad():
@@ -211,6 +219,118 @@ class CalibratedMXDepthwiseConv2d(nn.Module):
             # goes straight into the quantizer.
             mx = base_mx_quantizer(x_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
         out_raw = self.mx_dw(mx)
+        return out_raw
+
+
+class CalibratedMXConvTranspose2d(nn.Module):
+    """MX transposed conv layer driven by observer-derived LayerMXQParams.
+
+    Geometry: stride-s zero-insert of the activation + stride-1 dense conv
+    (nn.ConvTranspose2d semantics for groups=1, output_padding=0).
+    `dilation` is torch's KERNEL dilation (weight-side tap spacing).
+
+    Public weight stays in torch ConvTranspose2d layout (in, out, K, K); the
+    transpose+flip conversion happens inside ``load_mx_weight`` BEFORE weight
+    quantization.  IMPORTANT: observe/calibrate weights against the CONVERTED
+    tensor ``w.transpose(0, 1).flip(-1, -2)`` -- the conversion changes which
+    elements group per OC, hence the block statistics.
+
+    forward() takes a plain float torch.Tensor (like nn.ConvTranspose2d) and
+    returns the raw integer accumulator output; the float value is
+    ``output * 2**-output_scale_log2``.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        output_padding=0,
+        groups=1,
+        min_val: float = -1.0,
+        max_val: float = 1.0,
+        qparams: "LayerMXQParams | None" = None,
+        dilation=1,
+    ):
+        super(CalibratedMXConvTranspose2d, self).__init__()
+        if qparams is None:
+            raise ValueError("qparams (LayerMXQParams) is required")
+        self.qparams = qparams
+
+        self.mx_convt = MXConvTranspose2D_Loops(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            groups=groups,
+            dilation=dilation,
+            min_val=min_val,
+            max_val=max_val,
+        )
+
+    @classmethod
+    def from_torch_conv(cls, convT: "nn.ConvTranspose2d", qparams: LayerMXQParams) -> "CalibratedMXConvTranspose2d":
+        # groups != 1 and output_padding != 0 are rejected by the engine ctor
+        kernel_size = convT.kernel_size[0] if convT.kernel_size[0] == convT.kernel_size[1] else convT.kernel_size
+        stride = convT.stride[0] if convT.stride[0] == convT.stride[1] else convT.stride
+        padding = convT.padding[0] if convT.padding[0] == convT.padding[1] else convT.padding
+        dilation = convT.dilation[0] if convT.dilation[0] == convT.dilation[1] else convT.dilation
+        layer = cls(
+            in_channels=convT.in_channels,
+            out_channels=convT.out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=convT.output_padding,
+            groups=convT.groups,
+            dilation=dilation,
+            qparams=qparams,
+        )
+        with torch.no_grad():
+            layer.mx_convt.weight.copy_(convT.weight)
+            layer.mx_convt.bias.copy_(convT.bias)
+        return layer
+
+    @property
+    def weight(self):
+        return self.mx_convt.weight
+
+    @property
+    def bias(self):
+        return self.mx_convt.bias
+
+    @property
+    def output_scale_log2(self) -> int:
+        return self.qparams.output_scale_log2
+
+    def calibrate(self):
+        """(Re)quantize the (converted) weights and rebuild the PCU c_structs. Idempotent."""
+        qp = self.qparams
+        self.mx_convt.load_mx_weight(
+            block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.w_cal
+        )
+        self.mx_convt.load_c_struct(
+            build_c_struct_arr(qp, self.mx_convt.bias.data, self.mx_convt.out_channels)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mx_convt.mx_weight is None:
+            self.calibrate()
+
+        qp = self.qparams
+        x_scaled = x * 2.0 ** qp.x_cal
+        if qp.is_input_layer:
+            # round-to-integer of x*2^cal happens ONLY at the first layer (Q3)
+            mx = input_mx_quantizer(x_scaled.round(), block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+        else:
+            # intermediate layers: no pre-round; quantizer truncate is the only
+            # integer-ization (Q3)
+            mx = base_mx_quantizer(x_scaled, block_size=qp.block_size, mx_type=qp.mx_type, calibrate_offset=qp.x_cal)
+        out_raw = self.mx_convt(mx)
         return out_raw
 
 

@@ -1,7 +1,10 @@
 """MX (microscaling) format primitives for the NPE emulator.
 
 Verbatim transcription of the validated notebook quantizers — keep in sync
-with the notebook cell-for-cell.  Quirks are intentional HW emulation:
+with the notebook cell-for-cell.  One extension beyond the notebook:
+``base_mx_quantizer`` also accepts integer tensors (float-cast before the
+log2 path) — converted PTQ graphs feed it int32 from ``quantize_per_tensor``.
+Quirks are intentional HW emulation:
   * unsigned 4-bit exponent wrap-around (``& 0xF``)
   * ``input_mx_quantizer``'s uninitialized ``log2_vals`` (all-zero shared exp)
   * int storage with sign restored in the high bits
@@ -76,7 +79,7 @@ def base_mx_quantizer(x: torch.Tensor, block_size: int = 32, mx_type : str = "mx
 
     blocks = x_pad.view([*x_pad.shape[:-1], num_blocks, block_size])
 
-    abs_blocks = blocks.abs()
+    abs_blocks = blocks.abs().float()  # float cast: log2/index-put need float (int32 arrives from quantize_per_tensor in converted graphs)
     mask = abs_blocks > 0
     log2_vals = torch.zeros_like(abs_blocks)
     log2_vals[mask] = torch.log2(abs_blocks[mask]).floor()  # floor: block max mantissa fills [64,127] -- the integer bit is real (HW-confirmed, algo table Q1)
