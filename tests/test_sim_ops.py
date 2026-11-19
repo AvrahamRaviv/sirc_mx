@@ -3,6 +3,7 @@ integer taps explain its own output - conv acc from a_int/w_int, warp out_code
 from ref_code/grid_code."""
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -60,10 +61,18 @@ def test_warp_out_from_taps(name):
     assert torch.equal(t["out_code"].double(), want)
 
 
+def _convt_out_hw(c):
+    """nn.ConvTranspose2d output size (H, W) of a case, by torch's formula."""
+    p, (_, _, H, W), k = c["params"], c["x"].shape, c["w"].shape[-1]
+    return tuple((n - 1) * p["stride"] - 2 * p["padding"] + p["dilation"] * (k - 1)
+                 + p.get("output_padding", 0) + 1 for n in (H, W))
+
+
 @pytest.mark.parametrize("name", C.select("convt"))
 def test_convt_runs(name):
-    t = ALG.run(C.build(name))
-    assert t["out"].shape[2:] == (10, 32)
+    c = C.build(name)
+    t = ALG.run(c)
+    assert t["out"].shape[2:] == _convt_out_hw(c)
 
 
 @pytest.mark.parametrize("name", ["conv1x1", "conv3x3_p0"])
@@ -74,15 +83,143 @@ def test_hw_conv_runs(name):
     assert t["hw_acc"].shape == t["out_raw"].shape
 
 
-@pytest.mark.parametrize("name", ["conv3x3", "conv3x3_d2"])
-def test_hw_conv_unsupported_raises(name):
-    with pytest.raises(NotImplementedError):
-        HW.run(C.build(name), E4)
+def _rel(out, ref):
+    """max |out - ref| / max |ref|: the error relative to the layer's range."""
+    return float((out.double() - ref.double()).abs().max() / ref.double().abs().max())
 
 
-def test_hw_placeholder():
-    with pytest.raises(NotImplementedError, match="HW convt"):
-        HW.run(C.build("convt_k3_s2"), E4)
+# Their e4bm8 truncating quantizer against float, measured on these cases
+# (2026-11-19): conv <= 3.0 %, depthwise <= 2.5 %, convT <= 2.3 % (QA Q8:
+# depthwise abs err <= 0.045). About twice that: room for the format, and a
+# wrong geometry (a pad, dilation or flip ignored) is far outside it.
+HW_FLOAT_REL = 0.06
+
+
+def _case(name, **params):
+    """C.build(name) with its params replaced: a variant no table entry holds."""
+    c = C.build(name)
+    c["params"] = {**c["params"], **params}
+    return c
+
+
+def _dw_case(seed_name, groups=4, **params):
+    """A depthwise case: x [1, 4, 6, 40], w [4, 1, 3, 3] (groups == Cin == O),
+    data from the case `seed_name` (the first 4 filters, input channel 0)."""
+    c = C.build(seed_name)
+    c["w"] = c["w"][:4, :1].contiguous()
+    c["b"] = None if c["b"] is None else c["b"][:4]
+    c["params"] = {**c["params"], "groups": groups, **params}
+    return c
+
+
+@pytest.mark.parametrize("name", ["conv3x3", "conv3x3_s2", "conv3x3_d2",
+                                  "conv3x3_bias", "conv3x3_p0"])
+def test_hw_conv_padding_dilation_against_float(name):
+    """Their padding and kernel dilation (torch meaning, hw/README.md
+    "Geometry options") run in main_HW: the output has torch's shape and
+    follows float conv to the format's error."""
+    c = C.build(name)
+    p = c["params"]
+    ref = F.conv2d(c["x"], c["w"], c["b"], p["stride"], p["padding"], p["dilation"])
+    t = HW.run(c, E4)
+    assert t["out"].shape == ref.shape
+    assert _rel(t["out"], ref) < HW_FLOAT_REL
+
+
+@pytest.mark.parametrize("params", [dict(padding=1), dict(padding=2, dilation=2),
+                                    dict(padding=1, stride=2)])
+def test_hw_depthwise_padding_dilation_against_float(params):
+    """groups == Cin == O runs their CalibratedMXDepthwiseConv2d, padding and
+    dilation included: torch's depthwise shape and value."""
+    c = _dw_case("conv3x3_bias", **params)
+    p = c["params"]
+    ref = F.conv2d(c["x"], c["w"], c["b"], p["stride"], p["padding"], p["dilation"],
+                   groups=4)
+    t = HW.run(c, E4)
+    assert t["out"].shape == ref.shape
+    assert t["hw_w_mant"].shape == (4, 1, 32)          # one padded block per filter (Q8)
+    assert _rel(t["out"], ref) < HW_FLOAT_REL
+
+
+def test_hw_conv_other_groups_refused():
+    """A grouping their code has no layer for is the sim's named refusal."""
+    c = C.build("conv3x3")
+    c["w"] = c["w"][:, :2].contiguous()
+    c["params"]["groups"] = 2
+    with pytest.raises(NotImplementedError, match="HW conv: groups 2 .*dense .*depthwise"):
+        HW.run(c, E4)
+
+
+CONVT_HW = ["convt_k4_s2", "convt_k2_s2", "convt_k3_s2_op0", "convt_k3_s2_d2"]
+
+
+@pytest.mark.parametrize("name", CONVT_HW)
+def test_hw_convt_against_float(name):
+    """main_HW.convt runs their CalibratedMXConvTranspose2d: torch's
+    ConvTranspose2d shape, and its value to the format's error."""
+    c = C.build(name)
+    p = c["params"]
+    ref = F.conv_transpose2d(c["x"], c["w"], c["b"], p["stride"], p["padding"], 0, 1,
+                             p["dilation"])
+    t = HW.run(c, E4)
+    assert t["out"].shape == ref.shape and ref.shape[2:] == _convt_out_hw(c)
+    assert _rel(t["out"], ref) < HW_FLOAT_REL
+
+
+def test_hw_convt_zero_insert_after_quantization():
+    """QA Q7 / hw/README.md: the compact input is quantized (blocks along W
+    of the compact row), then the stride zeros and the border pad
+    d*(k-1) - padding are (0, 0) pairs in the aligned streams: x_dil holds
+    the compact mantissas at stride steps, zeros (exponent 0) elsewhere."""
+    c = C.build("convt_k2_s2")                    # k2 s2 p0: pad 1 each side
+    t = HW.run(c, E4)
+    B, Cin, H, W = c["x"].shape
+    s, pad = 2, 1
+    assert t["x_dil"].shape == (B, Cin, (H - 1) * s + 1 + 2 * pad, (W - 1) * s + 1 + 2 * pad)
+    assert t["hw_a_mant"].shape[:3] == (B, Cin, H)  # quantized compact
+    mant = t["hw_a_mant"].reshape(B, Cin, H, -1)[..., :W]
+    exp = t["hw_a_exp"].repeat_interleave(32, dim=-1)[..., :W]
+    real = torch.zeros_like(t["x_dil"], dtype=torch.bool)
+    real[:, :, pad:-pad:s, pad:-pad:s] = True
+    assert torch.equal(t["x_dil"][real].view(B, Cin, H, W), mant)
+    assert torch.equal(t["x_dil_exp"][real].view(B, Cin, H, W), exp.to(t["x_dil_exp"].dtype))
+    assert not t["x_dil"][~real].any() and not t["x_dil_exp"][~real].any()
+
+
+def test_hw_convt_weight_observed_converted():
+    """Their docstring: observe the convT weight on the converted kernel
+    (transpose(0, 1), flip kH kW): HW.convt_weight is the tensor their
+    load_mx_weight quantizes, and w_cal is the observer's on it. Input
+    channel 0 scaled by 1e-3: blocked as torch's [Cin, O*k*k] its blocks
+    would be tiny (another w_cal); per OC, C-major, they are not."""
+    from npe_mx_emu import MXObserver, mx_weight_quantizer
+    c = C.build("convt_k4_s2")
+    c["w"][0] *= 1e-3
+    t = HW.run(c, E4)
+    wc = HW.convt_weight(c["w"])
+    mine = mx_weight_quantizer(wc, block_size=32, mx_type="mx-e4bm8",
+                               calibrate_offset=int(t["w_cal"]))
+    assert torch.equal(mine.data, t["hw_w_mant"]) and torch.equal(mine.shared_exp, t["hw_w_exp"])
+
+    def cal(w):
+        o = MXObserver(block_size=32, mx_type="mx-e4bm8", mode="mx")
+        o.update(w, per_row_flatten=True)
+        return o.calibrate_offset()
+
+    assert int(t["w_cal"]) == cal(wc) != cal(c["w"])
+
+
+@pytest.mark.parametrize("name, params, why", [
+    ("convt_k3_s2", {}, "output_padding != 0 is not supported"),
+    ("convt_k4_s2", {"groups": 2}, r"grouped transposed conv is not supported"),
+])
+def test_hw_convt_refusals_are_named(name, params, why):
+    """Their NotImplementedError (output_padding, groups) is the sim's named
+    refusal (sim_config.REFUSED), prefixed with what refused it."""
+    c = _case(name, **params)
+    with pytest.raises(SC.REFUSED, match=f"HW convT: npe_mx_emu: {why}") as e:
+        HW.run(c, E4)
+    assert isinstance(e.value, NotImplementedError)
 
 
 def test_int_input_is_on_grid_and_hw_preround_is_noop():
@@ -788,6 +925,41 @@ def test_warp_bit_exact_on_the_dof_hw_config(name):
     assert bad == [] and "out_code" in a
 
 
+# Their warp as it ran before the 2026-11-19 HW drop was merged (origin/main
+# 76bd2da, the 257a52e warp fixes in): sha256 (first 16 hex) of every integer
+# stage, _warp_digest. The drop's warp is the pre-257a52e one; the merge keeps
+# 257a52e's, and this pins it bit for bit, on both configs (the HW warp reads
+# only the grid fraction bits and the widths from them, equal in both).
+WARP_PIN = {
+    "warp_int_shift": "3f5e01270645310a", "warp_half_pixel": "a542c2eb250024d1",
+    "warp_neg_frac": "a6d0d2a319d470d6", "warp_oob": "e94a6c4f6a6ab338",
+    "warp_u8_zero": "d50fdce27adb1f62", "warp_u8_half": "d4dba2f743df0160",
+    "warp_u8_oob": "cb47bd6d4d0107d9", "warp_u8_subpix": "e6cbe120ec89ee17",
+    "warp_u8_subpix_w64": "7fe94a38a5272165",
+}
+WARP_PIN_TAPS = ("ref_code", "grid_code", "hw_weights", "hw_corners", "hw_acc", "out_code")
+
+
+def _warp_digest(t):
+    h = hashlib.sha256()
+    for k in WARP_PIN_TAPS:
+        h.update(k.encode())
+        h.update(t[k].double().contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def test_warp_pin_covers_every_hw_warp_case():
+    assert sorted(WARP_PIN) == sorted(WARP_HW) and len(WARP_HW) > 0
+
+
+@pytest.mark.parametrize("cfg", ["E4", "SE4_HW"])
+@pytest.mark.parametrize("name", WARP_HW)
+def test_hw_warp_pinned_bit_for_bit(name, cfg):
+    """Every integer stage of their warp is what it was before the drop."""
+    t = HW.run(C.build(name), {"E4": E4, "SE4_HW": SE4_HW}[cfg])
+    assert _warp_digest(t) == WARP_PIN[name]
+
+
 def test_t12_border_q1():
     """Q1: the complete coordinate saturates, no excess fraction kept.
     ref[y,x] = 10(x+1)+y on 4x6: x = 2, y = H-1+0.25 -> ref[3, 2] = 33 (the
@@ -917,17 +1089,19 @@ def _refused_names(summary):
 
 
 def test_main_hw_cli_reports_each_refusal_and_goes_on():
-    """-m all on npe_e4: conv3x3 (padding) is refused by their code, and the
-    run goes on to the end; every refusal is named with its reason and in
-    the summary, never counted as ran; refusals and no failure: exit 2."""
+    """-m all on npe_e4: convt_k3_s2 (output_padding) is refused by their
+    code, and the run goes on to the end; every refusal is named with its
+    reason and in the summary, never counted as ran; refusals and no
+    failure: exit 2. conv3x3 (padding) now runs on their code."""
     names = C.select("all")
     p = _cli("main_HW.py", "-m", "all", "--config", "mx_config_npe_e4.json")
     assert p.returncode == 2, p.stdout[-2000:] + p.stderr[-2000:]
     out = p.stdout.splitlines()
-    assert "  refused: Padding not yet supported" in out
+    assert "  refused: HW convT: npe_mx_emu: output_padding != 0 is not supported" in out
     assert "=== warp_u8_subpix_w64  HW ===" in out          # the last case ran
     refused = _refused_names(out[-1])
-    assert "conv3x3" in refused and "conv1x1" not in refused
+    assert "convt_k3_s2" in refused and "conv1x1" not in refused
+    assert not {"conv3x3", "conv3x3_d2", "convt_k4_s2"} & set(refused)
     assert out[-1].startswith(f"{len(names) - len(refused)}/{len(names)} ran")
     assert sum(ln.startswith("  refused: ") for ln in out) == len(refused)
 

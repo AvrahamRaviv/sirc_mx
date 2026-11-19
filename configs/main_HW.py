@@ -1,11 +1,12 @@
 """
 main_HW.py - run one case through the HW implementation (the HW side).
 
-HW code lives in hw/npe_mx_emu/, copied verbatim from the HW team - never
-edited here. This file only wires it in: it builds their layer, calls their
+HW code lives in hw/npe_mx_emu/, the HW team's own (their drops merged with
+their commits, configs/README.md "HW side") - never hand-edited here. This file only wires it in: it builds their layer, calls their
 calibration and forward, and taps what their code produced (via a forward
 pre-hook and pass-through wrappers on their module functions - no logic of
-theirs is reimplemented). Status: conv and warp wired in; they have no convT.
+theirs is reimplemented). Status: conv (dense, depthwise), convT and warp
+wired in.
 
 Same interface as main_ALG:
 
@@ -50,8 +51,9 @@ import sim_cli as CLI
 import sim_config as SC
 from taps import tap, show
 
-# --- HW team code (hw/npe_mx_emu, verbatim) ---------------------------------
+# --- HW team code (hw/npe_mx_emu, theirs, never hand-edited) ----------------
 from npe_mx_emu import CalibratedMXConv2d, LayerMXQParams, MXObserver
+from npe_mx_emu import CalibratedMXConvTranspose2d, CalibratedMXDepthwiseConv2d
 from npe_mx_emu import CalibratedMXWarp
 from npe_mx_emu import mx_config_factory, SUPPORTED_ACC_WIDTHS
 from npe_mx_emu import Cstruct, pcu, mantissa_offset
@@ -205,13 +207,13 @@ def bins_pcu(n, pla, o, e):
     return y, k
 
 
-def _pla_bins_standin(taps, pla, layer, mx_a):
+def _pla_bins_standin(taps, pla, layer, engine, mx_a):
     """OUR ASSUMPTION UNTIL HW EMULATOR HAS BINS: per channel pick the bin by
     acc vs the boundaries (tie rule from the config), then their pcu
     (pcu_pla -> pcu_div -> relux) with that bin's S_k, B_k. Runs on the
     accumulator lines their bcu produced."""
     acc = taps["hw_acc"]
-    e = int(layer.mx_conv.mx_weight.e_min_layer + mx_a.e_min_layer)
+    e = int(engine.mx_weight.e_min_layer + mx_a.e_min_layer)
     out = torch.empty_like(acc)
     bins = torch.zeros_like(acc, dtype=torch.uint8)
     for o in range(acc.shape[1]):
@@ -224,41 +226,22 @@ def _pla_bins_standin(taps, pla, layer, mx_a):
     tap(taps, "hw_out_raw_bins", out)
     tap(taps, "out_bins", out * 2.0 ** -layer.output_scale_log2)
 
-def conv(case, cfg, taps):
-    """MX conv on the HW team's NPE emulator (hw/npe_mx_emu).
 
-    Flow exactly as their notebook (mx_conv_npe_emu_example):
-      MXObserver(mode="mx") on x and on w -> x_cal, w_cal
-      LayerMXQParams(x_cal, w_cal) -> CalibratedMXConv2d (weight/bias copied)
-      calibrate() -> forward(x) -> raw int, float = raw * 2^-output_scale_log2
+def _hw_setup(case, cfg, x, w_conv):
+    """Their format and calibration for one conv-family layer -> dict
+    {qp, acc_bits, s_shift, cal_src}.
 
-    Their format differs from ALG by design (e4bm8: per-tensor calibrate
-    offset, unsigned exponent with wrap, mantissa truncate, int64 acc with
-    two's-complement wrap, PCU round half up + 24-bit clamp), so their integer
-    taps carry an `hw_` prefix and are not compared to ALG's; `out` is.
+    w_conv is the weight in the layout their quantizer blocks: [O, C, kH, kW],
+    each filter flattened C-major (convT: the converted kernel, convt_weight).
 
-    Not supported by their code: padding (they raise), dilation (they have no
-    such parameter - refused here so it can't run silently as dilation 1),
-    groups.
-
-    Taps: x w | x_cal w_cal pre_round_moved | hw_a_mant hw_a_exp |
-          hw_w_mant hw_w_exp | hw_acc | out_raw | out
-    pre_round_moved: how many input elements a round(x * 2^x_cal) would
-    change. Their forward rounds only an input layer (is_input_layer); this
-    layer is not one, so x * 2^x_cal goes to their quantizer unrounded.
+    Calibration offsets: from the config's hw_grids when it has the register
+    bases (offline PTQ, as deployed): their observer anchors the smallest
+    non-zero block at shift 0, cal = mantissa_offset - E_min, and e_base_a /
+    e_base_w ARE E_min. Else their observers on this input, weights blocked
+    per flattened kernel, as their quantizer (per_row_flatten).
     """
-    x, w, b, p = case["x"], case["w"], case["b"], case["params"]
-    O, Cin, kH, kW = w.shape
-    if p["dilation"] != 1:
-        raise NotImplementedError("HW conv: npe_mx_emu has no dilation")
     mx_type, bs = hw_format(cfg)
     acc_bits = hw_acc_bits(cfg)
-
-    # calibration (theirs); weights blocked per flattened kernel, as they say
-    # Calibration offsets: from the config's hw_grids when it has the
-    # register bases (offline PTQ, as deployed): their observer anchors the
-    # smallest non-zero block at shift 0, cal = mantissa_offset - E_min, and
-    # e_base_a / e_base_w ARE E_min. Else their observers on this input.
     grid = SC.hw_grid(cfg, case) or {}
     m_off = mantissa_offset(mx_type)
     s_shift = int(grid.get("static_shift", 0))     # PCU static shift (M7)
@@ -284,81 +267,179 @@ def conv(case, cfg, taps):
     else:
         obs_x = MXObserver(block_size=bs, mx_type=mx_type, mode="mx"); obs_x.update(x)
         obs_w = MXObserver(block_size=bs, mx_type=mx_type, mode="mx")
-        obs_w.update(w, per_row_flatten=True)
+        obs_w.update(w_conv, per_row_flatten=True)
         x_cal, w_cal = obs_x.calibrate_offset(), obs_w.calibrate_offset()
         cal_src = "observer"
     # out_cal decodes their output: the static shift moves the 2^-12 base grid
     qp = LayerMXQParams(x_cal=x_cal, w_cal=w_cal, block_size=bs, mx_type=mx_type,
                         out_cal=2 * m_off + s_shift,
                         is_input_layer=bool(case.get("input_layer")))
+    return {"qp": qp, "acc_bits": acc_bits, "s_shift": s_shift, "cal_src": cal_src}
 
-    layer = CalibratedMXConv2d(Cin, O, (kH, kW), stride=p["stride"],
-                               padding=p["padding"], qparams=qp)
-    # their CalibratedMXConv2d doesn't forward acc_bit_width; MXConv2D_Loops
-    # keeps it as an attribute and passes it to bcu
-    layer.mx_conv.acc_bit_width = acc_bits
+
+def _run_hw_layer(layer, engine, case, hw, pla=None):
+    """Load the case's weight and bias into their layer, calibrate, run
+    forward(x). engine: their loop module inside `layer` (mx_conv, mx_dw,
+    mx_convt). The weight goes in as the case holds it (their layer converts
+    it if its op needs that). Returns {out_raw, mx_a (the MX input their
+    engine got), lines (every bcu p_sum, call order), canvas (every
+    pad_dilate_streams result: the activation streams after their geometry
+    zeros)}."""
+    w, b = case["w"], case["b"]
+    # their Calibrated* layers don't forward acc_bit_width; the engine keeps it
+    # as an attribute and passes it to bcu
+    engine.acc_bit_width = hw["acc_bits"]
     with torch.no_grad():
-        layer.mx_conv.weight.copy_(w)
-        layer.mx_conv.bias.copy_(b if b is not None else torch.zeros(O))
+        engine.weight.copy_(w)
+        engine.bias.copy_(b if b is not None else torch.zeros_like(engine.bias))
     layer.calibrate()
-    if s_shift:                         # their Cstruct.shift = the static shift
-        layer.mx_conv.load_c_struct(
-            {o: dataclasses.replace(c, shift=s_shift)
-             for o, c in layer.mx_conv.c_struct_arr.items()})
-    pla = _pla_bins(case, cfg, qp, O, s_shift) if case.get("act") else None
     if pla is not None:                 # their one-bin PCU, as it is today
-        layer.mx_conv.load_c_struct(_pla_single(pla, O))
+        engine.load_c_struct(_pla_single(pla, engine.bias.numel()))
+    elif hw["s_shift"]:                 # their Cstruct.shift = the static shift
+        engine.load_c_struct(
+            {o: dataclasses.replace(c, shift=hw["s_shift"])
+             for o, c in engine.c_struct_arr.items()})
 
     seen_mx = []
-    hook = layer.mx_conv.register_forward_pre_hook(
-        lambda m, args: seen_mx.append(args[0]))
+    hook = engine.register_forward_pre_hook(lambda m, args: seen_mx.append(args[0]))
     try:
-        with torch.no_grad(), _capture_bcu() as lines:
-            out_raw = layer(x)
+        with torch.no_grad(), _capture_bcu() as lines, \
+                _pass_through(_hw_pipe, "pad_dilate_streams") as canvas:
+            out_raw = layer(case["x"])
     finally:
         hook.remove()
-    mx_a, mx_w = seen_mx[0], layer.mx_conv.mx_weight
+    return {"out_raw": out_raw, "mx_a": seen_mx[0], "lines": lines, "canvas": canvas}
 
-    B, _, Ho, Wo = out_raw.shape
+
+def _tap_hw(taps, case, hw, layer, engine, r):
+    """The taps every conv-family HW run gives, in their order:
+    x w | cal_from_config x_cal w_cal pre_round_moved acc_bits |
+    hw_a_mant hw_a_exp | hw_w_mant hw_w_exp | hw_acc | out_raw out_scale_log2 out
+    pre_round_moved: how many input elements a round(x * 2^x_cal) would
+    change. Their forward rounds only an input layer (is_input_layer); this
+    layer is not one, so x * 2^x_cal goes to their quantizer unrounded."""
+    qp, mx_a, mx_w, x = hw["qp"], r["mx_a"], engine.mx_weight, case["x"]
+    B, O = r["out_raw"].shape[:2]
     tap(taps, "x", x)
-    tap(taps, "w", w)
-    tap(taps, "cal_from_config", int(cal_src == "config"))
+    tap(taps, "w", case["w"])
+    tap(taps, "cal_from_config", int(hw["cal_src"] == "config"))
     tap(taps, "x_cal", qp.x_cal)
     tap(taps, "w_cal", qp.w_cal)
     xs = x.double() * 2.0 ** qp.x_cal
     tap(taps, "pre_round_moved", int((xs != xs.round()).sum()))
-    tap(taps, "acc_bits", acc_bits)
+    tap(taps, "acc_bits", hw["acc_bits"])
     tap(taps, "hw_a_mant", mx_a.data)        # [B, Cin, H, nblk, bs] int32
     tap(taps, "hw_a_exp", mx_a.shared_exp)   # [B, Cin, H, nblk]
     tap(taps, "hw_w_mant", mx_w.data)        # [O, nblk, bs]
     tap(taps, "hw_w_exp", mx_w.shared_exp)   # [O, nblk]
-    # bcu is called per (b, oc, oh) in that loop order -> [B, O, Ho, Wo]
-    tap(taps, "hw_acc", torch.stack(lines).reshape(B, O, Ho, Wo))
-    tap(taps, "out_raw", out_raw)
+    # bcu is called per (b, oc, oh) in that loop order, one output line each
+    # -> [B, O, Ho, Wo] (convT: before their output crop)
+    lines = r["lines"]
+    tap(taps, "hw_acc", torch.stack(lines).reshape(B, O, -1, lines[0].shape[-1]))
+    tap(taps, "out_raw", r["out_raw"])
     tap(taps, "out_scale_log2", layer.output_scale_log2)   # out grid 2^-this
-    tap(taps, "out", out_raw * 2.0 ** -layer.output_scale_log2)
+    tap(taps, "out", r["out_raw"] * 2.0 ** -layer.output_scale_log2)
+
+
+def conv(case, cfg, taps):
+    """MX conv on the HW team's NPE emulator (hw/npe_mx_emu).
+
+    Flow exactly as their notebook (mx_conv_npe_emu_example):
+      MXObserver(mode="mx") on x and on w -> x_cal, w_cal  (_hw_setup)
+      LayerMXQParams(x_cal, w_cal) -> CalibratedMXConv2d (weight/bias copied)
+      calibrate() -> forward(x) -> raw int, float = raw * 2^-output_scale_log2
+
+    Depthwise (case params groups == Cin == O, weight [O, 1, k, k]): their
+    CalibratedMXDepthwiseConv2d, one padded block per channel filter (QA
+    Q8). Any other grouping is refused: their code has dense and depthwise
+    only.
+
+    Padding and dilation are theirs, with torch's meaning: zero (0, 0) pairs
+    inserted after quantization into the aligned streams (hw/README.md,
+    "Geometry options"): padding at the activation border, dilation between
+    the kernel taps.
+
+    Their format differs from ALG by design (e4bm8: per-tensor calibrate
+    offset, unsigned exponent with wrap, mantissa truncate, int64 acc with
+    two's-complement wrap, PCU round half up + 24-bit clamp), so their integer
+    taps carry an `hw_` prefix and are not compared to ALG's; `out` is.
+
+    Taps: _tap_hw; PLA cases add the bins stand-in (_pla_bins_standin).
+    """
+    w, p = case["w"], case["params"]
+    O, Cin_g, kH, kW = w.shape
+    Cin = case["x"].shape[1]
+    groups = p.get("groups", 1)
+    geo = dict(kernel_size=(kH, kW), stride=p["stride"], padding=p["padding"],
+               dilation=p["dilation"])
+    hw = _hw_setup(case, cfg, case["x"], w)
+    if groups == 1:
+        layer = CalibratedMXConv2d(Cin, O, qparams=hw["qp"], **geo)
+        engine = layer.mx_conv
+    elif groups == Cin == O and Cin_g == 1:
+        layer = CalibratedMXDepthwiseConv2d(Cin, qparams=hw["qp"], **geo)
+        engine = layer.mx_dw
+    else:
+        raise NotImplementedError(
+            f"HW conv: groups {groups} (Cin {Cin}, O {O}); npe_mx_emu has dense "
+            f"(groups 1) and depthwise (groups == Cin == O) conv only")
+    pla = _pla_bins(case, cfg, hw["qp"], O, hw["s_shift"]) if case.get("act") else None
+    r = _run_hw_layer(layer, engine, case, hw, pla)
+    _tap_hw(taps, case, hw, layer, engine, r)
     if pla is not None:
-        _pla_bins_standin(taps, pla, layer, mx_a)
+        _pla_bins_standin(taps, pla, layer, engine, r["mx_a"])
     return taps["out"]
 
 
+def convt_weight(w):
+    """A torch ConvTranspose2d weight [Cin, O, k, k] -> the conv kernel their
+    MXConvTranspose2D_Loops.load_mx_weight quantizes: [O, Cin, k, k], flipped
+    in kH, kW. Their docstring (CalibratedMXConvTranspose2d) asks the caller
+    to observe the weight on this converted tensor: the conversion changes
+    which elements share a block (per OC, C-major)."""
+    return w.transpose(0, 1).flip(-1, -2).contiguous()
+
+
 def convt(case, cfg, taps):
-    """ConvTranspose as zero-insert + conv.
+    """ConvTranspose on the HW team's emulator: their
+    CalibratedMXConvTranspose2d (MXConvTranspose2D_Loops), nothing of theirs
+    reimplemented.
 
-    Steps:
-      1. dilate x: insert (stride - 1) zeros between pixels in H and W.
-         tap "x_dil".
-      2. pad by (k - 1 - padding) each side (+ output_padding at bottom/right).
-      3. kernel: w [Cin,O,k,k] -> flip in kH, kW, swap to [O,Cin,k,k].
-      4. run `conv` steps 1-4 with stride 1.
+    Their geometry (hw/README.md, "Geometry options"): the compact input is
+    MX-quantized first; then the stride zero-insert and the border pad
+    (d*(k-1) - padding, a negative one crops the output) are (0, 0) pairs
+    inserted into the aligned streams after quantization (QA Q7: the zeros
+    are never in a block); then their stride-1 dense conv pipe. The weight
+    goes in torch layout [Cin, O, k, k]; their load_mx_weight converts it
+    (convt_weight) before quantizing, and the observer sees the converted
+    weight. dilation is torch's kernel dilation.
 
-    Open: quantize x before the zero insert (blocks on the original W) or after
-    (blocks on the dilated W)? ALG (lib) today blocks along Cin and accumulates
-    in fp32, so only `out` is comparable, as float.
+    Refused (their NotImplementedError, named): groups != 1,
+    output_padding != 0.
 
-    Taps: x_dil, then the conv taps, out.
+    ALG's convT, unless the lib's HW path (xblock_accum.convT "hw"), blocks
+    along Cin and accumulates in fp32: only `out` compares, as float.
+
+    Taps: _tap_hw, then x_dil (the activation mantissa stream after their
+    zero insert and pad, [B, Cin, H', W'], int) and x_dil_exp (its
+    per-element exponents; the inserted zeros carry 0).
     """
-    raise NotImplementedError("HW convt")
+    w, p = case["w"], case["params"]
+    Cin, O, kH, kW = w.shape
+    hw = _hw_setup(case, cfg, case["x"], convt_weight(w))
+    try:
+        layer = CalibratedMXConvTranspose2d(
+            Cin, O, (kH, kW), stride=p["stride"], padding=p["padding"],
+            output_padding=p.get("output_padding", 0), groups=p.get("groups", 1),
+            dilation=p["dilation"], qparams=hw["qp"])
+    except NotImplementedError as e:
+        raise NotImplementedError(f"HW convT: npe_mx_emu: {e}") from e
+    r = _run_hw_layer(layer, layer.mx_convt, case, hw)
+    _tap_hw(taps, case, hw, layer, layer.mx_convt, r)
+    (x_dil, x_dil_exp), = r["canvas"]
+    tap(taps, "x_dil", x_dil)
+    tap(taps, "x_dil_exp", x_dil_exp)
+    return taps["out"]
 
 
 # Warp, as the HW team answered it (hw/warp_hw_questions_and_answers.md) and

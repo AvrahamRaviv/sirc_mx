@@ -14,10 +14,10 @@ conv), and **warp**.
 | `cases.py` | the case table: one op per case, tiny shapes, fixed seed. Also `Warp`, the float spec of the warp |
 | `taps.py` | `tap(taps, name, t)` logs a value at any point; `show(taps)` prints them in order |
 | `main_ALG.py` | ALG side: MX lib only, one function per op (`conv`, `convt`, `warp`) |
-| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv (incl. PLA via a labelled bins stand-in) and warp (`CalibratedMXWarp`) run on their code. convT is a placeholder: their emulator has no convT |
+| `main_HW.py` | HW side: wires in the HW team's `hw/npe_mx_emu`: conv (dense and depthwise, padding, dilation; PLA via a labelled bins stand-in), convT (`CalibratedMXConvTranspose2d`) and warp (`CalibratedMXWarp`) run on their code |
 | `hw_vs_alg_check.py` | one test vector per known ALG-vs-HW arithmetic difference; prints numbers. Rerun on each HW drop. `--only warp`: the warp vectors (T12) alone |
 | `warp_vectors.py` | the T12 warp vectors: label, printed text, each side's values and the value the HW answer gives |
-| `hw/` | HW team code, **verbatim, never edited here**: `npe_mx_emu/` package, their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `warp_hw_questions_and_answers.md` (their warp answers: the HW spec of the warp), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
+| `hw/` | HW team code, **never hand-edited here**: `npe_mx_emu/` package (each line from one of their drops or their own commit, see HW side), their `README.md` and confluence guide (with their answers to the review table), `QA.md` (their answers to our later questions), `warp_hw_questions_and_answers.md` (their warp answers: the HW spec of the warp), `PLAN.md` (their PT2E plan), `EL_nb/` their notebooks |
 | `sim_config.py` | loads the one framework config both sides read (pure json, no MX lib; per-call-site fxp lists by the lib's pure rule, `fixed_point/fxp_sites.py`) |
 | `sim_cli.py` | what the CLIs share: the exit codes, and the many-case loop that reports each refusal and goes on |
 | `mx_config_npe_e4.json` | `mx_config_dof.json` with `scale_bits: 4`, the NPE exponent width |
@@ -47,7 +47,8 @@ are on purpose: they are spec references kept independent of the lib (as
 - **convT**:
   - `xblock_accum.convT = "hw"`: the lib's `MXConvTranspose2dHW` quantizes the compact input (blocks along W), zero-inserts the extracted operand and runs the HW conv. Taps as conv; `w_int` / `w_exp` are its equivalent conv weight `[O, Cin, kH, kW]`. HW confirmed this order (quantize compact, zeros never in a block).
   - Otherwise plain MX blocked along Cin with fp32 accumulation: only `out` compares, as float.
-  - HW side: their emulator has no convT yet (output interleaving still open).
+  - HW side: their `CalibratedMXConvTranspose2d` (HW side, below). Taps as their conv, plus `x_dil` / `x_dil_exp`: the activation mantissas and exponents after their zero insert and pad.
+  - HW answered the open question "quantize before or after the zero insert?": the compact input is quantized first; the stride zeros and the border pad are `(0, 0)` pairs inserted after quantization into the aligned streams, never in a block (`hw/README.md`, "Geometry options"; QA Q7).
 - **warp** (the HW spec: `hw/warp_hw_questions_and_answers.md`):
   - `ref` is int8 with a static scale (Q6).
   - `grid` is Q8.8: a displacement in px, channel 0 = x (relative motion, Q3).
@@ -143,8 +144,41 @@ Accumulator width: `xblock_accum.bits`, one of their `SUPPORTED_ACC_WIDTHS`
 (46, 48, 54, 56), else refused. Fixed inside their code (their API has no
 parameter): PCU clamp 24 bits (`main_HW.HW_FIXED`).
 
-Their code does not support padding (it raises) or dilation (it has no such
-parameter, so the wiring refuses it). Use `conv1x1` or `conv3x3_p0`.
+Geometry is theirs, with torch's meaning (`hw/README.md`, "Geometry
+options"): padding and kernel dilation are `(0, 0)` pairs inserted after
+quantization into the aligned streams (padding at the activation border,
+dilation between the kernel taps of each filter); no case is refused for
+them any more. A case whose params hold `groups == Cin == O` (weight
+`[O, 1, k, k]`) runs their `CalibratedMXDepthwiseConv2d` (one padded block
+per filter, QA Q8); any other grouping is refused. No table case is
+depthwise: the lib's HW conv takes `groups == 1` only, so the tests run it
+on HW alone, against float.
+
+convT (`main_HW.convt`): their `CalibratedMXConvTranspose2d`, built on the
+same blocks as conv (`_hw_setup`, `_run_hw_layer`, `_tap_hw`). The weight
+goes in torch layout `[Cin, O, k, k]`; their `load_mx_weight` transposes and
+flips it before quantizing, and the observer sees that converted kernel
+(`main_HW.convt_weight`, per their docstring: its blocks run per OC,
+C-major). From the config's `hw_grids`, `e_base_w` is the lib's equivalent
+conv weight base, the same layout. Their code refuses `groups != 1` and
+`output_padding != 0`; the sim names it (`HW convT: npe_mx_emu: ...`), a
+refusal (`convt_k3_s2`). ALG's convT, unless `xblock_accum.convT` is
+`"hw"`, blocks along Cin and accumulates in fp32, so only `out` compares,
+as float.
+
+On `mx_config_npe_e4.json` (2026-11-19), out max |HW - ALG| / max |float|:
+conv 2.7-3.0 %, convT 1.8-2.6 % (k4 s2 p1, k2 s2 p0, k3 s2 p1, k3 s2 p1 d2);
+HW against float: conv <= 3.0 %, depthwise <= 2.5 %, convT <= 2.3 %.
+
+- Decision (2026-11-19, owner "A"): the drop of 2026-11-19 (convT, padding,
+  dilation) is a 3-way merge into `hw/npe_mx_emu`: base their 2026-11-05
+  delivery (7fccb9e), ours main, theirs the drop. Each merged file is the
+  drop's except exactly the hunks of 257a52e (their own warp fixes of
+  2026-11-15); `calib.py` and `observers.py` are not in the drop and stay.
+  Rejected: a verbatim copy, because the drop was built on 7fccb9e and would
+  revert the agreed warp fixes. `tests/test_sim_ops.py` pins their warp bit
+  for bit (`WARP_PIN`). The drop's `mxpt2e/`, `ir/`, `graph_extraction/` and
+  `docs/` are left out (owner "Y").
 
 ## HW warp (npe_mx_emu)
 

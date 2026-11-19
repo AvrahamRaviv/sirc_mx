@@ -69,7 +69,7 @@ CASES = {
     # --- conv -----------------------------------------------------------------
     "conv1x1":      dict(op="conv", x=(1, 4, 3, 32), w=(8, 4, 1, 1)),
     "conv3x3":      dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=1),
-    "conv3x3_p0":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3)),  # HW: no padding yet
+    "conv3x3_p0":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3)),  # no padding
     "conv3x3_s2":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=1,
                          stride=2),
     "conv3x3_d2":   dict(op="conv", x=(1, 4, 6, 40), w=(8, 4, 3, 3), padding=2,
@@ -91,11 +91,20 @@ CASES = {
                          act=("prelu", (0.0,) * 8)),
     "conv_prelu_negb": dict(op="conv", x=(1, 16, 6, 40), w=(8, 16, 3, 3), bias=-1,
                             act=("prelu", (0.0, 0.25, 0.1, 1.0, 0.5, 0.05, 0.3, 0.2))),
-    # --- convT (HW: zero-insert = dilate the input, then a plain conv) ----------
+    # --- convT (HW: quantize compact, zero-insert, then a stride-1 conv) --------
     "convt_k3_s2":  dict(op="convt", x=(1, 4, 5, 16), w=(4, 8, 3, 3), stride=2,
                          padding=1, output_padding=1),
     "convt_k4_s2":  dict(op="convt", x=(1, 4, 5, 16), w=(4, 8, 4, 4), stride=2,
                          padding=1),
+    # k2 s2 p0, the DOF convT as L61 gives it (the infer_dof test stand-in's
+    # dense convT is k4 s2 p1: convt_k4_s2)
+    "convt_k2_s2":  dict(op="convt", x=(1, 4, 5, 16), w=(4, 8, 2, 2), stride=2),
+    # HW refuses output_padding != 0 (convt_k3_s2): the same layer without it,
+    # and with kernel dilation
+    "convt_k3_s2_op0": dict(op="convt", x=(1, 4, 5, 16), w=(4, 8, 3, 3), stride=2,
+                            padding=1),
+    "convt_k3_s2_d2": dict(op="convt", x=(1, 4, 5, 16), w=(4, 8, 3, 3), stride=2,
+                           padding=1, dilation=2),
     # --- warp -----------------------------------------------------------------
     "warp_int_shift":  dict(op="warp", x=(1, 4, 5, 9), flow=("const", 3.0, -1.0),
                             ref_scale=P2, out_scale=P2),

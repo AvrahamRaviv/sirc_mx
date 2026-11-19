@@ -794,8 +794,8 @@ it); the rest of the suite does not need it.
 ## Single-op simulator (`configs/`)
 
 Each NPE op (conv, convT, warp) runs alone through the MX lib (ALG) and the
-HW team's emulator (`configs/hw/npe_mx_emu`, verbatim), and every stage is
-compared. Conv and warp run on their code; their emulator has no convT yet.
+HW team's emulator (`configs/hw/npe_mx_emu`, their code, never hand-edited),
+and every stage is compared. Conv, convT and warp run on their code.
 How it works, the warp included: `configs/README.md`.
 
 ```bash

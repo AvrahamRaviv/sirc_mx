@@ -305,9 +305,9 @@ def convt(case, cfg, taps):
     """MXConvTranspose2d. Taps: x w | a_int a_exp | w_int w_exp | out.
 
     The lib has no HW path for convT: plain MX operands, fp32 accumulation, and
-    blocks along Cin (input axis 1, weight axis 0) - not the NPE layout. HW does
-    convT as zero-insert + conv; whether it quantizes before or after the zero
-    insert is an open question. Compare `out` as float until that is settled.
+    blocks along Cin (input axis 1, weight axis 0) - not the NPE layout. HW
+    quantizes the compact input, then zero-inserts and runs a conv (QA Q7);
+    compare `out` as float.
 
     The operands are the layer's own: captured from its quantize_mx_op calls
     (input first, then weight).
